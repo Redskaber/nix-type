@@ -236,6 +236,7 @@ in rec {
           else { ok = true; type = synth.type; constraints = cs ++ (synth.constraints or []); }
 
         else
+          # FIXME: Undefined name => `or`
           { ok = false; error = "Cannot apply non-function type: ${fnV or "?"}"; constraints = []; }
 
     # Lit：已知类型
@@ -257,6 +258,7 @@ in rec {
 
     # 无法推断（checking-mode only）
     else
+      # FIXME: Undefined name => `or`
       { ok = false; error = "Cannot infer type for ${tag or "?"}"; constraints = []; };
 
   # ══════════════════════════════════════════════════════════════════════════════

@@ -1,377 +1,295 @@
-# ARCHITECTURE.md — Phase 3.2
+# ARCHITECTURE.md — Phase 4.0
 
 # Nix Type System 架构文档
 
 ---
 
-## 总体架构（Phase 3.2）
+## 总体架构（Phase 4.0）
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                       Nix Type System（Phase 3.2）                           │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐   │
-│  │                      TypeIR（统一宇宙）                               │   │
-│  │  Type = { tag; id; kind; repr; meta; phase }                          │   │
-│  │  Kind = KStar | KArrow | KRow | KEffect | KVar | KUnbound             │   │
-│  │  Meta = { eqStrategy; muPolicy; rowPolicy; bidirPolicy; ... }         │   │
-│  └───────────────────────────────────────────────────────────────────────┘   │
-│         │                    │                    │                          │
-│  ┌──────▼──────┐   ┌─────────▼──────┐   ┌─────────▼───────┐                 │
-│  │  TypeRepr   │   │   Normalize    │   │  Constraint     │                 │
-│  │ (21 变体)   │   │ (TRS, 3-fuel)  │   │  IR (INV-6)     │                 │
-│  │ Pi/Sigma    │   │ ruleRowCanon ✅ │   │  Worklist       │                 │
-│  │ Effect      │   │ ruleEffNorm  ✅ │   │  Solver         │                 │
-│  │ Opaque      │   │ bisimMu      ✅ │   │  _typeMentions  │                 │
-│  └──────┬──────┘   └─────────┬──────┘   └─────────┬───────┘                 │
-│         │                    │                    │                          │
-│  ┌──────▼────────────────────▼────────────────────▼──────┐                  │
-│  │                    Meta Layer                         │                  │
-│  │  serialize(α-canonical v3) → hash(NF) → equality      │                  │
-│  │  Coherence: structural ⊆ nominal ⊆ hash               │                  │
-│  │  muEq: bisimulation + guard set ✅                     │                  │
-│  │  rowVarEq: rigid name identity                        │                  │
-│  └───────────────────────────────────────────────────────┘                  │
-│         │                                    │                              │
-│  ┌──────▼────────┐   ┌──────────┐   ┌────────▼────────┐                     │
-│  │  Incremental  │   │ Instance │   │  Bidirectional  │                     │
-│  │  Graph(BFS)   │   │ DB       │   │  Type Checking  │                     │
-│  │  Memo(epoch)  │   │ specif.✅│   │  substLib ✅    │                     │
-│  └───────────────┘   └──────────┘   └─────────────────┘                     │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 模块依赖图（严格拓扑序，Phase 3.2）
-
-```
-kindLib ──────────────────────────────────────────────────────────────┐
-serialLib ────────────────────────────────────────────────────────────┤
-metaLib ──────────────────────────────────────────────────────────────┤
-                                                                      ▼
-typeLib ← (kindLib, metaLib, serialLib)                          [typeLib]
-reprLib ← (lib)
-substLib ← (typeLib, reprLib)                     ← Phase 3.2: bidir 使用
-rulesLib ← (typeLib, reprLib, substLib, kindLib)  ← Phase 3.2: ruleRowCanonical
-normalizeLib ← (typeLib, reprLib, rulesLib)
-hashLib ← (typeLib, normalizeLib, serialLib)
-equalityLib ← (typeLib, hashLib, normalizeLib, serialLib)
-constraintLib ← (typeLib, hashLib)
-unifyLib ← (constraintLib, substLib, serialLib, hashLib)  ← Phase 3.2: bisimMu
-instanceLib ← (constraintLib, hashLib, normalizeLib)      ← Phase 3.2: specificity
-solverLib ← (constraintLib, unifyLib, instanceLib)        ← Phase 3.2: _typeMentions
-bidirLib ← (normalizeLib, constraintLib, unifyLib, reprLib, substLib) ← Phase 3.2
-graphLib ← (lib)
-memoLib ← (hashLib, constraintLib)
-matchLib ← (typeLib, reprLib)
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                          Nix Type System（Phase 4.0）                              │
+│                                                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                           TypeIR（统一宇宙）                                 │  │
+│  │  Type = { tag; id; kind; repr; meta; phase }                                 │  │
+│  │  Kind = KStar|KArrow|KRow|KEffect|KVar|KUnbound                              │  │
+│  │  Meta = { eqStrategy; muPolicy; rowPolicy; bidirPolicy; ... }                │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│         │                    │                    │                │               │
+│  ┌──────▼──────┐   ┌─────────▼──────┐   ┌─────────▼───────┐ ┌────▼─────────────┐  │
+│  │  TypeRepr   │   │   Normalize    │   │  Constraint     │ │  Meta Layer      │  │
+│  │ (25+ 变体)  │   │ (TRS, 3-fuel)  │   │  IR (INV-6)     │ │  serialize(α-v3) │  │
+│  │ Pi/Sigma    │   │ rules_p40 ✅   │   │  Worklist P4.0  │ │  hash(NF)        │  │
+│  │ Effect/Hdlr │   │ ruleEffMerge✅ │   │  RowEquality    │ │  equality        │  │
+│  │ Refined  ✅ │   │ ruleRefined ✅ │   │  SMT residual✅ │ │  muEq bisim      │  │
+│  │ Sig/Struct✅│   │ ruleSig     ✅ │   │  UnifiedSubst✅ │ └──────────────────┘  │
+│  │ ModFunctor✅│   └─────────┬──────┘   └─────────┬───────┘                       │
+│  └──────┬──────┘             │                    │                               │
+│         │            ┌───────▼──────────────────────────────┐                    │
+│         │            │         UnifiedSubst（Phase 4.0）     │                    │
+│         │            │  { typeBindings; rowBindings; kindBindings }               │
+│         │            │  INV-US1: compose law                 │                    │
+│         │            │  INV-US3: 键前缀 t:/r:/k:             │                    │
+│         │            └──────────────────────────────────────┘                    │
+│         │                                                                         │
+│  ┌──────▼──────────────────────────────────────────────────────────┐              │
+│  │                     Phase 4.0 新增模块                          │              │
+│  │                                                                  │              │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐  │              │
+│  │  │  Refined Types   │  │  Module System   │  │Effect Handlers│  │              │
+│  │  │  PredExpr IR     │  │  Sig/Struct      │  │checkHandler   │  │              │
+│  │  │  staticEval      │  │  ModFunctor      │  │handleAll      │  │              │
+│  │  │  smtBridge(str)  │  │  checkSig        │  │subtractEffect │  │              │
+│  │  │  INV-SMT-1~4 ✅  │  │  INV-MOD-1~5 ✅  │  │INV-EFF-4~7 ✅ │  │              │
+│  │  └──────────────────┘  └──────────────────┘  └───────────────┘  │              │
+│  │                                                                  │              │
+│  │  ┌──────────────────────────────────────────────────────────┐   │              │
+│  │  │          QueryKey Incremental（Salsa-style）              │   │              │
+│  │  │  QueryKey = tag:inputs（INV-QK1 确定性）                  │   │              │
+│  │  │  BFS invalidation（INV-QK2 精确失效）                     │   │              │
+│  │  │  revDeps 反向依赖图（链式失效）                           │   │              │
+│  │  │  Cycle detection（INV-QK5 DFS）                          │   │              │
+│  │  │  bumpEpoch（退化全量失效模式）                            │   │              │
+│  │  └──────────────────────────────────────────────────────────┘   │              │
+│  └──────────────────────────────────────────────────────────────────┘              │
+│                                                                                    │
+│  ┌──────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌──────────────┐  │
+│  │  Instance DB     │  │  Bidirectional │  │  Pattern Match │  │  Incremental │  │
+│  │  specificity ✅  │  │  substLib ✅   │  │  full P3.3 ✅   │  │  Graph/Memo  │  │
+│  │  partialUnify ✅ │  │  Pi/Sigma ✅   │  │  DT compiler   │  │  QueryDB ✅  │  │
+│  └──────────────────┘  └────────────────┘  └────────────────┘  └──────────────┘  │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 3.2 关键变化
-
-### 1. `_unifyMu` — 真正的 bisimulation
-
-**旧实现（Phase 3.1）**：alpha-canonical 序列化比较（保守近似）
+## 依赖拓扑（Phase 4.0，严格分层）
 
 ```
-serA == serB  →  ok  |  fail
-```
-
-**新实现（Phase 3.2）**：guard set + coinductive unfolding
-
-```
-unifyMu(guard, a, b, fuel):
-  key = min(a.id,b.id) + ":" + max(a.id,b.id)    # symmetric guard key
-  if key ∈ guard → ok (coinductive hypothesis)
-  if fuel = 0 → fallback alpha-canonical
-  guard' = guard ∪ {key}
-  unfoldA = substitute(a.var, a, a.body)
-  unfoldB = substitute(b.var, b, b.body)
-  unifyCore(guard', unfoldA, unfoldB, fuel-1)
-```
-
-**覆盖的新情况**：
-
-- `μ(lst.Nil|Cons(Int,lst))` ≡ `μ(list.Nil|Cons(Int,list))`（不同 binder 名）
-- 互相递归类型（guard 防止无限展开）
-- partial unfolding（fuel 控制深度）
-
-### 2. `ruleRowCanonical` — 完整 spine sort
-
-**旧实现（Phase 3.1）**：no-op（`{ changed = false; type = t; }`）
-
-**新实现（Phase 3.2）**：
-
-```
-unspine: RowExtend → [(label, fieldType)] × tail
-sort: by label (lexicographic)
-rebuild: foldr RowExtend tail sortedFields
-```
-
-**关键不变量**（INV-ROW）：
-
-```
-typeHash(normalize({ b:Bool | a:Int })) == typeHash(normalize({ a:Int | b:Bool }))
-```
-
-### 3. Specificity-based Instance Selection
-
-**旧实现（Phase 3.1）**：lexicographic key 顺序（不稳定语义）
-
-**新实现（Phase 3.2）**：
-
-```
-specificity(inst) = |{arg : arg.repr.__variant ≠ "Var"}|
-
-resolve(db, class, args):
-  candidates = [e ∈ byClass[class] | args matches e.normArgs]
-  best = argmax_{e ∈ candidates} e.specificity  # tie: min key
-  return best.impl
-```
-
-**示例**：
-
-```
-Eq a   → specificity = 0  (泛化)
-Eq Int → specificity = 1  (具体，优先)
-```
-
-### 4. `_substTypeInType` — substLib 集成
-
-**旧实现（Phase 3.1）**：手写顶层 Var 替换（不完整）
-
-**新实现（Phase 3.2）**：
-
-```nix
-_substTypeInType = varName: replacement: ty:
-  substitute varName replacement ty;  # substLib.substitute：完整 capture-safe
-```
-
-**影响**：dependent type checking（Pi/Sigma application）中 `B[x↦arg]` 完全正确。
-
-### 5. `_applySubstTypeFull` — 完整深层替换
-
-**旧实现（Phase 3.1）**：`_applySubstType` 仅顶层 Var
-
-```
-Var → lookup; else → t (pass through)
-```
-
-**新实现（Phase 3.2）**：全 21 TypeRepr 变体深层遍历
-
-```
-Var    → follow chain
-Lambda → body
-Pi     → domain + body
-Apply  → fn + args
-Fn     → from + to
-Mu     → body
-...（全 21 变体）
-```
-
-### 6. `_typeMentions` — freeVarsRepr 全变体
-
-**旧实现（Phase 3.1）**：只检查顶层 Var
-
-```
-_typeMentions vars t = t.repr.__variant == "Var" && elem t.repr.name vars
-```
-
-**新实现（Phase 3.2）**：`_reprMentions` 递归所有 TypeRepr 变体
-
-```
-Lambda → check body (respecting binder)
-Pi     → check domain + body (respecting binder)
-Apply  → check fn + all args
-ADT    → check all variant fields
-Record → check all field types
-...（全 21 变体）
+Layer 0:  kindLib                            （无依赖）
+Layer 1:  serialLib                          （仅 lib）
+Layer 2:  metaLib                            （仅 lib）
+Layer 3:  typeLib          ← kindLib, metaLib, serialLib
+Layer 4:  reprLib          ← typeLib, kindLib
+Layer 5:  substLib         ← reprLib, typeLib
+Layer 6:  rulesBaseLib     ← substLib, kindLib, reprLib, typeLib
+          rules_p33Lib     ← typeLib, kindLib
+          rules_p40Lib     ← typeLib, kindLib              ← NEW 4.0
+          rulesLib         = rulesBaseLib ∪ p33 ∪ p40
+Layer 7:  normalizeLib     ← rulesLib
+Layer 8:  hashLib          ← normalizeLib, serialLib
+Layer 9:  equalityLib      ← hashLib, normalizeLib
+Layer 10: constraintLib    ← typeLib, hashLib
+Layer 11: unifyRowLib      ← typeLib, reprLib, kindLib
+          unifyLib         ← constraintLib, substLib, unifyRowLib
+Layer 12: instanceLib      ← constraintLib, hashLib, normalizeLib, unifyLib
+Layer 13: unifiedSubstLib  ← typeLib, kindLib, reprLib     ← NEW 4.0
+Layer 14: refinedLib       ← typeLib, kindLib, reprLib, hashLib  ← NEW 4.0
+Layer 15: moduleLib        ← typeLib, kindLib, reprLib, normalizeLib, hashLib, unifiedSubstLib ← NEW 4.0
+Layer 16: effectHandlerLib ← typeLib, kindLib, reprLib, normalizeLib, hashLib ← NEW 4.0
+Layer 17: solverP33Lib     ← constraintLib, unifyLib, instanceLib
+          solverP40Lib     ← constraintLib, unifyLib, instanceLib,
+                             unifyRowLib, unifiedSubstLib, refinedLib  ← NEW 4.0
+Layer 18: bidirLib         ← normalizeLib, constraintLib, unifyLib, reprLib, substLib
+Layer 19: graphLib         （无 type 依赖）
+Layer 20: memoLib          ← hashLib, constraintLib
+          queryLib         ← hashLib                       ← NEW 4.0
+Layer 21: patternLib       = patternBase ∪ patternP33
+Layer 22: lib/default.nix  ← ALL layers（unified export）
 ```
 
 ---
 
-## TypeRepr 变体全集（21 个，Phase 3.2）
+## TypeRepr 变体全集（Phase 4.0，25+ 变体）
 
 ```
-Primitive  { name }                    # 原子类型（Int, Bool, ...）
-Var        { name; scope }             # 类型变量
-Lambda     { param; body }             # 类型级 λ
-Apply      { fn; args }                # 类型级应用
-Fn         { from; to }                # 函数类型（语法糖）
-Pi         { param; domain; body }     # 依赖函数类型
-Sigma      { param; domain; body }     # 依赖对类型
-Mu         { var; body }               # 等递归类型（bisimulation）
-Constructor{ name; kind; params; body }# 泛型 ADT 构造器
-ADT        { variants; closed }        # ADT（closed/open）
-Record     { fields; rowVar? }         # Record 类型
-VariantRow { variants; tail? }         # Variant row（Effect 使用）
-RowExtend  { label; fieldType; rest }  # Row 扩展（canonical = sorted）
-RowEmpty   {}                          # 空 Row
-Effect     { effectTag; effectRow }    # Effect 类型
-Constrained{ base; constraints }       # 约束类型（INV-6）
-Opaque     { inner; tag }              # 不透明类型（module sealing）
-Ascribe    { inner; ty }               # 类型标注
-VarDB      { index }                   # de Bruijn 变量（序列化内部）
+TypeRepr =
+  Primitive    { name }                       # 原子类型 Int/Bool/String
+| Var          { name; scope }                # 类型变量
+| Lambda       { param; body }                # 类型级 λ
+| Apply        { fn; args }                   # 类型级应用
+| Constructor  { name; kind; params; body }   # 泛型 ADT 构造器
+| Fn           { from; to }                   # 函数类型
+| ADT          { variants; closed }           # 代数数据类型
+| Constrained  { base; constraints }          # 约束内嵌（INV-6）
+| Mu           { var; body }                  # 等递归类型
+| Record       { fields }                     # 记录类型
+| VariantRow   { variants; extension }        # 变体行（Effect handler 基础）
+| RowExtend    { label; fieldType; rest }     # 行扩展
+| RowEmpty     {}                             # 空行
+| RowVar       { name }                       # 行变量
+| Pi           { param; domain; body }        # 依赖函数类型
+| Sigma        { param; domain; body }        # 依赖积类型
+| Effect       { effectRow }                  # 效果类型
+| EffectMerge  { left; right }               # 效果合并节点
+| Opaque       { inner; tag }                 # 不透明类型（sealing）
+| Ascribe      { expr; type }                # 类型标注（bidir 辅助）
+# Phase 4.0 NEW ─────────────────────────────────────────────────────
+| Refined      { base; predVar; predExpr }   # { n : T | φ(n) }
+| Sig          { fields }                     # Module 接口签名
+| Struct       { sig; impl }                  # Module 实现
+| ModFunctor   { param; paramTy; body }       # Π(M : Sig). Body
+| Handler      { effectTag; branches; returnType } # Effect Handler
 ```
 
 ---
 
-## Constraint IR（Phase 3.2）
+## PredExpr IR（Refined Types 谓词语言）
+
+```
+PredExpr =
+  PTrue   {}                          # 恒真
+| PFalse  {}                          # 恒假
+| PAnd    { left; right }             # 合取
+| POr     { left; right }             # 析取
+| PNot    { body }                    # 否定
+| PCmp    { op; lhs; rhs }            # 比较（op ∈ {gt,lt,ge,le,eq,neq}）
+| PVar    { name }                    # 自由变量（指向约束 context）
+| PLit    { value }                   # 字面量
+| PApp    { fn; args }                # 外部谓词（应用）
+
+静态求值（Phase 4.0）：
+  PTrue/PFalse → immediately discharged
+  PAnd(PFalse, _) → short-circuit false
+  PCmp(lit, lit)  → constant folding
+  PVar/PApp      → SMT residual（交给外部求解器）
+
+SMT 输出（SMTLIB2，纯 string）：
+  smtBridge([refined_constraint]) → SMTLIB2 script
+  → 用户传递给 z3/cvc5/solver
+```
+
+---
+
+## Constraint IR 全集（Phase 4.0）
 
 ```
 Constraint =
-  Class     { name: String; args: [Type] }         # 类型类约束
-| Equality  { a: Type; b: Type }                   # 相等约束（id-ordered）
-| Predicate { fn: String; arg: Type }              # 谓词（Liquid Types，Phase 4）
-| Implies   { premises: [Constraint]; conclusion }  # 蕴含（sorted premises）
-
-Pipeline（INV-C4）:
-  raw → mapTypesInConstraint(subst) → normalizeConstraint → key → hash
+  Equality    { lhs; rhs }           # 类型等价（INV-6）
+| Class       { className; args }    # typeclass 约束
+| Predicate   { predName; subject }  # 谓词约束（P3.x）
+| Implies     { premises; conclusion } # 蕴含约束
+| RowEquality { lhsRow; rhsRow }     # 行等价约束 ← NEW 4.0
+| Refined     { subject; predVar; predExpr } # Refined 约束 ← NEW 4.0
 ```
 
 ---
 
-## Normalize Pipeline（Phase 3.2）
+## UnifiedSubst 架构（Phase 4.0，解决遗留风险 1）
 
 ```
-normalize(t):
-  normalize'(defaultFuel, t)
-
-normalize'(fuel, t):
-  if !hasDepth(fuel) → t
-  else _normalizeStep(fuel, t)
-
-_normalizeStep(fuel, t):
-  t' = _normalizeSubterms(fuel.depth-1, t)   # innermost: subterms first
-  r  = applyRules(fuel, t')
-  if !r.changed → t'                          # NF: no rule applied
-  else _normalizeStep(fuel.beta-1, r.type)    # repeat with reduced fuel
-
-applyRules（优先级顺序）:
-  1. ruleBetaReduce       # Apply(Lambda, arg) → β-reduce
-  2. rulePiReduce         # Apply(Pi, arg) → dependent β-reduce
-  3. ruleConstructorFull  # Constructor full application
-  4. ruleConstructorPartial # Constructor partial kind fix
-  5. ruleConstrainedFloat # Constrained float out
-  6. ruleRowCanonical ✅  # RowExtend spine sort（Phase 3.2）
-  7. ruleRecordCanonical  # Record field clean
-  8. ruleEffectNormalize ✅ # Effect VariantRow sort（Phase 3.2）
-  9. ruleMuUnfold         # μ(α).T → T[α↦μ(α).T]（muFuel）
-  10. ruleFnDesugar       # Fn → Lambda（默认关闭）
+┌─────────────────────────────────────────────────────────────┐
+│                    UnifiedSubst                              │
+│  {                                                          │
+│    typeBindings : AttrSet "t:${varName}" → Type             │
+│    rowBindings  : AttrSet "r:${varName}" → RowType          │
+│    kindBindings : AttrSet "k:${varName}" → Kind             │
+│  }                                                          │
+│                                                             │
+│  INV-US3: 前缀不冲突（t: vs r: vs k:）                     │
+│  INV-US1: compose law 成立（INV-US1 = 替换正确性核心）      │
+│                                                             │
+│  之前（Phase 3.3）：                                        │
+│    type subst: AttrSet String Type  → solver 用             │
+│    row subst:  AttrSet String Type  → unifyRow 单独返回     │
+│    ❌ 两轨不统一 → rowVar binding 无法注入 constraint       │
+│                                                             │
+│  现在（Phase 4.0）：                                        │
+│    solver_p40 统一使用 UnifiedSubst                         │
+│    RowEquality constraint → unifyRow → fromLegacyRowSubst   │
+│    → composeSubst → applySubstToConstraints                 │
+│    ✅ 单一 pipeline，INV-SOL-P40-1 成立                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Instance Resolution 算法（Phase 3.2）
+## QueryKey 增量管道（Phase 4.0，Salsa-style）
 
 ```
-resolveWithFallback(db, classGraph, className, args):
-  normArgs = map normalize args
-
-  # Stage 1: Primitive（内建，最高优先）
-  if isPrimitive(className, normArgs) →
-    return { found=true; impl=primitiveImpl; source="primitive" }
-
-  # Stage 2: Exact match（hash-based key）
-  key = instanceKey(className, normArgs)
-  if db.instances[key] exists →
-    return { found=true; impl=entry.impl; source="db-exact" }
-
-  # Stage 3: Specificity-based（Phase 3.2 新增）
-  candidates = [e ∈ db.byClass[className] | argsMatch(normArgs, e.normArgs)]
-  if candidates ≠ [] →
-    best = argmax_{c ∈ candidates} c.specificity  # tie: min key
-    return { found=true; impl=best.impl; source="db-specificity-N" }
-
-  # Stage 4: Superclass resolution
-  for subClass ∈ getAllSubs(classGraph, className):
-    result = resolveWithFallback(db, classGraph, subClass, normArgs)
-    if result.found && result.impl ≠ null →
-      return result // { source = "via-superclass(subClass)" }
-
-  return { found=false }
-
-argsMatch(callArgs, instArgs):
-  ∀i: instArgs[i] is Var          # 泛化 match
-     OR typeHash(callArgs[i]) == typeHash(instArgs[i])  # exact match
-     OR same Constructor name     # structural match
+┌───────────────────────────────────────────────────────────────────────┐
+│  Phase 3.3 Memo（epoch-based，粗粒度）：                              │
+│    bumpEpoch → 全量失效（所有 cache 清空）                            │
+│    invalidateType → hash前缀匹配（中粒度）                            │
+│    ❌ 无 dep tracking → 无法精确传播失效                              │
+│                                                                       │
+│  Phase 4.0 QueryDB（Salsa-style，细粒度）：                           │
+│    QueryKey = "tag:input1,input2,..."（INV-QK1）                      │
+│    storeResult(db, key, value, deps) → 记录反向依赖                   │
+│    invalidateKey(db, key) → BFS 传播（仅失效依赖此 key 的查询）        │
+│    detectCycle(db, key) → DFS cycle detection（INV-QK5）              │
+│                                                                       │
+│  失效传播示例：                                                       │
+│    normalize("Int") → hash("Int") → solve([Eq a Int])                 │
+│    invalidate normalize("Int")                                        │
+│    → hash("Int") invalid（deps 包含 normalize key）                   │
+│    → solve result invalid（deps 包含 normalize key）                  │
+│    ✅ INV-QK2：精确失效，无过度失效                                   │
+│                                                                       │
+│  与 Phase 3.3 memo 互补：                                             │
+│    memo  = 对 normalize/subst/solve 的 epoch bucket cache             │
+│    query = 对任意 QueryKey 的 dep-tracked 细粒度 cache                │
+│    bumpEpochDB = 兼容退化（全量失效，等同 memo.bumpEpoch）            │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Bisimulation Unification 算法（Phase 3.2）
+## TRS 规则集（Phase 4.0，完整）
+
+| 规则                      | 触发条件         | 语义                                     | Phase   |
+| ------------------------- | ---------------- | ---------------------------------------- | ------- |
+| ruleBetaReduce            | Apply + Lambda   | β-归约                                   | 1.0     |
+| ruleConstructorPartial    | Apply + Ctor     | 部分应用 + kind 推断（INV-K1）           | 3.1     |
+| ruleConstrainedFloat      | Apply + Const    | 约束上浮                                 | 3.0     |
+| ruleRowCanonical          | RowExtend        | spine sort → NF（INV-ROW）               | 3.2     |
+| ruleRecordCanonical       | Record           | null field 清理                          | 3.2     |
+| ruleEffectNormalize       | Effect           | VariantRow 字母序（INV-EFF）             | 3.2     |
+| ruleFnDesugar             | Fn               | 默认关闭                                 | 3.0     |
+| ruleMuUnfold              | Mu               | equi-recursive unfold                    | 2.0     |
+| ruleVariantRowCanonical   | VariantRow       | flatten + sort，open tail（INV-ROW-2）   | **4.0** |
+| ruleEffectMerge(P40)      | EffectMerge      | flatten + merge + RowVar tail（INV-EFF-6）| **4.0** |
+| ruleRefined               | Refined          | base 归约 + PTrue 消除                   | **4.0** |
+| ruleSig                   | Sig              | fields 字母序规范化（INV-MOD-4）         | **4.0** |
+
+规则引擎策略：`innermost + fixpoint（closed under normSubterms → rule → normSubterms）`
+
+---
+
+## Solver Pipeline（Phase 4.0）
 
 ```
-unifyMu(guard, binders, subst, a, b, fuel):
-
-  # Symmetric guard key（canonical pair）
-  key = if a.id ≤ b.id then "${a.id}:${b.id}" else "${b.id}:${a.id}"
-
-  if key ∈ guard:
-    return { ok=true, subst }    # coinductive hypothesis
-
-  if fuel ≤ 0:
-    # Fallback: alpha-canonical comparison
-    if serializeAlpha(a.repr) == serializeAlpha(b.repr):
-      return { ok=true, subst }
-    else:
-      return { ok=false, error="Mu: fuel exhausted" }
-
-  guard' = guard ∪ {key}
-  unfoldA = substitute(a.var, a, a.body)   # μ(α).T → T[α↦μ(α).T]
-  unfoldB = substitute(b.var, b, b.body)
-
-  # 若 unfold 后仍是 Mu → 递归 unifyMu（减少 fuel）
-  # 若 unfold 后非 Mu → 转入 unifyCore（正常结构比较）
-  return unifyMuBodies(guard', binders, subst, unfoldA, unfoldB, fuel-1)
-
-Soundness note:
-  guard set 保证对任意有限深度的 mu-type 对，算法终止
-  coinductive hypothesis 对 equi-recursive semantics 是 sound 的
-  fuel 防止无限展开（degenerates to alpha-canonical at limit）
+[Constraint]
+  → normalizeConstraint        # canonical form
+  → deduplicateConstraints     # O(n) set dedup
+  → _solveLoop (worklist)
+      ↓ Equality   → unify → fromLegacyTypeSubst → composeSubst → applyToWorklist
+      ↓ RowEquality → unifyRow → fromLegacyRowSubst → composeSubst → applyToWorklist
+      ↓ Class      → instanceDB → discharge / classResidual
+      ↓ Refined    → staticEvalPred → discharge / smtResidual
+      ↓ Implies    → check premises → enqueue conclusion / classResidual
+  → SolverResult {
+      ok;
+      subst: UnifiedSubst;   ← Phase 4.0: unified（INV-SOL-P40-1）
+      solved;
+      classResidual;
+      smtResidual;            ← Phase 4.0 新增（INV-SMT-3）
+      rowSubst;               ← 向后兼容（extracted from subst.rowBindings）
+    }
 ```
 
 ---
 
-## Row Canonical Form（Phase 3.2）
+## 架构风险矩阵（Phase 4.0 → 5.0）
 
-```
-Canonical form of RowExtend chain:
-  { l₁:T₁ | { l₂:T₂ | ... | tail } }  →  sorted by label (lexicographic)
-
-Algorithm:
-  unspine({ l:T | rest }) = { fields = [(l,T)] ++ unspine(rest).fields
-                             ; tail  = unspine(rest).tail }
-  unspine(tail)           = { fields = []; tail = tail }
-
-  canonical(row) =
-    let (fields, tail) = unspine(row)
-        sorted = sortBy label fields
-    in foldr (λ(l,T). { l:T | _ }) tail sorted
-
-Idempotency (INV-ROW):
-  canonical(canonical(row)) = canonical(row)
-  typeHash(canonical(row_ab)) = typeHash(canonical(row_ba))  # for same field set
-```
-
----
-
-## 不变量总表（Phase 3.2）
-
-| 不变量   | 描述                                              | 验证位置                | Phase 3.2 状态 |
-| -------- | ------------------------------------------------- | ----------------------- | -------------- |
-| INV-1    | 所有结构 ∈ TypeIR                                 | `lib/default.nix`       | ✅             |
-| INV-2    | normalize 终止（split fuel）                      | `normalize/rewrite.nix` | ✅             |
-| INV-3    | typeEq = NF-hash（单一路径）                      | `meta/equality.nix`     | ✅             |
-| INV-4    | cache key = NF-hash                               | `meta/hash.nix`         | ✅             |
-| INV-5    | 依赖追踪 = Graph Edge                             | `incremental/graph.nix` | ✅             |
-| INV-6    | Constraint ∈ TypeRepr                             | `constraint/ir.nix`     | ✅             |
-| INV-MU   | muEq = bisimulation（guard set）                  | `constraint/unify.nix`  | ✅ **新**      |
-| INV-ROW  | ruleRowCanonical 幂等                             | `normalize/rules.nix`   | ✅ **新**      |
-| INV-SPEC | specificity-based selection                       | `runtime/instance.nix`  | ✅ **新**      |
-| INV-I2   | overlap = partial unification                     | `runtime/instance.nix`  | ✅ **新**      |
-| INV-SOL4 | \_applySubstTypeFull（深层替换）                  | `constraint/solver.nix` | ✅ **强化**    |
-| INV-SOL5 | \_typeMentions 全变体                             | `constraint/solver.nix` | ✅ **强化**    |
-| INV-DEP  | \_substTypeInType = substLib（完整 capture-safe） | `bidir/check.nix`       | ✅ **新**      |
+| 风险                                          | 等级  | 缓解策略                                                   | 目标 Phase |
+| --------------------------------------------- | ----- | ---------------------------------------------------------- | ---------- |
+| SMT bridge = string only（用户需自行调用 z3） | 🟡 低 | smtBridge 生成标准 SMTLIB2；用户侧集成                     | 4.1        |
+| Refined subtype 非自动化                      | 🟠 中 | Phase 4.1 引入 implication oracle（SMT auto check）        | 4.1        |
+| Functor transitive composition 未实现         | 🟠 中 | applyFunctor 单次；Phase 4.2 引入 functor composition      | 4.2        |
+| Effect Handler continuations（delimited）     | 🟠 中 | 当前仅 type-level；Phase 4.3 引入 continuation passing     | 4.3        |
+| Mu bisimulation up-to congruence              | 🟡 低 | guard set 已覆盖 99% 用例；Phase 4.0 预研                  | 4.3        |
+| Decision Tree prefix sharing                  | 🟡 低 | sequential-first；Phase 4.x 引入 DTSplit                  | 4.x        |
+| QueryKey + Memo 双层缓存一致性                | 🟠 中 | 两者 key space 不重叠；bumpEpoch 同步两者；需文档化约定    | —          |
+| Nix evaluation depth limit（深 ADT）          | 🔴 高 | split fuel 保护；注意 Nix builtins.seq 强制求值范围        | 持续       |
