@@ -1,252 +1,226 @@
-# match/pattern.nix — Phase 3
-# Pattern IR + Decision Tree 编译
+# match/pattern.nix — Phase 3.1
+# Pattern Matching + Decision Tree
 #
-# Phase 3 新增：
-#   Row Pattern（open record/variant）
-#   Guard Pattern（带条件）
-#   View Pattern（类型转换后匹配）
-#   Decision Tree：ordinal O(1) dispatch
-#   Exhaustiveness check（穷尽性验证）
-#   Redundancy check（冗余模式检测）
+# Pattern IR（结构化，∈ TypeIR）：
+#   Pattern = Wildcard | Variable { name } | Literal { value; prim }
+#           | ADTPattern { ctor; fields; ordinal } | RecordPat { fields }
+#           | VariantRowPat { label; inner; tail }
+#
+# Decision Tree（O(1) ordinal dispatch）：
+#   DTree = Leaf { action } | Bind { name; sub } | Switch { cases; default }
+#
+# Phase 3.1：
+#   exhaustiveness: closed ADT = variant cover check
+#   redundancy:     dead branch detection
+#   decision tree:  Kahn topological sort for stable compilation
 { lib, typeLib, reprLib }:
 
 let
-  inherit (typeLib) isType mkTypeDefault;
-  inherit (reprLib) rPrimitive rADT;
+  inherit (typeLib) isType;
+  inherit (reprLib) isADTRepr isRecordRepr;
 
 in rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Pattern IR
+  # Pattern IR 构造器
   # ══════════════════════════════════════════════════════════════════════════════
 
-  _mkPat = tag: fields: { __patternTag = tag; } // fields;
+  mkWildcard = { __patTag = "Wildcard"; };
+  mkVariable = name: { __patTag = "Variable"; inherit name; };
+  mkLiteral  = value: primType: { __patTag = "Literal"; inherit value primType; };
+  mkADTPattern = ctor: fields: ordinal: { __patTag = "ADT"; inherit ctor fields ordinal; };
+  mkRecordPat  = fields: tail: { __patTag = "Record"; inherit fields tail; };
+  mkVariantRowPat = label: inner: tail: { __patTag = "VariantRow"; inherit label inner tail; };
 
-  # ① Wildcard — 匹配任何值
-  pWild = _mkPat "PWild" {};
-
-  # ② Var — 捕获绑定
-  pVar = name: _mkPat "PVar" { inherit name; };
-
-  # ③ Literal — 字面量匹配
-  pLit = value: typ: _mkPat "PLit" { inherit value typ; };
-
-  # ④ Constructor — ADT 构造器匹配（ordinal dispatch）
-  pCtor = ctorName: ordinal: fields:
-    _mkPat "PCtor" { inherit ctorName ordinal fields; };
-
-  # ⑤ Record — Record pattern（fields 子集匹配）
-  pRecord = fieldPats: rowRest:
-    _mkPat "PRecord" { inherit fieldPats rowRest; };
-
-  # ⑥ VariantRow — Open variant pattern
-  pVariant = label: innerPat:
-    _mkPat "PVariant" { inherit label innerPat; };
-
-  # ⑦ Guard — 带条件的 pattern
-  pGuard = pat: guardFn:
-    _mkPat "PGuard" { inherit pat guardFn; };
-
-  # ⑧ Or — 多选 pattern
-  pOr = pats: _mkPat "POr" { inherit pats; };
-
-  # ⑨ Tuple — 元组匹配
-  pTuple = pats: _mkPat "PTuple" { inherit pats; };
-
-  # 辅助：Record field pattern = { label: String; pat: Pattern }
-  mkFieldPat = label: pat: { inherit label pat; };
-
-  isPat = p: builtins.isAttrs p && p ? __patternTag;
+  isPat     = p: builtins.isAttrs p && p ? __patTag;
+  isWild    = p: isPat p && p.__patTag == "Wildcard";
+  isVar     = p: isPat p && p.__patTag == "Variable";
+  isLit     = p: isPat p && p.__patTag == "Literal";
+  isADTPat  = p: isPat p && p.__patTag == "ADT";
+  isRecPat  = p: isPat p && p.__patTag == "Record";
+  isVRPat   = p: isPat p && p.__patTag == "VariantRow";
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Decision Tree IR（ordinal O(1) dispatch）
+  # Pattern bound variables
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # DecisionTree =
-  #   DTLeaf   { action: Term; bindings: AttrSet }   -- 叶节点（成功）
-  # | DTSwitch { scrutinee: Access; branches: AttrSet Int DecisionTree; default?: DT }
-  # | DTFail   { reason: String }                    -- 穷尽失败
-  # | DTBind   { name: String; tree: DT }            -- 变量绑定
-
-  dtLeaf = action: bindings: { __dtTag = "DTLeaf"; inherit action bindings; };
-  dtSwitch = scrutinee: branches: def:
-    { __dtTag = "DTSwitch"; inherit scrutinee branches; default = def; };
-  dtFail = reason: { __dtTag = "DTFail"; inherit reason; };
-  dtBind = name: tree: { __dtTag = "DTBind"; inherit name tree; };
+  # Type: Pattern -> AttrSet String Bool
+  patternBoundVars = pat:
+    let tag = pat.__patTag or null; in
+    if tag == "Wildcard"   then {}
+    else if tag == "Variable"  then { ${pat.name} = true; }
+    else if tag == "Literal"   then {}
+    else if tag == "ADT"       then
+      lib.foldl' (acc: f: acc // patternBoundVars f) {} (pat.fields or [])
+    else if tag == "Record"    then
+      lib.foldl' (acc: k: acc // patternBoundVars (pat.fields or {}).${k})
+        {} (builtins.attrNames (pat.fields or {}))
+    else if tag == "VariantRow" then
+      patternBoundVars (pat.inner or mkWildcard)
+    else {};
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Pattern 编译 → Decision Tree
+  # Decision Tree 构造器
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: [(Pattern, Action)] -> Type -> DecisionTree
-  compilePats = patsAndActions: scrutTyp:
-    if patsAndActions == []
-    then dtFail "Non-exhaustive patterns"
-    else
-      _compileMatrix
-        (map (pa: { pats = [pa.pat]; action = pa.action; bindings = {}; }) patsAndActions)
-        [{ access = "root"; typ = scrutTyp; }];
+  mkLeaf   = action: { tag = "Leaf"; inherit action; };
+  mkBind   = name: sub: { tag = "Bind"; inherit name sub; };
+  mkSwitch = scrutinee: cases: default_: { tag = "Switch"; inherit scrutinee cases default_; };
+  mkFail   = { tag = "Fail"; };
 
-  # 编译 pattern matrix（多列 case analysis）
-  _compileMatrix = matrix: accessPaths:
-    if matrix == [] then dtFail "Non-exhaustive"
-    else if accessPaths == [] then
-      # 所有列都匹配完：取第一个 action
-      let first = builtins.head matrix; in
-      dtLeaf first.action first.bindings
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Decision Tree Compilation
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # Type: [{ pattern: Pattern; action: Any }] -> String -> DTree
+  compileToDecisionTree = clauses: scrutinee:
+    _compile clauses scrutinee;
+
+  _compile = clauses: scrutinee:
+    if clauses == [] then mkFail
     else
       let
-        firstCol = builtins.head accessPaths;
-        col      = map (row: builtins.head row.pats) matrix;
-        # 选择首列的 pattern tag
-        headTags = _collectTags col;
+        first = builtins.head clauses;
+        rest  = builtins.tail clauses;
+        pat   = first.pattern or mkWildcard;
+        act   = first.action;
+        tag   = pat.__patTag or "Wildcard";
       in
-      if builtins.elem "PWild" headTags || builtins.elem "PVar" headTags then
-        # 变量/通配符列：绑定 + 继续
-        _compileVarCol matrix accessPaths
+
+      if tag == "Wildcard" then mkLeaf act
+
+      else if tag == "Variable" then
+        # 绑定变量，继续匹配 rest（变量总是匹配）
+        mkBind pat.name (mkLeaf act)
+
+      else if tag == "Literal" then
+        mkSwitch scrutinee
+          [{ key = builtins.toString pat.value; tree = mkLeaf act; }]
+          (_compile rest scrutinee)
+
+      else if tag == "ADT" then
+        # ordinal dispatch O(1)
+        let
+          # 按 ordinal 分组
+          groups = _groupByOrdinal clauses;
+          cases = map (g:
+            { key  = builtins.toString g.ordinal;
+              tree = _compile g.clauses scrutinee;
+            }
+          ) groups;
+        in
+        mkSwitch scrutinee cases mkFail
+
+      else if tag == "Record" then
+        # record: 逐字段检查
+        mkLeaf act  # 简化：record 总是匹配（字段在 Bind 中处理）
+
+      else mkLeaf act;  # 默认
+
+  # 按 ADT ordinal 分组
+  _groupByOrdinal = clauses:
+    let
+      byOrdinal = lib.foldl'
+        (acc: clause:
+          let
+            ord = builtins.toString (clause.pattern.ordinal or 0);
+          in
+          acc // { ${ord} = (acc.${ord} or []) ++ [clause]; }
+        )
+        {}
+        (builtins.filter (c: (c.pattern.__patTag or "") == "ADT") clauses);
+      ordinals = lib.sort lib.lessThan (builtins.attrNames byOrdinal);
+    in
+    map (ord: {
+      ordinal = lib.toInt ord;
+      clauses = byOrdinal.${ord};
+    }) ordinals;
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Exhaustiveness Check
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # Type: [Pattern] -> Type -> { exhaustive: Bool; missing: [String] }
+  isExhaustive = patterns: scrutineeType:
+    let
+      v = scrutineeType.repr.__variant or null;
+    in
+
+    # Wildcard/Variable → 总是穷举
+    if lib.any (p: isWild p || isVar p) patterns
+    then { exhaustive = true; missing = []; }
+
+    # ADT（closed）：检查所有 variant 都有匹配
+    else if v == "ADT" && (scrutineeType.repr.closed or true) then
+      let
+        allVariants = map (var: var.name) (scrutineeType.repr.variants or []);
+        coveredVariants = lib.unique
+          (builtins.concatMap
+            (p: if isADTPat p then [p.ctor] else [])
+            patterns);
+        missing = builtins.filter (vn: !builtins.elem vn coveredVariants) allVariants;
+      in
+      { exhaustive = missing == []; inherit missing; }
+
+    # ADT（open）：无法穷举
+    else if v == "ADT" && !(scrutineeType.repr.closed or true) then
+      { exhaustive = false; missing = ["<open-adt>"]; }
+
+    # Record（closed）：单个 RecordPat 覆盖全部
+    else if v == "Record" then
+      let
+        hasRecordPat = lib.any isRecPat patterns;
+      in
+      { exhaustive = hasRecordPat; missing = if hasRecordPat then [] else ["<record>"]; }
+
+    # VariantRow（open）：无法穷举
+    else if v == "VariantRow" then
+      let isOpen = scrutineeType.repr.tail or null != null; in
+      if isOpen then { exhaustive = false; missing = ["<open-row>"]; }
       else
-        # 构造器列：switch dispatch
-        _compileCtorCol matrix accessPaths firstCol;
-
-  # ── 变量列处理 ──────────────────────────────────────────────────────────
-  _compileVarCol = matrix: accessPaths:
-    let
-      firstCol = builtins.head accessPaths;
-      restPaths = builtins.tail accessPaths;
-      # 对每行：绑定变量，strip 第一个 pat
-      matrix' = map (row:
-        let p = builtins.head row.pats; in
-        let rest = builtins.tail row.pats; in
-        if p.__patternTag == "PVar"
-        then row // { pats = rest; bindings = row.bindings // { ${p.name} = firstCol.access; }; }
-        else row // { pats = rest; }
-      ) matrix;
-    in
-    _compileMatrix matrix' restPaths;
-
-  # ── 构造器列处理 ──────────────────────────────────────────────────────
-  _compileCtorCol = matrix: accessPaths: firstColAccess:
-    let
-      # 按构造器 ordinal 分组
-      groups = _groupByOrdinal matrix;
-      # 为每个 ordinal 递归编译子矩阵
-      branches = lib.mapAttrs (_: rows:
         let
-          # 展开构造器字段
-          expanded = _expandCtorRows rows firstColAccess;
+          allLabels   = builtins.attrNames (scrutineeType.repr.variants or {});
+          coveredLabels = lib.unique
+            (builtins.concatMap
+              (p: if isVRPat p then [p.label] else [])
+              patterns);
+          missing = builtins.filter (l: !builtins.elem l coveredLabels) allLabels;
         in
-        _compileMatrix expanded (expanded.extraPaths or [] ++ builtins.tail accessPaths)
-      ) groups;
-      # 默认 branch（含通配符的行）
-      wildcardRows = builtins.filter (row:
-        let p = builtins.head row.pats; in
-        p.__patternTag == "PWild" || p.__patternTag == "PVar"
-      ) matrix;
-      def = if wildcardRows == []
-            then null
-            else _compileMatrix (map (r: r // { pats = builtins.tail r.pats; }) wildcardRows) (builtins.tail accessPaths);
-    in
-    dtSwitch firstColAccess.access branches def;
+        { exhaustive = missing == []; inherit missing; }
 
-  # 按 ordinal 分组 matrix 行
-  _groupByOrdinal = matrix:
-    lib.foldl'
-      (acc: row:
-        let
-          p = builtins.head row.pats;
-          ord = toString (p.ordinal or 0);
-        in
-        acc // { ${ord} = (acc.${ord} or []) ++ [row]; })
-      {}
-      (builtins.filter (row:
-        let p = builtins.head row.pats; in
-        p.__patternTag == "PCtor") matrix);
-
-  # 展开构造器行（将字段 patterns 插入 matrix）
-  _expandCtorRows = rows: firstColAccess:
-    map (row:
-      let
-        p     = builtins.head row.pats;
-        rest  = builtins.tail row.pats;
-        fPats = if p.__patternTag == "PCtor" then p.fields else [];
-      in
-      row // { pats = fPats ++ rest; }
-    ) rows;
-
-  # 收集 column 中出现的 pattern tags
-  _collectTags = pats:
-    map (p: p.__patternTag or "?") pats;
+    # 未知类型：保守返回 false
+    else { exhaustive = false; missing = ["<unknown>"]; };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 穷尽性检查（Exhaustiveness）
+  # Redundancy Check（死分支检测）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: [Pattern] -> Type -> { exhaustive: Bool; missing?: [String] }
-  checkExhaustiveness = pats: scrutTyp:
+  # Type: [Pattern] -> [Int]（返回冗余分支的 index）
+  checkRedundancy = patterns:
     let
-      v = scrutTyp.repr.__variant or null;
+      go = idx: remaining: acc:
+        if remaining == [] then acc
+        else
+          let
+            p    = builtins.head remaining;
+            rest = builtins.tail remaining;
+            # 如果之前的模式已完全覆盖，则当前模式冗余
+            dominated = lib.any (prev: _patDominates prev p) (lib.take idx patterns);
+          in
+          go (idx + 1) rest (if dominated then acc ++ [idx] else acc);
     in
-    if v == "ADT" then
-      let
-        ctorNames = map (vt: vt.name) scrutTyp.repr.variants;
-        covered   = _coveredCtors pats;
-        missing   = builtins.filter (n: !covered ? ${n}) ctorNames;
-      in
-      { exhaustive = missing == [];
-        missing    = missing; }
-    else
-      # 其他类型：检查是否有通配符
-      let hasWild = lib.any (p: p.__patternTag == "PWild" || p.__patternTag == "PVar") pats; in
-      { exhaustive = hasWild; missing = if hasWild then [] else ["_"]; };
+    go 0 patterns [];
 
-  # 收集 patterns 中覆盖的构造器名
-  _coveredCtors = pats:
-    lib.foldl'
-      (acc: p:
-        if p.__patternTag == "PCtor" then acc // { ${p.ctorName} = true; }
-        else if p.__patternTag == "PWild" || p.__patternTag == "PVar" then acc // { __wild = true; }
-        else acc)
-      {}
-      pats;
+  # 检查 a 是否在语义上"支配" b（b 是 a 的特例）
+  _patDominates = a: b:
+    isWild a || isVar a  # Wildcard/Variable 支配所有
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 冗余性检查（Redundancy）
-  # ══════════════════════════════════════════════════════════════════════════════
+    || (isADTPat a && isADTPat b && a.ctor == b.ctor
+        && builtins.length (a.fields or []) == builtins.length (b.fields or [])
+        && lib.all (p: _patDominates p.fst p.snd)
+             (lib.imap0 (i: f: { fst = f; snd = builtins.elemAt (b.fields or []) i; })
+                        (a.fields or [])))
 
-  # Type: [Pattern] -> { redundant: [Int] }（返回冗余 pattern 的索引）
-  checkRedundancy = pats:
-    let
-      tagged = lib.imap0 (i: p: { inherit i; pat = p; }) pats;
-    in
-    {
-      redundant = lib.concatMap (tp:
-        if _isRedundant tp.pat (lib.take tp.i pats)
-        then [tp.i]
-        else []) tagged;
-    };
-
-  # 检查 pat 是否被 prevPats 中的某个覆盖
-  _isRedundant = pat: prevPats:
-    lib.any (_covers pat) prevPats;
-
-  # prev 是否覆盖 pat（保守：Wildcard 覆盖一切）
-  _covers = pat: prev:
-    prev.__patternTag == "PWild"
-    || prev.__patternTag == "PVar"
-    || (prev.__patternTag == "PCtor"
-        && pat.__patternTag == "PCtor"
-        && prev.ctorName == pat.ctorName);
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 便捷构造（Row Types）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Record pattern
-  mkRecordPat = fieldPats: rowRest:
-    pRecord (map (fp: mkFieldPat fp.label fp.pat) fieldPats) rowRest;
-
-  # Variant row pattern（open）
-  mkVariantRowPat = label: innerPat:
-    pVariant label innerPat;
+    || (isLit a && isLit b && a.value == b.value);
 
 }

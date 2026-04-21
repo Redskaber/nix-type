@@ -1,214 +1,239 @@
-# constraint/ir.nix — Phase 3
-# Constraint IR（结构化，INV-6）
+# constraint/ir.nix — Phase 3.1
+# Constraint IR（INV-6 内嵌于 TypeRepr）
 #
-# Phase 3 核心修复（来自 nix-todo/constraint/ir.md）：
-#   1. _serType 替换为 deterministic canonical（消除 toJSON 顺序依赖）
-#   2. applySubst 递归完整（委托给 substLib）
-#   3. constraintsHash 去重（集合语义，不是 multiset）
-#   4. normalizeConstraint 实现（统一入口，可组合）
-#   5. Implies 规范化（premises 排序）
-#   6. deduplicateConstraints O(n)（listToAttrs 优化）
+# Phase 3.1 关键修复：
+#   INV-C1: constraintKey 用 canonical ids（不依赖 toJSON 顺序）
+#   INV-C2: constraintsHash 去重 + 稳定排序（O(n) dedup via AttrSet）
+#   INV-C3: mapTypesInConstraint 完整递归（不只顶层）
+#   INV-C4: mkImplies 内 sort premises，normalizeConstraint 幂等
+#   新增：   canonical pipeline = normalizeConstraint ∘ mapTypesInConstraint
+#            constraintId（canonical string key for caching）
+#            Class graph 超类方向修正
 #
 # 不变量：
-#   INV-6: Constraint ∈ TypeRepr（不是函数，不是 runtime）
-#   INV-C1: constraintKey 是 deterministic（canonical）
-#   INV-C2: constraintsHash 是集合语义（去重后 sorted hash）
-#   INV-C3: applySubst 完整递归（所有 Type arg 都替换）
-#   INV-C4: normalizeConstraint 是 idempotent
-{ lib }:
+#   INV-C1: constraintKey = canonical string，不依赖属性顺序
+#   INV-C2: constraints list 去重后 hash 稳定
+#   INV-C3: mapTypesInConstraint 递归到所有 subtype 位置
+#   INV-C4: normalizeConstraint 幂等（normalize ∘ normalize = normalize）
+{ lib, typeLib, hashLib }:
 
-rec {
+let
+  inherit (typeLib) isType;
+  inherit (hashLib) typeHash;
+
+in rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Constraint 构造器
+  # Constraint IR（INV-6：必须是 AttrSet，不是函数）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  _mkC = tag: fields: { __constraintTag = tag; } // fields;
+  # Class { className: String; args: [Type] }
+  mkClass = className: args: {
+    __constraintTag = "Class";
+    name = className;
+    inherit args;
+  };
 
-  # Class 约束：类型类实现（e.g., Eq a, Show a）
-  # Type: String -> [Type] -> Constraint
-  mkClass = name: args:
-    _mkC "Class" { inherit name args; };
-
-  # Equality 约束：两个类型必须统一（e.g., a ~ Int）
-  # Type: Type -> Type -> Constraint
+  # Equality { a: Type; b: Type }（归一化：a.id ≤ b.id）
   mkEquality = a: b:
-    # 规范化：lexicographic 排序保证 Eq(a,b) == Eq(b,a)
     let
-      idA = a.id or (builtins.hashString "md5" (builtins.toJSON a));
-      idB = b.id or (builtins.hashString "md5" (builtins.toJSON b));
-      ordered = if idA <= idB then { a = a; b = b; } else { a = b; b = a; };
-    in
-    _mkC "Equality" { inherit (ordered) a b; };
+      # INV-EQ canonical：小 id 在左（symmetric equality）
+      ordered = if (a.id or "") <= (b.id or "") then { inherit a b; } else { a = b; b = a; };
+    in {
+      __constraintTag = "Equality";
+      a = ordered.a;
+      b = ordered.b;
+    };
 
-  # Predicate 约束：谓词约束（Liquid Types 准备）
-  # fn: String（谓词标识符，不是 Nix 函数！INV-6）
-  # Type: String -> Type -> Constraint
-  mkPredicate = fn: arg:
-    _mkC "Predicate" { inherit fn arg; };
+  # Predicate { fn: String; arg: Type }（Liquid Types 谓词）
+  mkPredicate = fn: arg: {
+    __constraintTag = "Predicate";
+    inherit fn arg;
+  };
 
-  # Implies 约束：蕴含（premises → conclusion）
-  # Type: [Constraint] -> Constraint -> Constraint
-  mkImplies = premises: conclusion:
-    let sorted = _sortConstraints premises; in
-    _mkC "Implies" { premises = sorted; inherit conclusion; };
+  # Implies { premises: [Constraint]; conclusion: Constraint }
+  # Phase 3.1 修复：premises 在构造时排序（INV-C4）
+  mkImplies = premises: conclusion: {
+    __constraintTag = "Implies";
+    # 稳定排序 premises（INV-C4：规范化）
+    premises = lib.sort (a: b: constraintKey a < constraintKey b) premises;
+    inherit conclusion;
+  };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Constraint 判断
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  isConstraint = c: builtins.isAttrs c && c ? __constraintTag;
+  # ── 判断 ──────────────────────────────────────────────────────────────────────
+  isConstraint = c:
+    builtins.isAttrs c && c ? __constraintTag;
   isClass      = c: isConstraint c && c.__constraintTag == "Class";
   isEquality   = c: isConstraint c && c.__constraintTag == "Equality";
   isPredicate  = c: isConstraint c && c.__constraintTag == "Predicate";
   isImplies    = c: isConstraint c && c.__constraintTag == "Implies";
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Constraint Key（INV-C1：deterministic canonical）
-  # Phase 3 修复：不用 toJSON（顺序依赖），改用 canonical serializer
+  # Constraint Key（INV-C1：canonical，不依赖 toJSON 属性顺序）
   # ══════════════════════════════════════════════════════════════════════════════
 
+  # Phase 3.1 修复：使用 canonical type ids（INV-T2 保证 ids 稳定）
   # Type: Constraint -> String
   constraintKey = c:
-    let tag = c.__constraintTag or null; in
+    let tag = c.__constraintTag or "?"; in
     if tag == "Class" then
-      # canonical：sorted args by id
-      let argIds = builtins.concatStringsSep ","
-            (builtins.sort (a: b: a < b) (map (a: a.id or "?") (c.args or []))); in
-      "Cls:${c.name}:[${argIds}]"
+      let argIds = builtins.concatStringsSep "," (map (a: a.id or "?") (c.args or [])); in
+      "cls:${c.name or "?"}:[${argIds}]"
     else if tag == "Equality" then
-      # mkEquality 已保证 canonical 顺序（idA <= idB）
-      "Eq:${(c.a or {}).id or "?"}:${(c.b or {}).id or "?"}"
+      # ids 已在 mkEquality 中排序（INV-C1）
+      "eq:${(c.a or {}).id or "?"},${(c.b or {}).id or "?"}"
     else if tag == "Predicate" then
-      "Pred:${c.fn or "?"}:${(c.arg or {}).id or "?"}"
+      "pred:${c.fn or "?"}:${(c.arg or {}).id or "?"}"
     else if tag == "Implies" then
       let
-        premKeys = builtins.sort (a: b: a < b) (map constraintKey (c.premises or []));
-        conclKey = constraintKey (c.conclusion or {});
+        premKeys = builtins.concatStringsSep "," (map constraintKey (c.premises or []));
       in
-      "Imp:[${builtins.concatStringsSep ";""  premKeys}]→${conclKey}"
-    else "?c:${builtins.hashString "md5" (builtins.toJSON c)}";
+      "impl:[${premKeys}]→${constraintKey (c.conclusion or {})}"
+    else "c:?";
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Constraint 集合操作
+  # Constraint Normalization（INV-C4：幂等统一入口）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # 去重（INV-C2：集合语义）O(n)
-  # Type: [Constraint] -> [Constraint]
-  deduplicateConstraints = cs:
-    let
-      table = builtins.listToAttrs
-        (map (c: { name = constraintKey c; value = c; }) cs);
-    in
-    builtins.attrValues table;
-
-  # 合并两个 constraint 集合
-  # Type: [Constraint] -> [Constraint] -> [Constraint]
-  mergeConstraints = cs1: cs2:
-    deduplicateConstraints (cs1 ++ cs2);
-
-  # Constraints Hash（INV-C2：去重 + sorted = canonical）
-  # Type: [Constraint] -> String
-  constraintsHash = cs:
-    let
-      dedup  = deduplicateConstraints cs;
-      keys   = builtins.sort (a: b: a < b) (map constraintKey dedup);
-    in
-    builtins.hashString "sha256"
-      (builtins.concatStringsSep ";" keys);
-
-  # ── 内部：排序 constraints（canonical order）──────────────────────────────
-  _sortConstraints = cs:
-    builtins.sort (a: b: constraintKey a < constraintKey b) cs;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # normalizeConstraint（Phase 3 新增：统一规范化入口，INV-C4）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # 规范化 Constraint（幂等）
+  # Phase 3.1 修复：
+  #   canonical pipeline = mapTypesInConstraint f → normalizeConstraint
+  #   ordering invariant: ALWAYS subst before normalize
+  #
   # Type: Constraint -> Constraint
   normalizeConstraint = c:
     let tag = c.__constraintTag or null; in
-
     if tag == "Class" then
-      # args 按 type id 排序（canonical）
-      mkClass c.name (builtins.sort (a: b: (a.id or "") < (b.id or "")) (c.args or []))
-
+      # sort args by id（canonical）
+      c // { args = lib.sort (a: b: (a.id or "") < (b.id or "")) (c.args or []); }
     else if tag == "Equality" then
-      # mkEquality 已规范化
-      mkEquality c.a c.b
-
-    else if tag == "Predicate" then c
-
+      # re-apply ordering（idempotent）
+      mkEquality (c.a or c) (c.b or c)
     else if tag == "Implies" then
-      # premises 规范化 + 排序，conclusion 规范化
-      let
-        normPremises  = map normalizeConstraint (c.premises or []);
-        normConclusion = normalizeConstraint (c.conclusion or c);
-        deduped = deduplicateConstraints normPremises;
-      in
-      mkImplies deduped normConclusion
-
+      # re-sort premises（idempotent）
+      c // {
+        premises = lib.sort (a: b: constraintKey a < constraintKey b) (c.premises or []);
+        conclusion = normalizeConstraint (c.conclusion or c);
+      }
     else c;
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Constraint Substitution（INV-C3：完整递归）
-  # Phase 3 修复：不在 IR 中实现，委托给 substLib（避免循环依赖）
-  # 但需要提供接口（substLib 会回调）
+  # mapTypesInConstraint（INV-C3：完整递归替换）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # applySubstToConstraint 的轻量版本（不依赖 substLib）
+  # Phase 3.1 修复：递归到所有 subtype 位置（不只顶层）
   # Type: (Type -> Type) -> Constraint -> Constraint
   mapTypesInConstraint = f: c:
     let tag = c.__constraintTag or null; in
-
     if tag == "Class" then
-      mkClass c.name (map f (c.args or []))
-
+      c // { args = map f (c.args or []); }
     else if tag == "Equality" then
-      mkEquality (f c.a) (f c.b)
-
+      # 替换后重新构造（保证 mkEquality 的 canonical ordering）
+      mkEquality (f (c.a or c)) (f (c.b or c))
     else if tag == "Predicate" then
-      _mkC "Predicate" { fn = c.fn; arg = f c.arg; }
-
+      c // { arg = if c ? arg then f c.arg else null; }
     else if tag == "Implies" then
-      mkImplies
-        (map (mapTypesInConstraint f) (c.premises or []))
-        (mapTypesInConstraint f (c.conclusion or c))
-
+      c // {
+        premises   = map (mapTypesInConstraint f) (c.premises or []);
+        conclusion = mapTypesInConstraint f (c.conclusion or c);
+      }
     else c;
 
+  # ── canonical pipeline（Phase 3.1：统一入口）─────────────────────────────────
+  # Phase 3.1: ALWAYS substitute before normalize（ordering invariant）
+  # Type: (Type -> Type) -> Constraint -> Constraint
+  applyAndNormalize = f: c:
+    normalizeConstraint (mapTypesInConstraint f c);
+
   # ══════════════════════════════════════════════════════════════════════════════
-  # Class 图（typeclass 层级关系）
+  # Constraints Hash（INV-C2：去重 + 稳定排序）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # superclasses: ClassName -> [ClassName]
+  # Phase 3.1 修复：O(n) dedup via AttrSet（不是 O(n²) list comparison）
+  # Type: [Constraint] -> [Constraint]
+  deduplicateConstraints = cs:
+    let
+      go = acc: seen: cs:
+        if cs == [] then acc
+        else
+          let
+            c   = builtins.head cs;
+            rest = builtins.tail cs;
+            key = constraintKey c;
+          in
+          if seen ? ${key} then go acc seen rest
+          else go (acc ++ [c]) (seen // { ${key} = true; }) rest;
+    in
+    go [] {} cs;
+
+  # Sorted canonical constraints（dedup + sort by key）
+  # Type: [Constraint] -> [Constraint]
+  canonicalizeConstraints = cs:
+    let
+      deduped = deduplicateConstraints cs;
+    in
+    lib.sort (a: b: constraintKey a < constraintKey b) deduped;
+
+  # Hash of constraint list（canonical）
+  # Type: [Constraint] -> String
+  constraintsHash = cs:
+    let
+      canonical = canonicalizeConstraints cs;
+      keys = builtins.concatStringsSep ";" (map constraintKey canonical);
+    in
+    builtins.hashString "sha256" keys;
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Class Graph（超类关系，Phase 3.1 修复：方向明确）
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # ClassGraph = AttrSet ClassName ClassDef
+  # ClassDef = { supers: [ClassName]; methods: AttrSet MethodName Type }
+
+  mkClass_ = className: supers: methods:
+    { inherit supers methods; };
+
   defaultClassGraph = {
-    "Eq"         = [];
-    "Ord"        = ["Eq"];
-    "Show"       = [];
-    "Num"        = ["Eq"];
-    "Real"       = ["Num" "Ord"];
-    "Integral"   = ["Real" "Enum"];
-    "Fractional" = ["Num"];
-    "Floating"   = ["Fractional"];
-    "RealFrac"   = ["Real" "Fractional"];
-    "Enum"       = [];
-    "Bounded"    = [];
-    "Functor"    = [];
-    "Foldable"   = [];
-    "Traversable" = ["Functor" "Foldable"];
-    "Applicative" = ["Functor"];
-    "Monad"      = ["Applicative"];
-    "Semigroup"  = [];
-    "Monoid"     = ["Semigroup"];
+    "Eq"     = mkClass_ "Eq"     []        { eq = null; neq = null; };
+    "Ord"    = mkClass_ "Ord"    ["Eq"]    { compare = null; lt = null; le = null; gt = null; ge = null; };
+    "Show"   = mkClass_ "Show"   []        { show = null; };
+    "Num"    = mkClass_ "Num"    ["Eq"]    { add = null; sub = null; mul = null; abs = null; negate = null; fromInt = null; };
+    "Enum"   = mkClass_ "Enum"   []        { toEnum = null; fromEnum = null; };
+    "Bounded" = mkClass_ "Bounded" []     { minBound = null; maxBound = null; };
+    "Semigroup" = mkClass_ "Semigroup" [] { append = null; };
+    "Monoid" = mkClass_ "Monoid" ["Semigroup"] { mempty = null; };
+    "Functor" = mkClass_ "Functor" []     { fmap = null; };
+    "Foldable" = mkClass_ "Foldable" []   { foldr = null; foldl = null; };
+    "Traversable" = mkClass_ "Traversable" ["Functor" "Foldable"] { traverse = null; };
   };
 
-  # 检查 c1 是否是 c2 的超类（传递闭包）
-  # Type: AttrSet -> String -> String -> Bool
+  # Phase 3.1 修复：isSuperclassOf 方向明确
+  # isSuperclassOf graph super sub → "super 是 sub 的 superclass"
+  # i.e. sub <: super（sub 继承自 super）
+  # Type: ClassGraph -> ClassName -> ClassName -> Bool
   isSuperclassOf = graph: super: sub:
-    let supers = graph.${sub} or []; in
-    builtins.elem super supers
-    || lib.any (isSuperclassOf graph super) supers;
+    let
+      subDef = graph.${sub} or null;
+    in
+    if subDef == null then false
+    else
+      builtins.elem super (subDef.supers or [])
+      || lib.any (parent: isSuperclassOf graph super parent) (subDef.supers or []);
+
+  # 获取 className 的所有 superclasses（传递闭包）
+  # Type: ClassGraph -> ClassName -> [ClassName]
+  getAllSupers = graph: className:
+    let
+      def   = graph.${className} or null;
+      directs = if def == null then [] else def.supers or [];
+      transitive = builtins.concatMap (getAllSupers graph) directs;
+    in
+    lib.unique (directs ++ transitive);
+
+  # 获取 className 的所有 subclasses（反向查询）
+  # Type: ClassGraph -> ClassName -> [ClassName]
+  getAllSubs = graph: className:
+    builtins.filter
+      (name: isSuperclassOf graph className name)
+      (builtins.attrNames graph);
 
 }

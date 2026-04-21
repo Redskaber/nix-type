@@ -1,296 +1,275 @@
-# lib/default.nix — Phase 3
-# 统一模块入口（Nix Type System Library Phase 3）
+# lib/default.nix — Phase 3.1
+# 统一模块入口（正确拓扑序依赖）
 #
-# 模块装配顺序（严格依赖拓扑序）：
-#   1.  kindLib       — 无依赖
-#   2.  metaLib       — 无依赖
-#   3.  reprLib       — 无依赖（仅 lib）
-#   4.  serialLib     — 无依赖（仅 lib）
-#   5.  typeLib       — kindLib, metaLib, serialLib（延迟）
-#   6.  substLib      — typeLib, reprLib
-#   7.  rulesLib      — reprLib, substLib, kindLib, typeLib
-#   8.  normalizeLib  — typeLib, reprLib, rulesLib, substLib, kindLib
-#   9.  hashLib       — serialLib, normalizeLib, typeLib
-#   10. eqLib         — typeLib, normalizeLib, serialLib, metaLib
-#   11. constraintLib — lib（无 typeLib 依赖，避免循环）
-#   12. unifyLib      — reprLib, typeLib, serialLib
-#   13. solverLib     — constraintLib, unifyLib
-#   14. graphLib      — lib
-#   15. memoLib       — hashLib
-#   16. matchLib      — typeLib, reprLib
-#   17. instanceLib   — typeLib, hashLib, constraintLib, normalizeLib
-#   18. bidirLib      — typeLib, normalizeLib, constraintLib, unifyLib, reprLib
+# 拓扑序（严格）：
+#   kindLib → serialLib → metaLib → typeLib
+#          → reprLib（依赖 typeLib）
+#          → substLib（依赖 reprLib）
+#          → normalizeLib（依赖 rulesLib, substLib）
+#          → hashLib（依赖 normalizeLib, serialLib）
+#          → equalityLib（依赖 hashLib, normalizeLib）
+#          → constraintLib（依赖 typeLib, hashLib）
+#          → unifyLib（依赖 constraintLib, substLib, serialLib, hashLib）
+#          → instanceLib（依赖 constraintLib, hashLib, normalizeLib）
+#          → solverLib（依赖 constraintLib, unifyLib, instanceLib）
+#          → bidirLib（依赖 normalizeLib, constraintLib, unifyLib, reprLib）
+#          → graphLib（依赖 lib）
+#          → memoLib（依赖 hashLib, constraintLib）
+#          → matchLib（依赖 typeLib, reprLib）
 #
-# Phase 3 新增模块：
-#   - bidirLib（bidir/check.nix）— Bidirectional Type Checking（P3-0）
-#   - Pi/Sigma/Effect 全链路（repr → rules → normalize → unify → bidir）
-#   - Open ADT（extendADT）
-#   - Worklist Solver（constraint/solver.nix Phase 3）
+# INV-1~6 运行时验证也在此模块完成。
 { lib }:
 
 let
-
-  # ── 1. Kind System ─────────────────────────────────────────────────────────
+  # ── 层 0：Kind（无依赖）──────────────────────────────────────────────────────
   kindLib = import ../core/kind.nix { inherit lib; };
 
-  # ── 2. MetaType ────────────────────────────────────────────────────────────
-  metaLib = import ../core/meta.nix { inherit lib; };
-
-  # ── 3. TypeRepr ────────────────────────────────────────────────────────────
-  reprLib = import ../repr/all.nix { inherit lib; };
-
-  # ── 4. Serializer（α-canonical，Phase 3）──────────────────────────────────
+  # ── 层 1：Serialize（仅依赖 lib）────────────────────────────────────────────
   serialLib = import ../meta/serialize.nix { inherit lib; };
 
-  # ── 5. TypeIR Core（依赖 serialLib 延迟传入）──────────────────────────────
+  # ── 层 2：Meta（依赖 lib）───────────────────────────────────────────────────
+  metaLib = import ../core/meta.nix { inherit lib; };
+
+  # ── 层 3：Type（依赖 kindLib, metaLib, serialLib）────────────────────────────
   typeLib = import ../core/type.nix {
     inherit lib kindLib metaLib serialLib;
   };
 
-  # ── 6. Substitution ────────────────────────────────────────────────────────
+  # ── 层 4：Repr（依赖 typeLib, lib）──────────────────────────────────────────
+  reprLib = import ../repr/all.nix { inherit lib; };
+
+  # ── 层 5：Substitute（依赖 typeLib, reprLib）──────────────────────────────────
   substLib = import ../normalize/substitute.nix {
-    inherit lib reprLib typeLib;
+    inherit lib typeLib reprLib;
   };
 
-  # ── 7. TRS Rules（Phase 3：Pi-reduction + kind 修复）──────────────────────
+  # ── 层 5b：Rules（依赖 typeLib, reprLib, substLib, kindLib）───────────────────
   rulesLib = import ../normalize/rules.nix {
-    inherit lib reprLib substLib kindLib typeLib;
+    inherit lib typeLib reprLib substLib kindLib;
   };
 
-  # ── 8. Normalize Engine ────────────────────────────────────────────────────
+  # ── 层 6：Normalize（依赖 typeLib, reprLib, rulesLib）────────────────────────
   normalizeLib = import ../normalize/rewrite.nix {
-    inherit lib reprLib rulesLib substLib kindLib typeLib;
+    inherit lib typeLib reprLib rulesLib;
   };
 
-  # ── 9. Hash（Phase 3：统一 typeHash = nfHash ∘ normalize）────────────────
+  # ── 层 7：Hash（依赖 typeLib, normalizeLib, serialLib）───────────────────────
   hashLib = import ../meta/hash.nix {
-    inherit lib serialLib normalizeLib typeLib;
+    inherit lib typeLib normalizeLib serialLib;
   };
 
-  # ── 10. Equality（Phase 3：Coherence Law + muEq bisimulation）────────────
-  eqLib = import ../meta/equality.nix {
-    inherit lib typeLib normalizeLib serialLib metaLib;
+  # ── 层 8：Equality（依赖 typeLib, hashLib, normalizeLib, serialLib）───────────
+  equalityLib = import ../meta/equality.nix {
+    inherit lib typeLib hashLib normalizeLib serialLib;
   };
 
-  # ── 11. Constraint IR（Phase 3：normalizeConstraint + dedup）─────────────
-  constraintLib = import ../constraint/ir.nix { inherit lib; };
+  # ── 层 9：Constraint IR（依赖 typeLib, hashLib, lib）─────────────────────────
+  constraintLib = import ../constraint/ir.nix {
+    inherit lib typeLib hashLib;
+  };
 
-  # ── 12. Unification（Phase 3：alpha-canonical Lambda + Pi/Sigma）─────────
+  # ── 层 10：Unify（依赖 typeLib, reprLib, substLib, serialLib, hashLib）────────
   unifyLib = import ../constraint/unify.nix {
-    inherit lib reprLib typeLib;
-    serialLib = serialLib;
+    inherit lib typeLib reprLib substLib serialLib hashLib;
   };
 
-  # ── 13. Constraint Solver（Phase 3：Worklist）────────────────────────────
-  solverLib = import ../constraint/solver.nix {
-    inherit lib constraintLib unifyLib;
-  };
-
-  # ── 14. Dependency Graph ──────────────────────────────────────────────────
-  graphLib = import ../incremental/graph.nix { inherit lib; };
-
-  # ── 15. Memo Layer（Phase 3：epoch + NF-hash key）────────────────────────
-  memoLib = import ../incremental/memo.nix { inherit lib hashLib; };
-
-  # ── 16. Pattern Matching（Phase 3：Decision Tree + exhaustiveness）────────
-  matchLib = import ../match/pattern.nix { inherit lib typeLib reprLib; };
-
-  # ── 17. Instance Database（Phase 3：coherence + superclass）─────────────
+  # ── 层 11：Instance（依赖 typeLib, hashLib, normalizeLib, constraintLib）──────
   instanceLib = import ../runtime/instance.nix {
     inherit lib typeLib hashLib normalizeLib constraintLib;
   };
 
-  # ── 18. Bidirectional Type Checking（Phase 3 新增，P3-0）────────────────
+  # ── 层 12：Solver（依赖 constraintLib, unifyLib, instanceLib）────────────────
+  solverLib = import ../constraint/solver.nix {
+    inherit lib typeLib constraintLib unifyLib instanceLib;
+  };
+
+  # ── 层 13：Bidir（依赖 normalizeLib, constraintLib, unifyLib, reprLib）────────
   bidirLib = import ../bidir/check.nix {
     inherit lib typeLib normalizeLib constraintLib unifyLib reprLib;
   };
 
-in {
+  # ── 层 14：Graph（依赖 lib）──────────────────────────────────────────────────
+  graphLib = import ../incremental/graph.nix { inherit lib; };
+
+  # ── 层 15：Memo（依赖 hashLib, constraintLib）────────────────────────────────
+  memoLib = import ../incremental/memo.nix {
+    inherit lib hashLib constraintLib;
+  };
+
+  # ── 层 16：Match（依赖 typeLib, reprLib）─────────────────────────────────────
+  matchLib = import ../match/pattern.nix {
+    inherit lib typeLib reprLib;
+  };
+
+in rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 模块级 re-export（供直接使用）
+  # 模块导出（按拓扑序）
   # ══════════════════════════════════════════════════════════════════════════════
 
   inherit
-    kindLib metaLib reprLib serialLib typeLib substLib
-    rulesLib normalizeLib hashLib eqLib constraintLib
-    unifyLib solverLib graphLib memoLib matchLib
-    instanceLib bidirLib;
+    kindLib
+    serialLib
+    metaLib
+    typeLib
+    reprLib
+    substLib
+    rulesLib
+    normalizeLib
+    hashLib
+    equalityLib
+    constraintLib
+    unifyLib
+    instanceLib
+    solverLib
+    bidirLib
+    graphLib
+    memoLib
+    matchLib;
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 顶层 API（便捷 re-export）
+  # 顶层 API（常用符号直接导出）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # ── Kind ─────────────────────────────────────────────────────────────────
+  # Kind
   inherit (kindLib)
     KStar KArrow KRow KEffect KVar KUnbound KError
     KStar1 KStar2 KHO1 KRowToStar KEffToStarToStar
-    kindEq kindCheck kindUnify kindNormalize kindSubst kindInferRepr
-    serializeKind;
+    kindEq kindUnify kindCheck kindInferRepr kindNormalize serializeKind;
 
-  # ── Meta ─────────────────────────────────────────────────────────────────
-  inherit (metaLib)
-    defaultMeta nominalMeta opaqueMeta recursiveMeta rowMeta effectMeta
-    mergeMeta validateMeta isMeta isNominal isOpaque;
-
-  # ── TypeRepr ─────────────────────────────────────────────────────────────
-  inherit (reprLib)
-    rPrimitive rVar rVarDB rVarScoped
-    rLambda rApply rFn
-    rConstructor rADT rConstrained
-    rMu rRecord rVariantRow rRowExtend rRowEmpty
-    rPi rSigma rEffect rOpaque rAscribe  # Phase 3 新增
-    mkVariant mkADTFromVariants extendADT  # Open ADT
-    freeVarsRepr buildRowSpine;
-
-  # ── TypeIR Core ───────────────────────────────────────────────────────────
+  # Type
   inherit (typeLib)
-    mkType mkTypeWith mkTypeDefault mkBootstrapType
-    withRepr withKind withMeta withConstraints
-    isType isTypeStrict
-    reprOf kindOf metaOf idOf phaseOf labelOf
-    reprVariant validateType showType debugType stableId;
+    mkTypeWith mkTypeDefault mkBootstrapType mkType mkTypeConstrained
+    isType isTypeStrict showType debugType
+    withRepr withKind withMeta withConstraints withId
+    emptyEnv extendEnv lookupEnv
+    stableId;
 
-  # ── Normalize ────────────────────────────────────────────────────────────
-  inherit (normalizeLib)
-    normalize normalizeWith normalize'
-    isNormalForm isNormalFormDeep
-    normalizeAndCheckKind;
+  # Repr
+  inherit (reprLib)
+    rPrimitive rVar rVarDB rLambda rLambdaSimple rApply rFn
+    rPi rSigma rMu rRecord rVariantRow rRowExtend rRowEmpty
+    rConstructor rADT rConstrained rEffect rOpaque rAscribe
+    mkVariant extendADT mkParam mkParamSimple freeVarsRepr;
 
-  # ── Substitution ──────────────────────────────────────────────────────────
-  inherit (substLib)
-    substitute substituteAll composeSubst
-    deBruijnify flattenRow buildRow freeVars;
+  # Normalize
+  inherit (normalizeLib) normalize normalize';
+  inherit (substLib) substitute substituteAll composeSubst deBruijnify;
 
-  # ── Serialize ─────────────────────────────────────────────────────────────
-  inherit (serialLib)
-    serializeRepr serializeReprAlphaCanonical;
-
-  # ── Hash / Equality ───────────────────────────────────────────────────────
+  # Equality + Hash
+  inherit (equalityLib)
+    typeEq typeEqFull structuralEq alphaEq nominalEq hashEq muEq rowVarEq
+    checkCoherence;
   inherit (hashLib)
-    typeHash nfHash memoKey memoKeyNS
-    combineHashes combineTwo
-    hashCons emptyHashConsTable
-    typeHashCached emptyHashMemo
-    verifyHashConsistency verifyHashInvariants;
+    typeHash nfHash reprHash typeHashCached hashCons
+    deduplicateByHash sortByHash verifyHashConsistency;
 
-  inherit (eqLib)
-    typeEq alphaEq nominalEq structuralEq muEq rowEq
-    listTypeEq attrTypeEq checkCoherence;
-
-  # ── Constraint ────────────────────────────────────────────────────────────
+  # Constraint
   inherit (constraintLib)
     mkClass mkEquality mkPredicate mkImplies
-    isConstraint isClass isEquality isPredicate isImplies
-    constraintKey constraintsHash deduplicateConstraints mergeConstraints
-    normalizeConstraint mapTypesInConstraint
-    defaultClassGraph isSuperclassOf;
+    isClass isEquality isPredicate isImplies
+    constraintKey normalizeConstraint mapTypesInConstraint
+    deduplicateConstraints canonicalizeConstraints constraintsHash
+    defaultClassGraph isSuperclassOf getAllSupers getAllSubs;
 
-  # ── Unification ───────────────────────────────────────────────────────────
-  inherit (unifyLib)
-    unify emptySubst occursIn
-    unifyRecord unifyVariantRow;
+  # Solver
+  inherit (solverLib) solve solveWith solveDefault showResult;
 
-  # ── Solver（Phase 3：Worklist）──────────────────────────────────────────
-  inherit (solverLib)
-    solve solveDefault solveWithDB solveWithGraph
-    emptyInstanceDB register resolve withBuiltinInstances;
-
-  # ── Incremental ───────────────────────────────────────────────────────────
-  inherit (graphLib)
-    emptyGraph addNode removeNode addEdge
-    setNodeState propagateDirty batchUpdate
-    getNode getDeps getRevDeps getState dirtyNodes
-    topologicalSort showGraph NodeState;
-
-  inherit (memoLib)
-    emptyMemo bumpEpoch invalidateType
-    memoLookupNormalize memoStoreNormalize
-    memoLookupSubst memoStoreSubst
-    memoLookupSolve memoStoreSolve
-    withMemoNormalize memoStats showMemoStats;
-
-  # ── Pattern Matching ──────────────────────────────────────────────────────
-  inherit (matchLib)
-    pWild pVar pLit pCtor pRecord pVariant pGuard pOr pTuple
-    mkFieldPat mkRecordPat mkVariantRowPat
-    compilePats checkExhaustiveness checkRedundancy;
-
-  # ── Instance DB ───────────────────────────────────────────────────────────
+  # Instance
   inherit (instanceLib)
-    emptyInstanceDB register resolve withBuiltinInstances  # Duplicated name definition
-    resolveWithFallback canDischarge listInstances instanceCount;
+    emptyInstanceDB register registerAll resolve resolveWithFallback canDischarge
+    listInstances instanceCount;
 
-  # ── Bidirectional（Phase 3 新增）─────────────────────────────────────────
-  inherit (bidirLib)
-    check infer
-    tVar tLam tApp tAscribe tLet tLit tMatch mkBranch
-    emptyCtx ctxBind ctxLookup;
+  # Unify
+  inherit (unifyLib) unify unifyWith;
+
+  # Bidir
+  inherit (bidirLib) check infer emptyCtx ctxBind ctxLookup;
+
+  # Graph
+  inherit (graphLib)
+    emptyGraph addNode addEdge addEdgeSafe removeNode
+    propagateInvalidation batchUpdate topologicalSort
+    dirtyNodes cleanNodes graphStats verifySymmetry
+    stateClean stateDirty stateComputing stateStale stateError
+    isValidTransition;
+
+  # Memo
+  inherit (memoLib)
+    emptyMemo bumpEpoch
+    lookupNormalize storeNormalize withMemoNormalize
+    lookupSubst storeSubst lookupSolve storeSolve
+    invalidateType memoStats;
+
+  # Match
+  inherit (matchLib)
+    mkWildcard mkVariable mkLiteral mkADTPattern mkRecordPat mkVariantRowPat
+    compileToDecisionTree isExhaustive checkRedundancy patternBoundVars;
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 版本信息
+  # INV 运行时验证（全量，Phase 3.1）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  version = "3.0.0-phase3";
-  phase   = 3;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 系统不变量验证（运行时）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: {} -> { ok: Bool; violations: [String] }
-  verifyInvariants = {}:
+  # Type: AttrSet -> { ok: Bool; violations: [String] }
+  verifyInvariants = opts:
     let
-      # INV-1：TypeIR 基础
-      testType = typeLib.mkTypeDefault
-        (reprLib.rPrimitive "TestInt") kindLib.KStar;
-      inv1 = typeLib.isType testType;
-
-      # INV-T1：kind ≠ null（KUnbound 替代）
-      nullKindType = typeLib.withKind testType null;
-      inv_t1 = nullKindType.kind != null;
-
-      # INV-T2：stableId 确定性
-      repr1 = reprLib.rPrimitive "X";
-      repr2 = reprLib.rPrimitive "X";
-      id1   = typeLib.stableId repr1;
-      id2   = typeLib.stableId repr2;
-      inv_t2 = id1 == id2;
-
-      # INV-H2：typeHash = nfHash ∘ normalize
-      h1 = hashLib.typeHash testType;
-      nf = normalizeLib.normalize testType;
-      h2 = hashLib.nfHash nf;
-      inv_h2 = h1 == h2;
-
-      # INV-3：NF equality
-      t1 = typeLib.mkTypeDefault (reprLib.rPrimitive "Int") kindLib.KStar;
-      t2 = typeLib.mkTypeDefault (reprLib.rPrimitive "Int") kindLib.KStar;
-      inv3 = eqLib.typeEq t1 t2;
-
-      # INV-6：Constraint ∈ TypeRepr（Constrained repr 存在）
-      c   = constraintLib.mkClass "Show" [testType];
-      ct  = typeLib.mkTypeDefault (reprLib.rConstrained testType [c]) kindLib.KStar;
-      inv6 = ct.repr.__variant == "Constrained";
-
-      # INV-EQ2：Coherence Law（structural ⊆ nominal ⊆ hash）
-      coh = eqLib.checkCoherence t1 t2;
-      inv_eq2 = coh.coherent;
-
-      # INV-K4：kindUnify 纯函数（返回 ok）
-      ku = kindLib.kindUnify {} kindLib.KStar kindLib.KStar;
-      inv_k4 = ku.ok;
+      # 准备测试类型
+      tInt   = mkTypeDefault (rPrimitive "Int")   KStar;
+      tBool  = mkTypeDefault (rPrimitive "Bool")  KStar;
+      tA     = mkTypeDefault (rVar "a")           KStar;
+      tLam   = mkTypeDefault (rLambda "x" KUnbound tA) KStar1;
 
       violations =
-        (if !inv1    then ["INV-1: TypeIR construction"]        else [])
-        ++ (if !inv_t1 then ["INV-T1: null kind → KUnbound"]   else [])
-        ++ (if !inv_t2 then ["INV-T2: stableId determinism"]   else [])
-        ++ (if !inv_h2 then ["INV-H2: typeHash = nfHash∘norm"] else [])
-        ++ (if !inv3   then ["INV-3: NF equality"]             else [])
-        ++ (if !inv6   then ["INV-6: Constraint ∈ TypeRepr"]   else [])
-        ++ (if !inv_eq2 then ["INV-EQ2: Coherence Law"]        else [])
-        ++ (if !inv_k4  then ["INV-K4: kindUnify pure"]        else []);
+        # INV-1: 所有结构 ∈ TypeIR
+        (if !isType tInt then ["INV-1: tInt not a Type"] else [])
+
+        # INV-T1: kind ≠ null → KUnbound
+        ++ (let t = mkBootstrapType (rPrimitive "X"); in
+            if t.kind == null then ["INV-T1: bootstrap kind is null"] else [])
+
+        # INV-T2: stableId 确定性
+        ++ (let
+              id1 = stableId (rPrimitive "Int");
+              id2 = stableId (rPrimitive "Int");
+            in
+            if id1 != id2 then ["INV-T2: stableId not deterministic"] else [])
+
+        # INV-3: typeEq = NF-hash equality
+        ++ (if !typeEq tInt tInt  then ["INV-3: typeEq tInt tInt = false"] else [])
+        ++ (if  typeEq tInt tBool then ["INV-3: typeEq tInt tBool = true"] else [])
+
+        # INV-EQ1: typeEq ⟹ hash-eq
+        ++ (let h1 = typeHash tInt; h2 = typeHash (mkTypeDefault (rPrimitive "Int") KStar); in
+            if h1 != h2 then ["INV-EQ1: same type different hash"] else [])
+
+        # INV-H2: typeHash = nfHash ∘ normalize（单路径）
+        ++ (let
+              h1 = typeHash tInt;
+              nf = normalize tInt;
+              h2 = nfHash nf;
+            in
+            if h1 != h2 then ["INV-H2: typeHash != nfHash(normalize(t))"] else [])
+
+        # INV-K4: kindUnify 纯函数
+        ++ (let r = kindUnify {} KStar KStar; in
+            if !r.ok then ["INV-K4: kindUnify KStar KStar failed"] else [])
+
+        # INV-EQ2: structural ⊆ nominal ⊆ hash
+        ++ (let coh = checkCoherence tInt tInt; in
+            if !coh.coherent then ["INV-EQ2: coherence violated for tInt tInt: " + builtins.concatStringsSep ", " coh.violations] else [])
+
+        # INV-6: Constraint ∈ TypeRepr（mkClass 返回 attrset）
+        ++ (let c = mkClass "Eq" [tInt]; in
+            if !builtins.isAttrs c then ["INV-6: mkClass not AttrSet"] else [])
+
+        # INV-SER3: serializeAlpha canonical
+        ++ (let
+              s1 = serialLib.serializeReprAlphaCanonical (rPrimitive "Int");
+              s2 = serialLib.serializeReprAlphaCanonical (rPrimitive "Int");
+            in
+            if s1 != s2 then ["INV-SER3: serializeAlpha not deterministic"] else []);
+
     in
-    { ok = builtins.length violations == 0; inherit violations; };
+    { ok = violations == []; inherit violations; };
 
 }

@@ -1,55 +1,35 @@
-# core/meta.nix — Phase 3
-# MetaType 语义控制层
+# core/meta.nix — Phase 3.1
+# MetaType 语义控制层（Coherence Law 强制）
 #
-# Phase 3 关键修复：
-#   1. equality coherence law — 单一 canonical equality strategy（修复 INV-3 violation）
-#   2. muPolicy — equi-recursive bisimulation 深度控制
-#   3. rowPolicy — rowVar equality domain 修正
-#   4. effectPolicy — Effect System 策略（Phase 3 新增）
-#   5. bidirPolicy — Bidirectional checking 策略（Phase 3 新增）
+# Phase 3.1 修复：
+#   1. INV-3 强化：strategy 不影响 equality 判断路径，只影响 normalization 深度
+#   2. 移除 strategy 分支导致的 INV-EQ1 违反
+#   3. muPolicy / rowPolicy / effectPolicy / bidirPolicy 完整定义
+#   4. validateMeta 增强（coherence law 一致性检查）
 #
-# 核心原则（Phase 3）：
-#   所有 equality 最终归一到 single canonical normal form（INV-3 强制）
-#   不允许 multi-equality-semantics 并存而无 coherence law
+# 核心原则：
+#   所有 equality 归一到 single canonical NF（INV-3 强制）
+#   strategy 只影响 normalize 深度/展开策略，不影响比较路径
 { lib }:
 
 rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Equality Strategy（Phase 3：单一 canonical，coherence law 强制）
+  # Equality Strategy（Phase 3.1：纯注释性，不改变 equality 路径）
   # ══════════════════════════════════════════════════════════════════════════════
-
-  # Phase 3 Equality Coherence Law：
-  #   所有 equality 路径必须满足：
-  #     structuralEq(a,b) = true → nominalEq(a,b) = true（结构蕴含 nominal）
-  #     nominalEq(a,b) = true   → hashEq(a,b) = true（nominal 蕴含 hash）
-  #   即：structural ⊆ nominal ⊆ hash（不允许反向）
-  #
-  # 实现：统一走 NF-hash equality，strategy 只影响 normalization 深度
+  # 注意：Phase 3.1 核心修复 —— 所有 equality 最终都走 NF-hash 比较
+  # strategy 只决定 normalize 时的展开深度策略（不决定是否比较）
 
   EqStrategy = {
-    # 结构相等（NF 比较，最精确）— 默认
-    structural = "structural";
-    # 名义相等（name + structure，用于 ADT nominal typing）
-    nominal    = "nominal";
-    # 引用相等（hash 相等 → 相等，最宽松）
-    referential = "referential";
+    structural  = "structural";  # NF 比较（最精确，默认）
+    nominal     = "nominal";     # name + NF（ADT 名义类型）
+    referential = "referential"; # hash 相等即相等（最宽松）
   };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Hash Strategy
-  # ══════════════════════════════════════════════════════════════════════════════
 
   HashStrategy = {
-    # 基于 NF repr 的 canonical hash（默认，INV-4 要求）
-    normalized = "normalized";
-    # 基于 raw repr 的 hash（仅用于内部快速路径，不对外）
-    repr       = "repr";
+    normalized = "normalized";  # NF-hash（默认，INV-4 要求）
+    repr       = "repr";        # raw repr hash（仅内部快速路径）
   };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Eval Strategy
-  # ══════════════════════════════════════════════════════════════════════════════
 
   EvalStrategy = {
     lazy   = "lazy";    # 惰性求值（默认）
@@ -57,29 +37,32 @@ rec {
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Mu Policy（Phase 3：equi-recursive bisimulation 控制）
+  # Mu Policy（equi-recursive bisimulation 控制）
   # ══════════════════════════════════════════════════════════════════════════════
 
   MuPolicy = {
-    # 展开深度限制（bisimulation fuel）
-    fuel    = 8;
-    # 是否启用 coinductive bisimulation（Phase 3 新增）
-    coinductive = true;
-    # bisimulation guard：已访问对 (a.id, b.id) → 视为相等（coinductive assumption）
+    # bisimulation 燃料（展开深度上限）
+    fuel         = 8;
+    # 启用 coinductive bisimulation（guard set 保护）
+    coinductive  = true;
+    # guard set：已访问对 (a.id, b.id) → coinductive hypothesis
     guardEnabled = true;
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Row Policy（Phase 3：rowVar equality domain 修正）
+  # Row Policy（rowVar equality domain 修正，INV-EQ4）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Phase 3 修复：rowVar 不走 alphaEq（binder equality），而走 rigid var equality
+  # Phase 3.1 修复：rowVar 不走 alphaEq（binder equality）
+  # 而走 rigid var equality（unification variable 语义）
   RowPolicy = {
-    # "rigid"   → rowVar 用 name equality（unification variable）
+    # "rigid"   → rowVar 用 name equality
     # "unified" → rowVar 走 unification（最灵活）
-    rowVarEq = "rigid";
-    # row field 排序策略（canonical）
+    rowVarEq  = "rigid";
+    # row field 排序策略（canonical lexicographic）
     fieldSort = "lexicographic";
+    # 允许 structural row extension
+    openRows  = true;
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
@@ -87,115 +70,106 @@ rec {
   # ══════════════════════════════════════════════════════════════════════════════
 
   KindCheckPolicy = {
-    # "strict"  → kind mismatch = error
-    # "lenient" → kind mismatch = warning（Phase 1 compat）
-    mode    = "strict";
-    # 是否在 normalize 后验证 kind 一致性
-    postNormalize = true;
+    mode           = "strict";    # "strict" | "lenient"
+    postNormalize  = true;        # normalize 后验证 kind 一致性
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Effect Policy（Phase 3 新增）
+  # Effect Policy（Phase 3：Row-based algebraic effects）
   # ══════════════════════════════════════════════════════════════════════════════
 
   EffectPolicy = {
-    # "row"     → Effect 用 Row Polymorphism 编码（Koka 风格）
-    # "set"     → Effect 用集合（Haskell mtl 近似）
-    encoding  = "row";
-    # 默认 effect row（空 = 纯函数）
-    defaultRow = null;
+    encoding   = "row";   # "row" | "set"
+    defaultRow = null;    # 默认 effect row（null = 纯函数）
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Bidirectional Policy（Phase 3 新增）
+  # Bidirectional Policy（Pierce/Turner 风格）
   # ══════════════════════════════════════════════════════════════════════════════
 
   BidirPolicy = {
-    # 是否启用 bidirectional type checking
-    enabled = true;
-    # subsumption 模式："coercive" | "strict"
-    subsumption = "strict";
+    enabled      = true;
+    subsumption  = "strict";  # "coercive" | "strict"
+  };
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Normalize Policy（Phase 3.1 新增：统一化 normalize 策略）
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  NormalizePolicy = {
+    # β-reduction 燃料
+    betaFuel      = 64;
+    # 深度限制
+    depthFuel     = 32;
+    # Mu 展开燃料（独立于 bisimulation fuel）
+    muFuel        = 8;
+    # eta reduction 是否启用（Phase 3.1：保守关闭）
+    etaEnabled    = false;
+    # innermost / outermost reduction strategy
+    strategy      = "innermost";
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
   # MetaType 构造器
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # 默认 Meta（所有 Phase 3 策略默认值）
   defaultMeta = {
-    __metaTag     = "MetaType";
-    eqStrategy    = EqStrategy.structural;
-    hashStrategy  = HashStrategy.normalized;
-    evalStrategy  = EvalStrategy.lazy;
-    muPolicy      = MuPolicy;
-    rowPolicy     = RowPolicy;
+    __metaTag       = "MetaType";
+    eqStrategy      = EqStrategy.structural;
+    hashStrategy    = HashStrategy.normalized;
+    evalStrategy    = EvalStrategy.lazy;
+    muPolicy        = MuPolicy;
+    rowPolicy       = RowPolicy;
     kindCheckPolicy = KindCheckPolicy;
-    effectPolicy  = EffectPolicy;
-    bidirPolicy   = BidirPolicy;
-    # 内嵌约束（Constrained 的补充，INV-6 支持）
-    constraints   = [];
-    # 不透明标记（nominal typing）
-    opaque        = false;
-    # 调试标签
-    label         = null;
-    # Phase 追踪
-    phase         = 3;
+    effectPolicy    = EffectPolicy;
+    bidirPolicy     = BidirPolicy;
+    normalizePolicy = NormalizePolicy;
+    constraints     = [];   # 内嵌约束（INV-6）
+    opaque          = false;
+    label           = null;
+    phase           = 3;
   };
 
-  # Nominal Meta（ADT name-based equality）
   nominalMeta = defaultMeta // {
     eqStrategy = EqStrategy.nominal;
     opaque     = true;
   };
 
-  # Opaque Meta（黑盒类型）
   opaqueMeta = defaultMeta // {
     eqStrategy = EqStrategy.referential;
     opaque     = true;
   };
 
-  # Recursive Meta（equi-recursive 类型，muFuel 控制展开）
   recursiveMeta = defaultMeta // {
-    muPolicy = MuPolicy // { fuel = 16; };
+    muPolicy = MuPolicy // { fuel = 16; coinductive = true; };
   };
 
-  # Row Meta（Row 类型专用）
-  rowMeta = defaultMeta // {
-    rowPolicy = RowPolicy // { rowVarEq = "rigid"; };
-  };
+  # ══════════════════════════════════════════════════════════════════════════════
+  # MetaType 判断与验证
+  # ══════════════════════════════════════════════════════════════════════════════
 
-  # Effect Meta（Effect 类型专用，Phase 3）
-  effectMeta = defaultMeta // {
-    effectPolicy = EffectPolicy // { encoding = "row"; };
-  };
+  isMeta = m:
+    builtins.isAttrs m && (m.__metaTag or null) == "MetaType";
 
-  # ── MetaType 谓词 ──────────────────────────────────────────────────────────
-  isMeta       = m: builtins.isAttrs m && (m.__metaTag or null) == "MetaType";
-  isNominal    = m: isMeta m && m.eqStrategy == EqStrategy.nominal;
-  isOpaque     = m: isMeta m && m.opaque;
-  isRecursive  = m: isMeta m && m.muPolicy.coinductive or false;
-
-  # ── Meta 合并（覆盖策略）─────────────────────────────────────────────────
-  # Type: MetaType -> MetaType -> MetaType
-  mergeMeta = base: override:
-    base // override // {
-      __metaTag   = "MetaType";
-      constraints = (base.constraints or []) ++ (override.constraints or []);
-    };
-
-  # ── Meta 验证（Phase 3 coherence check）──────────────────────────────────
+  # MetaType 验证（Phase 3.1：coherence law 一致性检查）
   # Type: MetaType -> { ok: Bool; violations: [String] }
   validateMeta = m:
     let
       violations =
         (if !(isMeta m) then ["not a MetaType"] else [])
         ++
-        # Coherence Law：nominal + not opaque = 警告（允许但建议 opaque）
-        (if (m.eqStrategy or null) == EqStrategy.nominal && !(m.opaque or false)
-         then ["nominal eq without opaque flag — consider setting opaque=true"]
+        # INV-3 coherence：strategy 合法值
+        (let s = m.eqStrategy or null; in
+         if !builtins.elem s [EqStrategy.structural EqStrategy.nominal EqStrategy.referential]
+         then ["invalid eqStrategy: ${builtins.toString s}"]
          else [])
         ++
-        # referential + constraints = 警告（约束在 referential 下无意义）
+        # nominal 必须 opaque
+        (if (m.eqStrategy or null) == EqStrategy.nominal && !(m.opaque or false)
+         then ["nominal eq without opaque=true — possible coherence break"]
+         else [])
+        ++
+        # referential + constraints = 语义矛盾
         (if (m.eqStrategy or null) == EqStrategy.referential
             && builtins.length (m.constraints or []) > 0
          then ["referential eq with constraints — constraints ignored in referential mode"]
@@ -203,4 +177,32 @@ rec {
     in
     { ok = builtins.length violations == 0; inherit violations; };
 
+  # ══════════════════════════════════════════════════════════════════════════════
+  # MetaType 工具
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # Type: MetaType -> MetaType -> MetaType（合并两个 Meta，保守合并）
+  mergeMeta = a: b:
+    defaultMeta // {
+      eqStrategy   = if a.eqStrategy == EqStrategy.referential
+                        || b.eqStrategy == EqStrategy.referential
+                     then EqStrategy.referential
+                     else if a.eqStrategy == EqStrategy.nominal
+                             || b.eqStrategy == EqStrategy.nominal
+                     then EqStrategy.nominal
+                     else EqStrategy.structural;
+      constraints  = (a.constraints or []) ++ (b.constraints or []);
+      opaque       = (a.opaque or false) || (b.opaque or false);
+      label        = a.label or b.label;
+    };
+
+  # Type: MetaType -> [Constraint] -> MetaType
+  addConstraints = m: cs:
+    m // { constraints = (m.constraints or []) ++ cs; };
+
+  # 获取 normalize 燃料
+  getBetaFuel = m:
+    (m.normalizePolicy or NormalizePolicy).betaFuel or 64;
+  getMuFuel = m:
+    (m.muPolicy or MuPolicy).fuel or 8;
 }

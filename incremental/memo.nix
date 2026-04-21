@@ -1,208 +1,186 @@
-# incremental/memo.nix — Phase 3
-# Memo 层（INV-H3 强化 + epoch + 语义 hash key）
+# incremental/memo.nix — Phase 3.1
+# Memo 层（INV-M1-4 完整实现）
 #
-# Phase 3 修复（来自 nix-todo/incremental/memo.md）：
-#   1. memoKey 单一来源（typeHash，INV-H3）
-#   2. epoch bump 协议（版本化 key：epoch:hash）
-#   3. 分桶设计（normalize / substitute / solve 独立 bucket）
-#   4. 约束 hash：sorted + dedup（INV-M-3）
-#   5. 缓存一致性验证（detect 隐性 cache miss）
-#
-# 不变量：
-#   INV-M1: memoKey = typeHash(t)（经过 normalize，INV-H3）
-#   INV-M2: epoch bump → 所有 keys 失效（全量失效）
-#   INV-M3: constraint key 是 sorted + dedup（canonical）
+# Phase 3.1 修复：
+#   INV-M1: memoKey = typeHash(t)（单一来源，INV-H2 保证）
+#   INV-M2: epoch bump → 所有 versioned keys 失效
+#   INV-M3: constraint key = sorted + dedup（canonical）
 #   INV-M4: versioned key = "epoch:hash"（细粒度失效）
-{ lib, hashLib }:
+#   新增：   结构化 cache value（不是 string identity 陷阱）
+#            withMemoNormalize 包装器（正确 compute callback 语义）
+#            invalidateSubgraph（细粒度 type-level 失效）
+{ lib, hashLib, constraintLib }:
 
-rec {
+let
+  inherit (hashLib) typeHash;
+  inherit (constraintLib) constraintKey;
+
+  # 版本化 key
+  _vKey = epoch: rawKey: "${builtins.toString epoch}:${rawKey}";
+
+in rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Memo Store 结构
+  # MemoStore 结构
   # ══════════════════════════════════════════════════════════════════════════════
 
   # MemoStore = {
-  #   epoch: Int;                    # 全局版本（bump → 全量失效）
-  #   normalize: AttrSet;            # normalize bucket
-  #   substitute: AttrSet;           # substitute bucket
-  #   solve: AttrSet;                # solver bucket
-  #   hash: AttrSet;                 # hash cache（快速路径）
-  #   stats: { hits: Int; misses: Int; evictions: Int };
+  #   epoch:     Int                  # 全局版本（bump → 全量失效）
+  #   normalize: AttrSet VKey NF      # normalize → NF bucket
+  #   substitute: AttrSet VKey Type   # substitute bucket
+  #   solve:     AttrSet VKey Result  # solver bucket
+  #   stats:     { hits; misses; evictions }
   # }
 
   emptyMemo = {
-    epoch     = 0;
-    normalize = {};
+    epoch      = 0;
+    normalize  = {};
     substitute = {};
     solve      = {};
-    hash       = {};
     stats      = { hits = 0; misses = 0; evictions = 0; };
   };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Key 协议
+  # Normalize Bucket（INV-M1：memoKey = typeHash）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # versioned key（INV-M4）
-  # Type: MemoStore -> String -> String
-  _vKey = memo: rawKey: "${toString memo.epoch}:${rawKey}";
-
-  # Type: MemoStore -> Type -> String
-  _typeKey = memo: t: _vKey memo (hashLib.typeHash t);
-
-  # Type: MemoStore -> Type -> String -> String（带 namespace）
-  _nsKey = memo: namespace: t: _vKey memo "${namespace}:${hashLib.typeHash t}";
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Normalize Bucket
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: MemoStore -> Type -> { found: Bool; value?: Type; memo: MemoStore }
-  memoLookupNormalize = memo: t:
-    let key = _typeKey memo t; in
-    let cached = memo.normalize.${key} or null; in
+  # Type: MemoStore -> Type -> { hit: Bool; value?: Type; memo: MemoStore }
+  lookupNormalize = memo: t:
+    let
+      key    = _vKey memo.epoch (typeHash t);
+      cached = memo.normalize.${key} or null;
+    in
     if cached != null
-    then {
-      found = true;
-      value = cached;
-      memo  = memo // { stats = memo.stats // { hits = memo.stats.hits + 1; }; };
-    }
-    else {
-      found = false;
-      memo  = memo // { stats = memo.stats // { misses = memo.stats.misses + 1; }; };
-    };
+    then { hit = true; value = cached; memo = _bumpHit memo; }
+    else { hit = false; memo = _bumpMiss memo; };
 
   # Type: MemoStore -> Type -> Type -> MemoStore
-  memoStoreNormalize = memo: t: nf:
-    let key = _typeKey memo t; in
+  storeNormalize = memo: t: nf:
+    let key = _vKey memo.epoch (typeHash t); in
     memo // { normalize = memo.normalize // { ${key} = nf; }; };
+
+  # 包装器：先 lookup，miss 则 compute + store
+  # Type: MemoStore -> Type -> (Type -> Type) -> { result: Type; memo: MemoStore }
+  withMemoNormalize = memo: t: computeFn:
+    let looked = lookupNormalize memo t; in
+    if looked.hit
+    then { result = looked.value; memo = looked.memo; }
+    else
+      let
+        nf     = computeFn t;
+        memo'  = storeNormalize looked.memo t nf;
+      in
+      { result = nf; memo = memo'; };
 
   # ══════════════════════════════════════════════════════════════════════════════
   # Substitute Bucket
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Key = typeHash(t) + hash(substSig)
   _substSig = subst:
     let
-      pairs = builtins.sort (a: b: a < b)
-        (map (k: "${k}:${(subst.${k}).id or "?"}") (builtins.attrNames subst));
+      # 稳定排序（deterministic key）
+      pairs = lib.sort lib.lessThan
+        (map (k: "${k}=${(subst.${k}).id or "?"}") (builtins.attrNames subst));
     in
     builtins.hashString "md5" (builtins.concatStringsSep ";" pairs);
 
-  # Type: MemoStore -> Type -> Subst -> { found: Bool; value?: Type; memo: MemoStore }
-  memoLookupSubst = memo: t: subst:
+  lookupSubst = memo: t: subst:
     let
-      key = _vKey memo "${hashLib.typeHash t}:subst:${_substSig subst}";
+      key    = _vKey memo.epoch "${typeHash t}:S:${_substSig subst}";
       cached = memo.substitute.${key} or null;
     in
     if cached != null
-    then { found = true; value = cached; memo = _bumpHit memo; }
-    else { found = false; memo = _bumpMiss memo; };
+    then { hit = true; value = cached; memo = _bumpHit memo; }
+    else { hit = false; memo = _bumpMiss memo; };
 
-  # Type: MemoStore -> Type -> Subst -> Type -> MemoStore
-  memoStoreSubst = memo: t: subst: result:
-    let key = _vKey memo "${hashLib.typeHash t}:subst:${_substSig subst}"; in
+  storeSubst = memo: t: subst: result:
+    let key = _vKey memo.epoch "${typeHash t}:S:${_substSig subst}"; in
     memo // { substitute = memo.substitute // { ${key} = result; }; };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Solve Bucket
+  # Solve Bucket（INV-M3：constraint sorted + dedup）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Key = hash(constraints)（sorted + dedup，INV-M3）
   _constraintSetKey = cs:
     let
-      # dedup（listToAttrs O(n)）
+      # dedup via AttrSet（O(n)）
       table = builtins.listToAttrs
-        (map (c: {
-          name = _constraintKey c;
-          value = true;
-        }) cs);
-      sorted = builtins.sort (a: b: a < b) (builtins.attrNames table);
+        (map (c: { name = constraintKey c; value = true; }) cs);
+      sorted = lib.sort lib.lessThan (builtins.attrNames table);
     in
-    builtins.hashString "sha256"
-      (builtins.concatStringsSep ";" sorted);
+    builtins.hashString "sha256" (builtins.concatStringsSep ";" sorted);
 
-  _constraintKey = c:
-    let tag = c.__constraintTag or c.__tag or null; in
-    if tag == "Class" then
-      "Cls:${c.name}:${builtins.concatStringsSep "," (map (a: a.id or "?") (c.args or []))}"
-    else if tag == "Equality" then "Eq:${(c.a or {}).id or "?"}:${(c.b or {}).id or "?"}"
-    else if tag == "Predicate" then "Pred:${c.fn or "?"}:${(c.arg or {}).id or "?"}"
-    else builtins.hashString "md5" (builtins.toJSON c);
-
-  # Type: MemoStore -> [Constraint] -> { found: Bool; value?: SolveResult; memo: MemoStore }
-  memoLookupSolve = memo: constraints:
-    let key = _vKey memo (_constraintSetKey constraints); in
-    let cached = memo.solve.${key} or null; in
+  lookupSolve = memo: constraints:
+    let
+      key    = _vKey memo.epoch (_constraintSetKey constraints);
+      cached = memo.solve.${key} or null;
+    in
     if cached != null
-    then { found = true; value = cached; memo = _bumpHit memo; }
-    else { found = false; memo = _bumpMiss memo; };
+    then { hit = true; value = cached; memo = _bumpHit memo; }
+    else { hit = false; memo = _bumpMiss memo; };
 
-  # Type: MemoStore -> [Constraint] -> SolveResult -> MemoStore
-  memoStoreSolve = memo: constraints: result:
-    let key = _vKey memo (_constraintSetKey constraints); in
+  storeSolve = memo: constraints: result:
+    let key = _vKey memo.epoch (_constraintSetKey constraints); in
     memo // { solve = memo.solve // { ${key} = result; }; };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Epoch 管理（全量失效）
+  # Epoch 管理（INV-M2：全量失效）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: MemoStore -> MemoStore（bump epoch → 所有 versioned keys 失效）
+  # Type: MemoStore -> MemoStore
   bumpEpoch = memo:
+    let
+      evictionCount = builtins.length (builtins.attrNames memo.normalize)
+                    + builtins.length (builtins.attrNames memo.substitute)
+                    + builtins.length (builtins.attrNames memo.solve);
+    in
     memo // {
-      epoch = memo.epoch + 1;
-      # 可选：清理旧 bucket（在 Nix 中 lazy，旧 key 自然失效）
+      epoch      = memo.epoch + 1;
       normalize  = {};
       substitute = {};
       solve      = {};
-      hash       = {};
-      stats      = memo.stats // { evictions = memo.stats.evictions + builtins.length (builtins.attrNames memo.normalize); };
+      stats      = memo.stats // { evictions = memo.stats.evictions + evictionCount; };
     };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 细粒度失效（单节点失效，INV-M4）
+  # 细粒度失效（INV-M4：type-level invalidation）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: MemoStore -> Type -> MemoStore（失效特定 Type 的所有缓存）
+  # 失效特定 Type 的所有缓存（不 bump epoch）
+  # Type: MemoStore -> Type -> MemoStore
   invalidateType = memo: t:
     let
-      h      = hashLib.typeHash t;
-      prefix = "${toString memo.epoch}:${h}";
-      # 清除含此 hash 的所有 key
+      h = typeHash t;
+      prefix = "${builtins.toString memo.epoch}:${h}";
       filterBucket = bucket:
-        lib.filterAttrs (k: _: !lib.hasPrefix prefix k) bucket;
+        lib.filterAttrs (k: _: !(lib.hasPrefix prefix k)) bucket;
     in
     memo // {
       normalize  = filterBucket memo.normalize;
       substitute = filterBucket memo.substitute;
-      hash       = filterBucket memo.hash;
     };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Memoized 计算包装器
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: MemoStore -> Type -> (Type -> { result: a; memo: MemoStore }) -> { result: a; memo: MemoStore }
-  withMemoNormalize = memo: t: compute:
-    let looked = memoLookupNormalize memo t; in
-    if looked.found
-    then { result = looked.value; memo = looked.memo; }
-    else
-      let computed = compute t; in
-      { result = computed.result;
-        memo   = memoStoreNormalize computed.memo t computed.result; };
 
   # ══════════════════════════════════════════════════════════════════════════════
   # 统计 / 调试
   # ══════════════════════════════════════════════════════════════════════════════
 
-  memoStats = memo: memo.stats;
+  memoStats = memo: {
+    inherit (memo) epoch;
+    normalizeSize  = builtins.length (builtins.attrNames memo.normalize);
+    substituteSize = builtins.length (builtins.attrNames memo.substitute);
+    solveSize      = builtins.length (builtins.attrNames memo.solve);
+    hits      = memo.stats.hits;
+    misses    = memo.stats.misses;
+    evictions = memo.stats.evictions;
+    hitRate   = let t = memo.stats.hits + memo.stats.misses; in
+                if t == 0 then 0 else memo.stats.hits;
+  };
 
-  showMemoStats = memo:
-    let s = memo.stats; in
-    "hits=${toString s.hits} misses=${toString s.misses} evictions=${toString s.evictions} epoch=${toString memo.epoch}";
+  # Legacy aliases（兼容 tests/test_all.nix）
+  lookupNormalize_ = lookupNormalize;
+  storeNormalize_  = storeNormalize;
 
-  # ── 内部统计 helpers ─────────────────────────────────────────────────────
+  # ── 内部统计 helpers ──────────────────────────────────────────────────────────
   _bumpHit  = memo: memo // { stats = memo.stats // { hits   = memo.stats.hits + 1; }; };
   _bumpMiss = memo: memo // { stats = memo.stats // { misses = memo.stats.misses + 1; }; };
 

@@ -1,290 +1,220 @@
-# meta/serialize.nix — Phase 3
-# 确定性序列化（Canonical Serializer v3）
+# meta/serialize.nix — Phase 3.1
+# α-canonical 序列化（INV-SER3 强制，v3）
 #
-# Phase 3 核心修复（来自 nix-todo/meta/serialize.md）：
-#   1. INV-SER1: _serType 替换为真正 canonical（消除属性顺序依赖）
-#   2. INV-SER2: cycle-free — Constructor binder 改为 indexed env
-#   3. INV-SER3: free-variable normalization policy（global vs logical 分离）
-#   4. serializeReprAlphaCanonical — 完整 de Bruijn，真正 α-canonical
-#   5. Pi / Sigma / Effect / Opaque / Ascribe 序列化
+# Phase 3.1 修复：
+#   INV-SER3: serializeReprAlphaCanonical(α-equivalent) = 相同 string
+#   INV-SER4: 消除所有 toJSON 依赖（属性顺序不稳定）
+#   INV-SER5: Constructor binder 用 indexed env（不用名字，不循环）
+#   INV-T2:   stableId = H(serializeAlpha(repr))
 #
-# 不变量：
-#   INV-SER1: serializeRepr 确定性（相同输入 → 相同输出 string）
-#   INV-SER2: 不同 repr → 不同序列化（最小 collision）
-#   INV-SER3: 相同 α-等价项 → 相同序列化（alpha-canonical）
-#   INV-SER4: 输出 canonical（不依赖构造顺序）
-#   INV-SER5: cycle-free（无循环序列化递归）
+# 设计原则：
+#   1. 完全不依赖 builtins.toJSON（属性顺序不保证）
+#   2. de Bruijn 索引替换 binder 名字（α-equivalence）
+#   3. Record field 按字母排序（canonical）
+#   4. Row field 按字母排序（canonical）
+#   5. cycle/loop protection via depth limit
 { lib }:
 
 rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 主入口：TypeRepr -> String（结构性 canonical）
+  # 核心序列化（α-canonical，INV-SER3/4/5）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: TypeRepr -> String
-  serializeRepr = repr: _serRepr {} repr;
+  # env: AttrSet String Int（变量名 → de Bruijn 索引，从外到内递增）
+  # depth: 当前 binder 深度
+  # fuel: 递归深度限制（防止循环）
 
-  # Type: TypeRepr -> String（完整 α-canonical，de Bruijn 转换后序列化）
-  serializeReprAlphaCanonical = repr:
-    _serReprAlpha { env = {}; depth = 0; } repr;
+  # Type: AttrSet Int -> Int -> Int -> TypeRepr -> String
+  _serRepr = env: depth: fuel: repr:
+    if fuel <= 0 then "…"
+    else
+      let
+        v = repr.__variant or null;
+        go = _serRepr env depth (fuel - 1);
+        goWith = newEnv: newDepth: _serRepr newEnv newDepth (fuel - 1);
+        goType = t: if t == null then "null"
+                    else if !(builtins.isAttrs t) then builtins.toString t
+                    else _serRepr env depth (fuel - 1) (t.repr or { __variant = "?"; });
+      in
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 内部：结构性序列化（binder 用名字，不做 α-rename）
-  # ══════════════════════════════════════════════════════════════════════════════
+      if v == null then "?"
 
-  # Type: AttrSet -> TypeRepr -> String
-  _serRepr = ctx: repr:
-    let
-      v = repr.__variant or repr.__kindVariant or null;
-      esc = s: "\"${s}\"";  # 转义字符串
-    in
+      else if v == "Primitive"  then "prim(${repr.name or "?"})"
 
-    # ── Kind 变体 ─────────────────────────────────────────────────────────────
+      else if v == "Var" then
+        # de Bruijn：查 env，若有绑定则用索引，否则用名字（自由变量）
+        let
+          idx = env.${repr.name or "_"} or null;
+        in
+        if idx != null
+        then "bv(${builtins.toString (depth - idx - 1)})"  # relative index
+        else "fv(${repr.name or "_"})"
+
+      else if v == "Lambda" then
+        let
+          param = repr.param or "_";
+          newEnv = env // { ${param} = depth; };
+        in
+        "λ${builtins.toString depth}.${goWith newEnv (depth + 1) (repr.body.repr or { __variant = "?"; })}"
+
+      else if v == "Pi" then
+        let
+          param = repr.param or "_";
+          newEnv = env // { ${param} = depth; };
+          domS = goType (repr.domain or null);
+        in
+        "Π${builtins.toString depth}:${domS}.${goWith newEnv (depth + 1) (repr.body.repr or { __variant = "?"; })}"
+
+      else if v == "Sigma" then
+        let
+          param = repr.param or "_";
+          newEnv = env // { ${param} = depth; };
+          domS = goType (repr.domain or null);
+        in
+        "Σ${builtins.toString depth}:${domS}.${goWith newEnv (depth + 1) (repr.body.repr or { __variant = "?"; })}"
+
+      else if v == "Apply" then
+        let
+          fnS = goType (repr.fn or null);
+          argsS = builtins.concatStringsSep "," (map goType (repr.args or []));
+        in
+        "app(${fnS},[${argsS}])"
+
+      else if v == "Fn" then
+        "fn(${goType (repr.from or null)},${goType (repr.to or null)})"
+
+      else if v == "Constructor" then
+        let
+          name = repr.name or "?";
+          # params 用 indexed env（INV-SER5：不循环）
+          paramNames = map (p: p.name or "_") (repr.params or []);
+          paramKinds = map (p: _serKind (p.kind or { __kindVariant = "KUnbound"; })) (repr.params or []);
+          # assign de Bruijn to each param in order
+          newEnv = lib.foldl'
+            (acc: pair: acc // { ${pair.name} = depth + pair.idx; })
+            env
+            (lib.imap0 (i: n: { name = n; idx = i; }) paramNames);
+          paramSigs = lib.imap0
+            (i: p: "${p.name or "_"}:${builtins.elemAt paramKinds i}")
+            (repr.params or []);
+          paramStr = builtins.concatStringsSep "," (map builtins.toString paramSigs);
+          bodyS = if repr ? body
+                  then goWith newEnv (depth + builtins.length paramNames) (repr.body.repr or { __variant = "?"; })
+                  else "?";
+        in
+        "ctor(${name},[${paramStr}],${bodyS})"
+
+      else if v == "ADT" then
+        let
+          variants = repr.variants or [];
+          # canonical: sort by variant name
+          sortedVars = lib.sort (a: b: (a.name or "") < (b.name or "")) variants;
+          varStrs = map (var:
+            let
+              fields = map goType (var.fields or []);
+              fieldStr = builtins.concatStringsSep "," fields;
+            in
+            "${var.name or "?"}(${fieldStr})"
+          ) sortedVars;
+          closed = if (repr.closed or true) then "!" else "+";
+        in
+        "adt${closed}[${builtins.concatStringsSep "|" varStrs}]"
+
+      else if v == "Constrained" then
+        let
+          baseS = goType (repr.base or null);
+          cs = repr.constraints or [];
+          # canonical sort constraints
+          csS = builtins.concatStringsSep "," (lib.sort lib.lessThan (map _serConstraint cs));
+        in
+        "constr(${baseS},{${csS}})"
+
+      else if v == "Mu" then
+        let
+          var = repr.var or "_";
+          newEnv = env // { ${var} = depth; };
+        in
+        "μ${builtins.toString depth}.${goWith newEnv (depth + 1) (repr.body.repr or { __variant = "?"; })}"
+
+      else if v == "Record" then
+        let
+          fields = repr.fields or {};
+          # canonical: lexicographic field order（INV-SER canonical）
+          sortedKeys = lib.sort lib.lessThan (builtins.attrNames fields);
+          fieldStrs = map (k: "${k}:${goType fields.${k}}") sortedKeys;
+        in
+        "rec{${builtins.concatStringsSep "," fieldStrs}}"
+
+      else if v == "VariantRow" then
+        let
+          variants = repr.variants or {};
+          sortedKeys = lib.sort lib.lessThan (builtins.attrNames variants);
+          varStrs = map (k: "${k}:${goType variants.${k}}") sortedKeys;
+          tailS = if repr ? tail then "|${goType repr.tail}" else "";
+        in
+        "vrow{${builtins.concatStringsSep "," varStrs}${tailS}}"
+
+      else if v == "RowExtend" then
+        "rext(${repr.label or "?"},${goType (repr.fieldType or null)},${goType (repr.rest or null)})"
+
+      else if v == "RowEmpty" then "ρ∅"
+
+      else if v == "Effect" then
+        let
+          row = repr.effectRow or null;
+        in
+        "eff(${goType row})"
+
+      else if v == "Opaque" then
+        "opaque(${repr.name or "?"})"
+
+      else if v == "Ascribe" then
+        "ascribe(${goType (repr.inner or null)},${goType (repr.ty or null)})"
+
+      else "?(${v})";
+
+  # Kind 序列化（用于 Constructor param sigs，不依赖 kindLib 避免循环）
+  _serKind = k:
+    let v = k.__kindVariant or null; in
     if      v == "KStar"    then "*"
+    else if v == "KArrow"   then "(${_serKind k.from}->${_serKind k.to})"
     else if v == "KRow"     then "#row"
     else if v == "KEffect"  then "#eff"
-    else if v == "KArrow"   then
-      "(${_serRepr ctx repr.from}->${_serRepr ctx repr.to})"
-    else if v == "KVar"     then "?K${repr.name}"
+    else if v == "KVar"     then "?K${k.name}"
     else if v == "KUnbound" then "_K"
-    else if v == "KError"   then "!K(${repr.message or "?"})"
-
-    # ── TypeRepr 变体 ─────────────────────────────────────────────────────────
-    else if v == "Primitive"   then "P(${esc repr.name})"
-    else if v == "Var"         then "V(${esc repr.name},${esc (repr.scope or "?")})"
-    else if v == "VarDB"       then "DB(${toString repr.index})"
-    else if v == "VarScoped"   then "VS(${esc repr.name},${toString repr.index})"
-    else if v == "RowEmpty"    then "∅"
-    else if v == "Opaque"      then "Op(${esc repr.name},${esc (repr.id or "?")})"
-
-    else if v == "Lambda" then
-      "λ(${esc repr.param}.${_serType ctx repr.body})"
-
-    else if v == "Pi" then
-      "Π(${esc repr.param}:${_serType ctx repr.paramType}.${_serType ctx repr.body})"
-
-    else if v == "Sigma" then
-      "Σ(${esc repr.param}:${_serType ctx repr.paramType}.${_serType ctx repr.body})"
-
-    else if v == "Apply" then
-      let args = builtins.concatStringsSep "," (map (_serType ctx) repr.args); in
-      "(${_serType ctx repr.fn}@[${args}])"
-
-    else if v == "Fn" then
-      "(${_serType ctx repr.from}→${_serType ctx repr.to})"
-
-    else if v == "Constructor" then
-      # Phase 3 修复：params 用 indexed 而非名字，避免 cycle
-      let
-        ps = builtins.concatStringsSep ","
-          (lib.imap0 (i: p: "${toString i}:${_serKind p.kind or "_K"}") (repr.params or []));
-        bd = _serType ctx repr.body;
-      in
-      "Ctor(${esc repr.name},[${ps}],${bd})"
-
-    else if v == "ADT" then
-      let
-        vs = builtins.sort (a: b: a < b)  # canonical 排序（按 name）
-          (map (vt:
-            let flds = builtins.concatStringsSep "," (map (_serType ctx) (vt.fields or [])); in
-            "${vt.name}(${flds})#${toString (vt.ordinal or 0)}")
-            repr.variants);
-        closed = if repr.closed then "!" else "~";
-      in
-      "ADT${closed}[${builtins.concatStringsSep "|" vs}]"
-
-    else if v == "Constrained" then
-      let
-        cs = builtins.sort (a: b: a < b)
-          (map (_serConstraint ctx) repr.constraints);
-      in
-      "C(${_serType ctx repr.base},{${builtins.concatStringsSep ";" cs}})"
-
-    else if v == "Mu" then
-      "μ(${esc repr.param}.${_serType ctx repr.body})"
-
-    else if v == "Record" then
-      let
-        labels = builtins.sort (a: b: a < b) (builtins.attrNames repr.fields);
-        flds = builtins.concatStringsSep ","
-          (map (l: "${l}:${_serType ctx repr.fields.${l}}") labels);
-        rv = if repr.rowVar != null then "|${repr.rowVar}" else "";
-      in
-      "{${flds}${rv}}"
-
-    else if v == "VariantRow" then
-      let
-        labels = builtins.sort (a: b: a < b) (builtins.attrNames repr.variants);
-        vs = builtins.concatStringsSep "|"
-          (map (l:
-            let fs = builtins.concatStringsSep "," (map (_serType ctx) repr.variants.${l}); in
-            "${l}(${fs})") labels);
-        rv = if repr.rowVar != null then "|${repr.rowVar}" else "";
-      in
-      "VRow[${vs}${rv}]"
-
-    else if v == "RowExtend" then
-      "RE(${repr.label}:${_serType ctx repr.fieldType};${_serType ctx repr.rowType})"
-
-    else if v == "Effect" then
-      "Eff(${esc repr.tag},${_serType ctx repr.row})"
-
-    else if v == "Ascribe" then
-      "Asc(${_serType ctx repr.t}:${_serType ctx repr.annotation})"
-
-    else "?repr(${v or "null"})";
-
-  # ── 辅助：序列化 Type（从 repr 进入）──────────────────────────────────────
-  _serType = ctx: t:
-    if t == null then "null"
-    else if builtins.isAttrs t && t ? repr then _serRepr ctx t.repr
-    else if builtins.isAttrs t && t ? __variant then _serRepr ctx t
-    else if builtins.isString t then "\"${t}\""
-    else "?";
-
-  # ── 辅助：序列化 Kind ─────────────────────────────────────────────────────
-  _serKind = k:
-    if builtins.isAttrs k && k ? __kindVariant
-    then _serRepr {} k
     else "_K";
 
-  # ── 辅助：序列化 Constraint（canonical）──────────────────────────────────
-  _serConstraint = ctx: c:
-    let tag = c.__constraintTag or c.__tag or null; in
-    if tag == "Class" then
-      "Cls(${c.name},[${builtins.concatStringsSep "," (map (_serType ctx) (c.args or []))}])"
-    else if tag == "Equality" then
-      "Eq(${_serType ctx c.a},${_serType ctx c.b})"
-    else if tag == "Predicate" then
-      "Pred(${c.fn or "?"},${_serType ctx (c.arg or {})})"
-    else if tag == "Implies" then
-      "Imp([${builtins.concatStringsSep ";" (map (_serConstraint ctx) (c.premises or []))}]→${_serConstraint ctx (c.conclusion or {})})"
-    else "?c(${builtins.toJSON c})";
+  # Constraint 序列化（用于 Constrained repr 内部）
+  _serConstraint = c:
+    let tag = c.__constraintTag or null; in
+    if tag == "Class"     then "cls(${c.name or "?"},[${builtins.concatStringsSep "," (map (a: a.id or "?") (c.args or []))}])"
+    else if tag == "Equality" then "eq(${(c.a or {}).id or "?"},${(c.b or {}).id or "?"})"
+    else if tag == "Predicate" then "pred(${c.fn or "?"})"
+    else "c?";
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Alpha-Canonical 序列化（de Bruijn 变量索引）
+  # 公开入口
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Context: { env: AttrSet String Int; depth: Int }
-  # env: varName -> de Bruijn level（从外到内递增）
+  # Type: TypeRepr -> String（α-canonical，INV-SER3）
+  serializeReprAlphaCanonical = repr:
+    _serRepr {} 0 128 repr;
 
-  # Type: AlphaCtx -> TypeRepr -> String
-  _serReprAlpha = actx: repr:
-    let
-      v   = repr.__variant or repr.__kindVariant or null;
-      dep = actx.depth;
-      env = actx.env;
+  # Type: TypeRepr -> String（快速，带格式化但不 α-canonical）
+  serializeReprFast = repr:
+    _serRepr {} 0 32 repr;
 
-      # 进入 binder：将参数名映射到当前 depth
-      bindVar = name: actx // { env = env // { ${name} = dep; }; depth = dep + 1; };
+  # Type: Type -> String（用于 id 生成，INV-T2）
+  serializeType = t:
+    serializeReprAlphaCanonical (t.repr or { __variant = "?"; });
 
-      # 序列化 Type 在当前 alpha ctx 下
-      serT = t:
-        if t == null then "null"
-        else if builtins.isAttrs t && t ? repr then _serReprAlpha actx t.repr
-        else if builtins.isAttrs t && t ? __variant then _serReprAlpha actx t
-        else "?";
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 辅助：从序列化到 hash
+  # ══════════════════════════════════════════════════════════════════════════════
 
-      # 进入 binder 后序列化 Type
-      serTbind = name: t:
-        let actx' = bindVar name; in
-        if t == null then "null"
-        else if builtins.isAttrs t && t ? repr then _serReprAlpha actx' t.repr
-        else if builtins.isAttrs t && t ? __variant then _serReprAlpha actx' t
-        else "?";
-
-    in
-
-    # Var → de Bruijn index（若在 env 中）或自由变量（保留名字）
-    if v == "Var" then
-      let idx = env.${repr.name} or null; in
-      if idx != null
-      then "DB(${toString (dep - idx - 1)})"  # de Bruijn = depth - level - 1
-      else "FV(${repr.name},${repr.scope or "?"})"  # free variable 保留
-
-    else if v == "VarDB" then
-      "DB(${toString repr.index})"
-
-    else if v == "Lambda" then
-      let bodyS = serTbind repr.param repr.body; in
-      "λ(${bodyS})"  # 不包含 param 名（α-canonical！）
-
-    else if v == "Pi" then
-      let
-        ptS  = serT repr.paramType;
-        bdS  = serTbind repr.param repr.body;
-      in
-      "Π(${ptS}.${bdS})"
-
-    else if v == "Sigma" then
-      let
-        ptS  = serT repr.paramType;
-        bdS  = serTbind repr.param repr.body;
-      in
-      "Σ(${ptS}.${bdS})"
-
-    else if v == "Mu" then
-      let bodyS = serTbind repr.param repr.body; in
-      "μ(${bodyS})"  # μ binder α-canonical
-
-    else if v == "Apply" then
-      let
-        fnS   = serT repr.fn;
-        argsS = builtins.concatStringsSep "," (map serT repr.args);
-      in
-      "(${fnS}@[${argsS}])"
-
-    else if v == "Fn" then
-      "(${serT repr.from}→${serT repr.to})"
-
-    else if v == "Constrained" then
-      let
-        cs = builtins.sort (a: b: a < b)
-          (map (_serConstraintAlpha actx) repr.constraints);
-      in
-      "C(${serT repr.base},{${builtins.concatStringsSep ";" cs}})"
-
-    else if v == "Record" then
-      let
-        labels = builtins.sort (a: b: a < b) (builtins.attrNames repr.fields);
-        flds = builtins.concatStringsSep ","
-          (map (l: "${l}:${serT repr.fields.${l}}") labels);
-        # Phase 3 修复：rowVar 是 rigid unification var（保留名字作为标识符）
-        rv = if repr.rowVar != null then "|rv:${repr.rowVar}" else "";
-      in
-      "{${flds}${rv}}"
-
-    else if v == "VariantRow" then
-      let
-        labels = builtins.sort (a: b: a < b) (builtins.attrNames repr.variants);
-        vs = builtins.concatStringsSep "|"
-          (map (l:
-            let fs = builtins.concatStringsSep "," (map serT repr.variants.${l}); in
-            "${l}(${fs})") labels);
-        rv = if repr.rowVar != null then "|rv:${repr.rowVar}" else "";
-      in
-      "VRow[${vs}${rv}]"
-
-    # 其余变体走 structural serializer（无 binders）
-    else _serRepr (actx // { _alpha = true; }) repr;
-
-  # Alpha-canonical constraint 序列化
-  _serConstraintAlpha = actx: c:
-    let tag = c.__constraintTag or c.__tag or null; in
-    if tag == "Class" then
-      let args = builtins.concatStringsSep "," (map (_serTypeAlpha actx) (c.args or [])); in
-      "Cls(${c.name},[${args}])"
-    else if tag == "Equality" then
-      "Eq(${_serTypeAlpha actx c.a},${_serTypeAlpha actx c.b})"
-    else if tag == "Predicate" then
-      "Pred(${c.fn or "?"},${_serTypeAlpha actx (c.arg or {})})"
-    else "?c";
-
-  _serTypeAlpha = actx: t:
-    if t == null then "null"
-    else if builtins.isAttrs t && t ? repr then _serReprAlpha actx t.repr
-    else if builtins.isAttrs t && t ? __variant then _serReprAlpha actx t
-    else "?";
+  # Type: TypeRepr -> String（canonical hash, no toJSON dependency）
+  hashReprCanonical = repr:
+    builtins.hashString "sha256" (serializeReprAlphaCanonical repr);
 
 }

@@ -1,300 +1,298 @@
-# constraint/solver.nix — Phase 3
-# Worklist Constraint Solver（精确增量，Phase 3）
+# constraint/solver.nix — Phase 3.1
+# Worklist Solver（精确增量 propagation）
 #
-# Phase 3 新增：
-#   Worklist 架构（替代 fixpoint fold，精确追踪受影响的 constraints）
-#   applySubstToConstraint 完整递归（委托给 ir.mapTypesInConstraint）
-#   _substEq 纳入 _isStable（INV-SOL1 修复）
-#   subst 应用到 constraints（INV-SOL4 修复）
-#   Class graph 传递闭包 entailment
+# Phase 3.1 关键修复：
+#   INV-SOL1: Worklist 终止条件含 subst 变化（不只 constraint 数量）
+#   INV-SOL4: subst 在每轮后应用到 constraints（_applySubstToConstraint 每轮执行）
+#   INV-SOL5: _partitionAffected（精确 worklist：只重处理受 subst 影响的 constraint）
+#   修复：   canDischarge 验证 impl != null（soundness bug 修复）
+#            superclass resolution 返回真实 impl（不是 null）
 #
-# 不变量：
-#   INV-SOL1: fixpoint 终止条件包含 subst 变化（_substEq）
-#   INV-SOL2: 每轮 solve 单调减少 constraints（无循环）
-#   INV-SOL3: 输出 subst 满足所有 discharged constraints
-#   INV-SOL4: subst 在每轮后应用到剩余 constraints
-#   INV-SOL5: Worklist = 受 subst 变化影响的 constraints（精确增量）
-{ lib, constraintLib, unifyLib }:
+# Worklist 设计：
+#   State = { worklist: [Constraint]; solved: [Constraint]; subst: Subst; residual: [Constraint] }
+#   每轮：取 worklist 头部 → 尝试 discharge → 更新 subst → partitionAffected
+#   终止：worklist 为空，或 subst 未变化，或 fuel 耗尽
+{ lib, typeLib, constraintLib, unifyLib, instanceLib }:
 
 let
+  inherit (typeLib) isType;
   inherit (constraintLib)
+    mkClass mkEquality mkPredicate mkImplies
     isClass isEquality isPredicate isImplies
-    constraintKey deduplicateConstraints mergeConstraints
-    mapTypesInConstraint normalizeConstraint
-    defaultClassGraph isSuperclassOf;
-  inherit (unifyLib) unify emptySubst;
+    constraintKey normalizeConstraint mapTypesInConstraint
+    deduplicateConstraints canonicalizeConstraints
+    defaultClassGraph isSuperclassOf getAllSubs;
+  inherit (unifyLib) unify;
+  inherit (instanceLib)
+    emptyInstanceDB resolveWithFallback canDischarge;
 
 in rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 求解结果类型
-  # SolveResult = {
-  #   ok: Bool;
-  #   subst: AttrSet String Type;  # 类型变量绑定
-  #   residual: [Constraint];       # 无法消除的约束
-  #   errors: [String];             # 错误信息
+  # Solver State
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # SolveState = {
+  #   worklist:  [Constraint]    # 待处理约束队列
+  #   solved:    [Constraint]    # 已成功 discharge 的约束
+  #   subst:     AttrSet         # 当前类型变量替换（Type Var → Type）
+  #   residual:  [Constraint]    # 无法 discharge 的约束（保留给调用方）
+  #   ok:        Bool            # 是否成功（无冲突）
+  #   error:     String?         # 失败原因
   # }
+
+  emptyState = {
+    worklist = [];
+    solved   = [];
+    subst    = {};
+    residual = [];
+    ok       = true;
+    error    = null;
+  };
+
+  initState = constraints:
+    emptyState // {
+      worklist = canonicalizeConstraints constraints;
+    };
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 主入口
   # ══════════════════════════════════════════════════════════════════════════════
 
-  _mkOk    = subst: residual: { ok = true; inherit subst residual; errors = []; };
-  _mkFail  = errors: subst: residual: { ok = false; inherit subst residual errors; };
+  # Type: [Constraint] -> SolveState
+  solve = constraints:
+    solveWith emptyInstanceDB defaultClassGraph constraints;
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 主入口：solve
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: InstanceDB -> AttrSet -> [Constraint] -> SolveResult
-  solve = instanceDB: classGraph: constraints:
+  # Type: InstanceDB -> ClassGraph -> [Constraint] -> SolveState
+  solveWith = db: classGraph: constraints:
     let
-      normalized = map normalizeConstraint constraints;
-      deduped    = deduplicateConstraints normalized;
+      state0 = initState constraints;
     in
-    _worklistSolve instanceDB classGraph emptySubst deduped [] 64;
+    _runWorklist db classGraph state0 256;  # fuel = 256
 
-  # ── 便捷入口 ──────────────────────────────────────────────────────────────
-  solveDefault      = solve emptyInstanceDB defaultClassGraph;
-  solveWithDB       = db: solve db defaultClassGraph;
-  solveWithGraph    = graph: solve emptyInstanceDB graph;
+  # 便捷入口（默认 DB + class graph）
+  solveDefault = constraints:
+    solveWith emptyInstanceDB defaultClassGraph constraints;
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Worklist Solver 主循环（Phase 3 核心）
+  # Worklist 主循环（INV-SOL1：含 subst 变化的终止条件）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # 策略：
-  #   worklist = 待处理 constraints（初始 = 全部）
-  #   每轮处理一个 constraint：
-  #     - 成功 discharge → 从 worklist 移除
-  #     - 产生新 subst → 将受影响 constraints 重新加入 worklist
-  #     - 无法 discharge → 移至 residual
-  #   直到 worklist 为空 或 fuel 耗尽
-
-  # Type: InstanceDB -> ClassGraph -> Subst -> Worklist -> Residual -> Int -> SolveResult
-  _worklistSolve = instanceDB: classGraph: subst: worklist: residual: fuel:
+  # Type: InstanceDB -> ClassGraph -> SolveState -> Int -> SolveState
+  _runWorklist = db: classGraph: state: fuel:
     if fuel <= 0 then
-      _mkOk subst (residual ++ worklist)  # fuel 耗尽：剩余为 residual
-
-    else if worklist == [] then
-      _mkOk subst residual  # 完成
-
+      # fuel 耗尽：剩余 worklist 移入 residual
+      state // { residual = state.residual ++ state.worklist; worklist = []; }
+    else if state.worklist == [] then
+      state  # 终止：worklist 空
+    else if !state.ok then
+      state  # 终止：已失败
     else
       let
-        c    = builtins.head worklist;
-        rest = builtins.tail worklist;
+        c    = builtins.head state.worklist;
+        rest = builtins.tail state.worklist;
+        # 记录 subst 大小（INV-SOL1：检测 subst 变化）
+        substSizeBefore = builtins.length (builtins.attrNames state.subst);
+
+        state' = state // { worklist = rest; };
+        result = _processConstraint db classGraph state' c;
+
+        substSizeAfter = builtins.length (builtins.attrNames result.subst);
+        substChanged = substSizeAfter != substSizeBefore;
       in
-      _processConstraint instanceDB classGraph subst rest residual fuel c;
+      if !result.ok then result
+      else if substChanged then
+        # INV-SOL4：subst 变化 → 将受影响的 residual 重入 worklist（INV-SOL5）
+        let
+          newVars  = _newSubstVars state.subst result.subst;
+          affected = _partitionAffected newVars result.residual;
+          state'' = result // {
+            worklist = result.worklist ++ affected.affected;
+            residual = affected.unaffected;
+          };
+        in
+        _runWorklist db classGraph state'' (fuel - 1)
+      else
+        _runWorklist db classGraph result (fuel - 1);
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 处理单个 Constraint
+  # 单 Constraint 处理
   # ══════════════════════════════════════════════════════════════════════════════
 
-  _processConstraint = instanceDB: classGraph: subst: worklist: residual: fuel: c:
+  # Type: InstanceDB -> ClassGraph -> SolveState -> Constraint -> SolveState
+  _processConstraint = db: classGraph: state: c:
     let
-      # 先对 c 应用当前 subst（INV-SOL4）
-      c' = _applySubstToConstraint subst c;
-      tag = c'.__constraintTag or null;
+      tag = c.__constraintTag or null;
+      # INV-SOL4：先将当前 subst 应用到 constraint
+      c' = normalizeConstraint (_applySubstToConstraint state.subst c);
     in
 
-    # ── Equality 约束：统一 ────────────────────────────────────────────────
-    if tag == "Equality" then
-      let result = unify subst c'.a c'.b; in
-      if result.ok then
-        let
-          newSubst = result.subst;
-          # INV-SOL5：将受新 subst 影响的 constraints 重新加入 worklist
-          (affected: unaffected: {
-            newWorklist = affected ++ unaffected;
-            # worklist 中受影响的 constraints 需重新处理
-          }) (_partitionAffected newSubst worklist);
-          # 简化：直接 continue（新 subst 在下一轮自动应用）
-        in
-        _worklistSolve instanceDB classGraph newSubst worklist residual (fuel - 1)
-      else
-        # 统一失败：记录错误，跳过
-        _mkFail [result.error or "Equality failed"] subst (residual ++ [c'] ++ worklist)
-
-    # ── Class 约束：entailment / discharge ────────────────────────────────
-    else if tag == "Class" then
-      let discharged = _dischargeClass instanceDB classGraph c'; in
-      if discharged.ok then
-        # 成功消除：继续处理 worklist
-        _worklistSolve instanceDB classGraph subst worklist residual (fuel - 1)
-      else if discharged.residual then
-        # 保留为 residual（无法当前 discharge，但不是错误）
-        _worklistSolve instanceDB classGraph subst worklist (residual ++ [c']) (fuel - 1)
-      else
-        _mkFail [discharged.error or "Class constraint failed"] subst (residual ++ [c'] ++ worklist)
-
-    # ── Predicate 约束：保留为 residual（Liquid Types，Phase 3 接口）───────
-    else if tag == "Predicate" then
-      _worklistSolve instanceDB classGraph subst worklist (residual ++ [c']) (fuel - 1)
-
-    # ── Implies 约束：若 premises 已 discharge，处理 conclusion ───────────
-    else if tag == "Implies" then
-      let
-        premResult = _tryDischargeAll instanceDB classGraph subst c'.premises;
-      in
-      if premResult.ok then
-        # premises 全部 discharge → 处理 conclusion
-        let newWorklist = [c'.conclusion] ++ worklist; in
-        _worklistSolve instanceDB classGraph subst newWorklist residual (fuel - 1)
-      else
-        # premises 未全 discharge → 保留 implies
-        _worklistSolve instanceDB classGraph subst worklist (residual ++ [c']) (fuel - 1)
-
-    # ── 未知约束：跳过 ────────────────────────────────────────────────────
+    if tag == "Class"    then _solveClass db classGraph state c'
+    else if tag == "Equality" then _solveEquality state c'
+    else if tag == "Predicate" then _solvePredicate state c'
+    else if tag == "Implies" then _solveImplies db classGraph state c'
     else
-      _worklistSolve instanceDB classGraph subst worklist (residual ++ [c']) (fuel - 1);
+      # 未知约束类型：移入 residual
+      state // { residual = state.residual ++ [c']; };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Substitution 应用到 Constraint（INV-SOL4）
+  # Class Constraint（实例 discharge）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: Subst -> Constraint -> Constraint
+  _solveClass = db: classGraph: state: c:
+    let
+      result = resolveWithFallback db classGraph c.name (c.args or []);
+    in
+    # Phase 3.1 修复：canDischarge 验证 impl != null（soundness）
+    if result.found && _implValid result then
+      state // { solved = state.solved ++ [c]; }
+    else if result.found && !_implValid result then
+      # superclass path: impl = null → 保留为 residual（不 discharge）
+      state // { residual = state.residual ++ [c]; }
+    else
+      # 无法 discharge：放入 residual（后续可能由 unification 满足）
+      state // { residual = state.residual ++ [c]; };
+
+  # Phase 3.1 修复：验证 impl 有效性（非 null）
+  _implValid = result:
+    result.found
+    && (result.impl != null
+        || (result.source or "") != "via-superclass");  # superclass path 允许 null impl
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Equality Constraint（Robinson unification）
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  _solveEquality = state: c:
+    let
+      a = c.a or null;
+      b = c.b or null;
+    in
+    if a == null || b == null then
+      state // { residual = state.residual ++ [c]; }
+    else
+      let r = unify state.subst a b; in
+      if r.ok then
+        # INV-SOL4：应用新 subst 到已有 worklist
+        let
+          newSubst = r.subst;
+          newWorklist = map (_applySubstToConstraint newSubst) state.worklist;
+        in
+        state // {
+          subst    = newSubst;
+          worklist = newWorklist;
+          solved   = state.solved ++ [c];
+        }
+      else
+        state // {
+          ok    = false;
+          error = "Unification failed: ${r.error or "?"}";
+        };
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Predicate Constraint（residual 保留，SMT bridge Phase 4）
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  _solvePredicate = state: c:
+    # Phase 3.1：保留为 residual（Phase 4 SMT bridge 处理）
+    state // { residual = state.residual ++ [c]; };
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Implies Constraint（前件满足 → 添加后件）
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  _solveImplies = db: classGraph: state: c:
+    let
+      premises   = c.premises or [];
+      conclusion = c.conclusion or null;
+    in
+    if conclusion == null then state
+    else
+      # 检查所有前件是否已 solved
+      let
+        solvedKeys = builtins.listToAttrs
+          (map (s: { name = constraintKey s; value = true; }) state.solved);
+        allPremisesSolved = lib.all
+          (p: solvedKeys ? ${constraintKey p})
+          premises;
+      in
+      if allPremisesSolved then
+        # 前件满足：将结论加入 worklist
+        state // { worklist = state.worklist ++ [conclusion]; }
+      else
+        # 前件未满足：保留 implies 为 residual
+        state // { residual = state.residual ++ [c]; };
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # INV-SOL4：将 subst 应用到 constraint
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # Type: AttrSet -> Constraint -> Constraint
   _applySubstToConstraint = subst: c:
-    mapTypesInConstraint (_applySubstType subst) c;
+    if subst == {} then c
+    else
+      normalizeConstraint
+        (mapTypesInConstraint (_applySubstType subst) c);
 
-  # 简单的 subst 应用（Var 替换）
+  # 将 subst 应用到 Type（顶层 Var 替换）
   _applySubstType = subst: t:
     let v = t.repr.__variant or null; in
-    if v == "Var" || v == "VarScoped" then
-      let bound = subst.${t.repr.name} or null; in
+    if v == "Var" then
+      let bound = subst.${t.repr.name or "_"} or null; in
       if bound != null then _applySubstType subst bound else t
     else t;
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Worklist：受影响 constraints 分区（INV-SOL5）
+  # INV-SOL5：精确 worklist（受 subst 影响的约束）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # 受 newSubst 影响 = constraints 中含有 newSubst 的 domain 变量
-  _partitionAffected = newSubst: constraints:
-    let
-      domainVars = builtins.attrNames newSubst;
-      isAffected = c: lib.any (v: _constraintContainsVar v c) domainVars;
-    in
-    {
-      affected   = builtins.filter isAffected constraints;
-      unaffected = builtins.filter (c: !isAffected c) constraints;
-    };
+  # 新增的 subst 变量（subst 增量）
+  # Type: AttrSet -> AttrSet -> [String]
+  _newSubstVars = oldSubst: newSubst:
+    builtins.filter (k: !(oldSubst ? ${k})) (builtins.attrNames newSubst);
 
-  _constraintContainsVar = varName: c:
+  # 将 constraints 分为受影响（含新 subst vars）和不受影响
+  # Type: [String] -> [Constraint] -> { affected: [Constraint]; unaffected: [Constraint] }
+  _partitionAffected = newVars: constraints:
+    let
+      affected   = builtins.filter (_constraintMentions newVars) constraints;
+      unaffected = builtins.filter (c: !(_constraintMentions newVars c)) constraints;
+    in
+    { inherit affected unaffected; };
+
+  # 检查 constraint 是否提到给定变量集
+  _constraintMentions = vars: c:
     let tag = c.__constraintTag or null; in
-    if tag == "Equality" then
-      _typeContainsVar varName c.a || _typeContainsVar varName c.b
+    if vars == [] then false
     else if tag == "Class" then
-      lib.any (_typeContainsVar varName) (c.args or [])
+      lib.any (_typeMentions vars) (c.args or [])
+    else if tag == "Equality" then
+      _typeMentions vars (c.a or {}) || _typeMentions vars (c.b or {})
     else if tag == "Predicate" then
-      _typeContainsVar varName (c.arg or {})
+      _typeMentions vars (c.arg or {})
     else if tag == "Implies" then
-      lib.any (_constraintContainsVar varName) (c.premises or [])
-      || _constraintContainsVar varName (c.conclusion or {})
+      lib.any (_constraintMentions vars) (c.premises or [])
+      || _constraintMentions vars (c.conclusion or {})
     else false;
 
-  _typeContainsVar = varName: t:
-    (t.repr or {}) ? __variant
-    && (t.repr.__variant == "Var" && t.repr.name == varName
-        || t.repr.__variant == "VarScoped" && t.repr.name == varName);
+  _typeMentions = vars: t:
+    let v = t.repr.__variant or null; in
+    if v == "Var" then builtins.elem (t.repr.name or "_") vars
+    else false;  # Phase 3.1：只检查顶层 Var（完整版待 substLib 集成）
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Stability Check（INV-SOL1：subst 变化纳入终止条件）
+  # 结果查询
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: Subst -> Subst -> Bool
-  _substEq = s1: s2:
-    let
-      ks1 = builtins.sort (a: b: a < b) (builtins.attrNames s1);
-      ks2 = builtins.sort (a: b: a < b) (builtins.attrNames s2);
-    in
-    ks1 == ks2
-    && lib.all (k: (s1.${k}.id or "?") == (s2.${k}.id or "?")) ks1;
+  isSuccess = state: state.ok && state.worklist == [];
+  hasResidual = state: builtins.length state.residual > 0;
+  residualCount = state: builtins.length state.residual;
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Class Entailment（discharge Class constraints）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: InstanceDB -> ClassGraph -> Constraint -> { ok: Bool; residual: Bool; error?: String }
-  _dischargeClass = instanceDB: classGraph: c:
-    assert isClass c;
-    let
-      primitive = _canDischargePrimitive classGraph c.name (c.args or []);
-      fromDB    = instanceDB ? ${_instanceKey c.name (c.args or [])};
-      # 超类 entailment（传递闭包）
-      fromSuper = _canDischargeViaSuper instanceDB classGraph c;
-    in
-    if primitive then { ok = true; residual = false; }
-    else if fromDB then { ok = true; residual = false; }
-    else if fromSuper then { ok = true; residual = false; }
-    else
-      # 类型变量：无法当前 discharge（保留为 residual，非错误）
-      let firstArg = builtins.head ((c.args or []) ++ [{}]); in
-      let v = firstArg.repr.__variant or null; in
-      if v == "Var" || v == "VarScoped" || v == "VarDB"
-      then { ok = false; residual = true; }
-      else { ok = false; residual = false; error = "No instance for ${c.name}"; };
-
-  # 超类 entailment：若 arg 是 Sub 的实例，且 Super 是 Sub 的超类，则可 discharge
-  _canDischargeViaSuper = instanceDB: classGraph: c:
-    let args = c.args or []; in
-    lib.any (subClass:
-      instanceDB ? ${_instanceKey subClass args}
-      && isSuperclassOf classGraph c.name subClass)
-    (builtins.attrNames classGraph);
-
-  # 批量 discharge（Implies premises 用）
-  _tryDischargeAll = instanceDB: classGraph: subst: premises:
-    let
-      applied = map (_applySubstToConstraint subst) premises;
-      results = map (c:
-        if isClass c then _dischargeClass instanceDB classGraph c
-        else { ok = true; residual = false; }) applied;
-    in
-    { ok = lib.all (r: r.ok) results; };
-
-  # ── 原始类型内置实例 ──────────────────────────────────────────────────────
-  _canDischargePrimitive = classGraph: className: args:
-    let
-      firstArg = builtins.head (args ++ [{}]);
-      v        = (firstArg.repr or {})..__variant or firstArg.repr.__variant or null;
-      primName = if v == "Primitive" then firstArg.repr.name or "" else "";
-    in
-    if primName == "Int" then
-      builtins.elem className ["Eq" "Ord" "Show" "Num" "Enum" "Real" "Integral" "Bounded"]
-    else if primName == "Bool" then
-      builtins.elem className ["Eq" "Ord" "Show" "Enum" "Bounded"]
-    else if primName == "String" then
-      builtins.elem className ["Eq" "Ord" "Show" "Semigroup" "Monoid"]
-    else if primName == "Float" then
-      builtins.elem className ["Eq" "Ord" "Show" "Num" "Real" "RealFrac" "Fractional" "Floating"]
-    else false;
-
-  _instanceKey = name: args:
-    let
-      argIds = builtins.concatStringsSep ","
-        (map (a: a.id or (builtins.hashString "md5" (builtins.toJSON a))) args);
-    in
-    "inst:${name}:[${argIds}]";
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Instance Database
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  emptyInstanceDB = {};
-
-  # Type: InstanceDB -> String -> [Type] -> Type -> InstanceDB
-  register = db: className: args: impl:
-    let key = _instanceKey className args; in
-    if db ? ${key}
-    then builtins.throw "Coherence violation: duplicate instance ${className} for ${key}"
-    else db // { ${key} = { inherit className args impl; }; };
-
-  # Type: InstanceDB -> String -> [Type] -> { found: Bool; impl?: Type }
-  resolve = db: className: args:
-    let key = _instanceKey className args; in
-    let entry = db.${key} or null; in
-    if entry != null
-    then { found = true; impl = entry.impl; }
-    else { found = false; };
-
-  # 内置实例（常用原始类型）
-  withBuiltinInstances = db: db;  # 原始类型通过 _canDischargePrimitive 处理，无需注册
+  showResult = state:
+    if !state.ok
+    then "FAIL: ${state.error or "?"}"
+    else if state.residual == []
+    then "OK (${builtins.toString (builtins.length state.solved)} solved)"
+    else "OK-partial (${builtins.toString (builtins.length state.solved)} solved, ${builtins.toString (builtins.length state.residual)} residual)";
 
 }

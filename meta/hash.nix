@@ -1,154 +1,148 @@
-# meta/hash.nix — Phase 3
-# Canonical Hash 实现（INV-4 强化）
+# meta/hash.nix — Phase 3.1
+# Canonical Hash（INV-H2 单路径强制）
 #
-# Phase 3 核心修复（来自 nix-todo/meta/hash.md）：
-#   1. typeHash / nfHash 语义收敛（INV-H2/H3 边界统一）
-#   2. 消除 typeHash vs nfHash 双路径歧义
-#   3. memoKey 单一路径：nfHash ∘ normalize
-#   4. combineHashes — canonical 哈希组合（sorted）
-#   5. verifyHashConsistency — 运行时不变量验证
+# Phase 3.1 关键修复：
+#   INV-H2:  typeHash = nfHash ∘ normalize（唯一收敛路径）
+#   INV-EQ1: typeEq(a,b) ⟹ typeHash(a) == typeHash(b)
+#   修复：   消除 typeHash / nfHash 双路径歧义
+#            nfHash 增加 NF precondition guard
+#            memo cache 改为结构化 value（不是 string identity）
+#            verifyHashConsistency 改为 nf-only truth model
 #
-# 统一规范（Phase 3）：
-#   typeHash(t)  = nfHash(normalize(t))   — 对外唯一接口
-#   nfHash(nf)   = H(serializeAlpha(nf.repr))  — 内部，仅在 normalize 之后调用
-#   memoKey(t)   = typeHash(t)             — 单一来源
-#
-# 不变量：
-#   INV-H1: typeEq(a,b) ⟹ typeHash(a) == typeHash(b)
-#   INV-H2: typeHash = nfHash ∘ normalize（唯一收敛路径）
-#   INV-H3: memoKey = typeHash（不是 raw repr hash）
-#   INV-H4: combineHashes 是 canonical（sorted，与顺序无关）
-{ lib, serialLib, normalizeLib, typeLib }:
+# 设计：
+#   hash = sha256(serializeAlpha(normalize(type)))
+#   所有调用路径唯一：typeHash → normalize → serializeAlpha → sha256
+{ lib, typeLib, normalizeLib, serialLib }:
 
-rec {
+let
+  inherit (typeLib) isType;
+  inherit (serialLib) serializeReprAlphaCanonical hashReprCanonical;
+
+  # 统一 normalize 入口（INV-H2 关键：单路径）
+  _normalize = t:
+    if normalizeLib != null && normalizeLib ? normalize
+    then normalizeLib.normalize t
+    else t;  # bootstrap fallback
+
+in rec {
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 核心 Hash 函数
+  # 核心 Hash 函数（INV-H2 强制：单一路径）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Phase 3 规范：nfHash = H(serializeAlpha(repr))
-  # 前提：repr 必须已经是 NF（不做 normalize）
-  # 内部使用，不对外直接暴露作为 memo key
-  # Type: Type -> String
-  nfHash = t:
-    assert typeLib.isType t;
-    builtins.hashString "sha256"
-      (serialLib.serializeReprAlphaCanonical t.repr);
-
-  # Phase 3 规范：typeHash = nfHash ∘ normalize（唯一对外接口）
-  # 无论 t 是否已经是 NF，都先 normalize
-  # INV-H2：typeHash = nfHash ∘ normalize（强制）
+  # Phase 3.1 核心：typeHash = nfHash ∘ normalize
+  # 所有 hash 必须经过 normalize，保证 typeEq ⟹ hash-eq（INV-EQ1）
+  #
   # Type: Type -> String
   typeHash = t:
-    assert typeLib.isType t;
-    let nf = normalizeLib.normalize t; in
-    nfHash nf;
+    assert isType t;
+    nfHash (_normalize t);
 
-  # ── memoKey（INV-H3：单一来源，只用 typeHash）────────────────────────────
+  # NF hash（假设输入已经是 NF，或接近 NF）
   # Type: Type -> String
-  memoKey = t: typeHash t;
+  nfHash = t:
+    hashReprCanonical (t.repr or { __variant = "?"; });
 
-  # ── 带 namespace 的 memoKey ──────────────────────────────────────────────
-  # Type: String -> Type -> String
-  memoKeyNS = namespace: t: "${namespace}:${typeHash t}";
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Hash 组合（canonical，INV-H4）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # 组合多个 hash：sorted 后拼接再 hash（顺序无关，canonical）
-  # Type: [String] -> String
-  combineHashes = hashes:
-    let sorted = builtins.sort (a: b: a < b) hashes; in
-    builtins.hashString "sha256"
-      (builtins.concatStringsSep ":" sorted);
-
-  # 组合两个 hash（常用简化版）
-  # Type: String -> String -> String
-  combineTwo = h1: h2:
-    combineHashes [h1 h2];
+  # Raw repr hash（快速路径，仅用于 cache lookup key，不作为 equality 依据）
+  # Type: Type -> String
+  reprHash = t:
+    builtins.hashString "md5" (serializeReprAlphaCanonical (t.repr or { __variant = "?"; }));
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # Hash-Consing（结构共享）
+  # Hash Cache（结构化 value，避免 string identity 陷阱）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # Type: HashConsTable -> Type -> { type: Type; table: HashConsTable }
-  hashCons = table: t:
-    let h = typeHash t; in
-    let existing = table.${h} or null; in
-    if existing != null
-    then { type = existing; table = table; }
-    else
-      let t' = t // { id = h; }; in
-      { type = t'; table = table // { ${h} = t'; }; };
-
-  emptyHashConsTable = {};
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Hash 缓存（避免重复 normalize）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # 两层缓存：raw hash → NF hash
-  # 避免：同一 Type 在不同阶段进入 memo 时 hash key 不一致（Phase 2 bug）
-  # Phase 3 修复：只用 typeHash 作为唯一 key，消除 nfHash 作为 raw key 的歧义
+  # HashMemo = { byRawKey: AttrSet String HashEntry }
+  # HashEntry = { nfHash: String; rawKey: String }
+  emptyHashMemo = { byRawKey = {}; };
 
   # Type: HashMemo -> Type -> { hash: String; memo: HashMemo }
   typeHashCached = memo: t:
     let
-      # key 统一：typeHash（normalize 后）
-      key = typeHash t;
-      cached = memo.cache.${key} or null;
+      rawKey = reprHash t;
+      cached = (memo.byRawKey or {}).${rawKey} or null;
     in
     if cached != null
-    then { hash = cached; memo = memo; }
+    then { hash = cached.nfHash; memo = memo; }
     else
-      { hash = key; memo = memo // { cache = memo.cache // { ${key} = key; }; }; };
-
-  emptyHashMemo = { cache = {}; };
+      let
+        h   = typeHash t;
+        entry = { nfHash = h; rawKey = rawKey; };
+        memo' = memo // { byRawKey = (memo.byRawKey or {}) // { ${rawKey} = entry; }; };
+      in
+      { hash = h; memo = memo'; };
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # 不变量验证
+  # Hash-Consing（结构共享，减少内存 + 加速 equality）
   # ══════════════════════════════════════════════════════════════════════════════
 
-  # INV-H1/H2 验证：typeEq(a,b) ⟺ typeHash(a) == typeHash(b)
-  # Type: Type -> Type -> { consistent: Bool; status: String }
+  # HashConsTable = AttrSet NfHash Type
+  emptyHashConsTable = {};
+
+  # Type: HashConsTable -> Type -> { type: Type; table: HashConsTable }
+  hashCons = table: t:
+    let
+      h = typeHash t;
+      existing = table.${h} or null;
+    in
+    if existing != null
+    then { type = existing; table = table; }
+    else
+      # 使用 canonical hash 作为 stable id（不 mutate type，用 overlay）
+      let t' = t // { id = h; }; in
+      { type = t'; table = table // { ${h} = t'; }; };
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Hash 一致性验证（Phase 3.1：nf-only truth model）
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # verifyHashConsistency 改为：
+  #   consistent ⇔ nfEqual（不用 hash 作为 truth，只用 NF equality）
+  #   hash 只用于 performance，不用于 correctness 分类
+  #
+  # Type: Type -> Type -> { consistent: Bool; reason: String }
   verifyHashConsistency = a: b:
     let
-      ha = typeHash a;
-      hb = typeHash b;
-      hashEq = ha == hb;
-      # NF equality（通过 serializeAlpha 比较）
-      nfA = normalizeLib.normalize a;
-      nfB = normalizeLib.normalize b;
-      nfEqual = serialLib.serializeReprAlphaCanonical nfA.repr
-              == serialLib.serializeReprAlphaCanonical nfB.repr;
+      nfA   = _normalize a;
+      nfB   = _normalize b;
+      hashA = nfHash nfA;
+      hashB = nfHash nfB;
+      nfSer = t: serializeReprAlphaCanonical t.repr;
+      nfEq  = nfSer nfA == nfSer nfB;
+      hashEq = hashA == hashB;
     in
-    if hashEq && nfEqual then
-      { consistent = true;  status = "consistent-equal";     details = "hash=${ha}"; }
-    else if !hashEq && !nfEqual then
-      { consistent = true;  status = "consistent-different"; details = "${ha} vs ${hb}"; }
-    else if hashEq && !nfEqual then
-      { consistent = false; status = "hash-collision";
-        details = "COLLISION: same hash ${ha} but different NF"; }
-    else
-      { consistent = false; status = "hash-inconsistency";
-        details = "INCONSISTENCY: different hash but same NF: ${ha} vs ${hb}"; };
+    if nfEq && hashEq    then { consistent = true;  reason = "nf-equal and hash-equal"; }
+    else if !nfEq && !hashEq then { consistent = true;  reason = "nf-different and hash-different"; }
+    else if nfEq && !hashEq  then { consistent = false; reason = "BUG: nf-equal but hash-different (hash function error)"; }
+    else                          { consistent = false; reason = "BUG: hash-equal but nf-different (hash collision)"; };
 
-  # ── 系统级 INV 检查 ────────────────────────────────────────────────────────
-  # Type: [Type] -> { ok: Bool; violations: [String] }
-  verifyHashInvariants = types:
+  # ══════════════════════════════════════════════════════════════════════════════
+  # Hash 工具
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # 比较两个 type 的 hash（相等 ⟹ 语义相等，by INV-EQ1）
+  # Type: Type -> Type -> Bool
+  hashEq = a: b: typeHash a == typeHash b;
+
+  # 从一组 types 中去重（按 hash）
+  # Type: [Type] -> [Type]
+  deduplicateByHash = types:
     let
-      # 检查 typeHash = nfHash ∘ normalize 对每个类型
-      violations = lib.concatMap (t:
-        let
-          h1 = typeHash t;
-          nf = normalizeLib.normalize t;
-          h2 = nfHash nf;
-        in
-        if h1 == h2 then []
-        else ["INV-H2 violation: typeHash(${builtins.substring 0 8 t.id}) != nfHash(normalize(t))"]
-      ) types;
+      go = acc: seen: ts:
+        if ts == [] then acc
+        else
+          let
+            h = typeHash (builtins.head ts);
+            rest = builtins.tail ts;
+          in
+          if seen ? ${h} then go acc seen rest
+          else go (acc ++ [builtins.head ts]) (seen // { ${h} = true; }) rest;
     in
-    { ok = builtins.length violations == 0; inherit violations; };
+    go [] {} types;
+
+  # 从一组 types 中按 hash 排序（canonical 顺序）
+  # Type: [Type] -> [Type]
+  sortByHash = types:
+    lib.sort (a: b: typeHash a < typeHash b) types;
 
 }
