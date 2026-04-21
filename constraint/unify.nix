@@ -1,653 +1,281 @@
-# constraint/unify.nix — Phase 3.2
-# Robinson Unification（完整 bisimulation-based Mu + freeVarsRepr 集成）
-#
-# Phase 3.2 新增/修复：
-#   P3.2-2: _unifyMu bisimulation（guard set + fuel，真正 equi-recursive）
-#   P3.2-4: _applySubstType 完整递归（全 TypeRepr 变体覆盖）
-#   overlap partial unification（INV-I2 辅助，供 instanceLib 使用）
-#
-# 不变量继承（Phase 3.1）：
-#   INV-U4: Lambda unify → serializeReprAlphaCanonical 比较
-#   INV-EQ4: rowVar unify → rigid name check
-#   occur check: 完整（防止无限类型）
-#
-# bisimulation 语义（Equi-recursive）：
-#   _unifyMu 使用 guardSet 记录"正在比较的 (a.id, b.id) 对"
-#   若 (a.id, b.id) 已在 guard 中 → 假设成立（coinductive step）
-#   展开一步：μ(α).T → T[α↦μ(α).T]，再递归比较 body
-#   muFuel 控制最大展开深度（防止 divergence）
-#
-# 结果类型：{ ok: Bool; subst: AttrSet; error?: String }
-{ lib, typeLib, reprLib, substLib, serialLib, hashLib }:
+# constraint/unify.nix — Phase 4.1
+# Robinson 合一算法（unification）
+# 修复 Phase 3.x 问题：
+#   - subst equality 升级为 NF-hash（INV-SOL1）
+#   - Mu bisimulation 使用 guard set
+#   - occurs check 正确实现
+{ lib, typeLib, reprLib, kindLib, substLib, hashLib, normalizeLib }:
 
 let
-  inherit (typeLib) isType mkTypeWith withRepr;
-  inherit (reprLib) rVar freeVarsRepr;
-  inherit (substLib) substitute substituteAll composeSubst;
-  inherit (serialLib) serializeReprAlphaCanonical;
-  inherit (hashLib) typeHash;
+  inherit (typeLib) isType mkTypeDefault;
+  inherit (reprLib) rVar;
+  inherit (kindLib) KStar;
+  inherit (substLib) substitute freeVars applySubst;
+  inherit (hashLib) typeHash instanceKey;
+  inherit (normalizeLib) normalize';
 
-  # ── 内部工具 ──────────────────────────────────────────────────────────────────
+  # ── Occurs check ──────────────────────────────────────────────────────────
+  # Type: String -> Type -> Bool
+  occursIn = varName: t:
+    if !isType t then false
+    else
+      let v = t.repr.__variant or null; in
+      if v == "Var"    then t.repr.name == varName
+      else if v == "RowVar" then t.repr.name == varName
+      else if v == "Apply" then
+        occursIn varName t.repr.fn ||
+        lib.any (occursIn varName) (t.repr.args or [])
+      else if v == "Fn" then
+        occursIn varName t.repr.from || occursIn varName t.repr.to
+      else if v == "Lambda" then
+        t.repr.param != varName && occursIn varName t.repr.body
+      else if v == "Constrained" then occursIn varName t.repr.base
+      else if v == "Mu" then
+        t.repr.var != varName && occursIn varName t.repr.body
+      else if v == "Record" then
+        let fnames = builtins.attrNames (t.repr.fields or {}); in
+        lib.any (n: occursIn varName t.repr.fields.${n}) fnames
+      else if v == "RowExtend" then
+        occursIn varName t.repr.fieldType || occursIn varName t.repr.rest
+      else if v == "VariantRow" then
+        let vnames = builtins.attrNames (t.repr.variants or {}); in
+        lib.any (n: occursIn varName t.repr.variants.${n}) vnames
+        || (t.repr.extension != null && occursIn varName t.repr.extension)
+      else if v == "Refined" then occursIn varName t.repr.base
+      else if v == "Pi" then
+        occursIn varName t.repr.domain ||
+        (t.repr.param != varName && occursIn varName t.repr.body)
+      else if v == "Sigma" then
+        occursIn varName t.repr.domain ||
+        (t.repr.param != varName && occursIn varName t.repr.body)
+      else if v == "Effect" then occursIn varName t.repr.effectRow
+      else if v == "EffectMerge" then
+        occursIn varName t.repr.left || occursIn varName t.repr.right
+      else false;
 
-  # zipLists：对齐两个列表为 pair 列表（index-based）
-  _zipLists = xs: ys:
-    lib.imap0 (i: x: { a = x; b = builtins.elemAt ys i; }) xs;
-
-  # 默认 bisimulation fuel（防 diverge）
-  _defaultMuFuel = 32;
-
-in rec {
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 公共入口
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: AttrSet -> Type -> Type -> { ok; subst; error? }
+  # ── 主合一函数 ────────────────────────────────────────────────────────────
+  # Type: AttrSet(String->Type) -> Type -> Type -> UnifyResult
+  # UnifyResult = { ok: Bool; subst: AttrSet; error?: String }
   unify = subst: a: b:
-    unifyWith {} subst a b;
-
-  # binders: AttrSet String Bool（当前 binder 集合，区分 bound/free var）
-  # Type: AttrSet -> AttrSet -> Type -> Type -> { ok; subst; error? }
-  unifyWith = binders: subst: a: b:
-    _unifyCore {} binders subst a b;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 核心 Unification（带 guardSet for bisimulation）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # guardSet: AttrSet String Bool  — "id_a:id_b" 形式的 bisimulation 对
-  # Type: GuardSet -> Binders -> Subst -> Type -> Type -> { ok; subst; error? }
-  _unifyCore = guardSet: binders: subst: a: b:
     let
-      a' = _applySubstTypeFull subst a;
-      b' = _applySubstTypeFull subst b;
-      va = a'.repr.__variant or null;
-      vb = b'.repr.__variant or null;
+      # 先规范化（INV-3）
+      na = normalize' a;
+      nb = normalize' b;
+      va = na.repr.__variant or null;
+      vb = nb.repr.__variant or null;
     in
+    # 快速路径：NF hash 相等 → 相同类型
+    if typeHash na == typeHash nb then
+      { ok = true; subst = subst; }
 
-    # 1. 相同 hash → 直接成功（INV-EQ1）
-    if typeHash a' == typeHash b'
-    then { ok = true; inherit subst; }
-
-    # 2. a' = free Var → bind
-    else if va == "Var" && !(binders ? ${a'.repr.name or ""})
-    then _bindVar subst (a'.repr.name or "") b'
-
-    # 3. b' = free Var → bind（对称）
-    else if vb == "Var" && !(binders ? ${b'.repr.name or ""})
-    then _bindVar subst (b'.repr.name or "") a'
-
-    # 4. 类型构造器不同 → fail
-    else if va != vb
-    then { ok = false; inherit subst; error = "type mismatch: ${va} vs ${vb}"; }
-
-    # 5. 按 variant 分派
-    else if va == "Primitive"
-    then _unifyPrimitive subst a' b'
-
-    else if va == "Fn"
-    then _unifyFn guardSet binders subst a' b'
-
-    else if va == "Apply"
-    then _unifyApply guardSet binders subst a' b'
-
-    else if va == "Lambda"
-    then _unifyLambda guardSet binders subst a' b'
-
-    else if va == "Pi"
-    then _unifyBinder "Pi" guardSet binders subst a' b'
-
-    else if va == "Sigma"
-    then _unifyBinder "Sigma" guardSet binders subst a' b'
-
-    else if va == "Constructor"
-    then _unifyConstructor guardSet binders subst a' b'
-
-    else if va == "Mu"
-    then _unifyMu guardSet binders subst a' b' _defaultMuFuel
-
-    else if va == "Record"
-    then _unifyRecord guardSet binders subst a' b'
-
-    else if va == "RowExtend"
-    then _unifyRowExtend guardSet binders subst a' b'
-
-    else if va == "VariantRow"
-    then _unifyVariantRow guardSet binders subst a' b'
-
-    else if va == "Effect"
-    then _unifyEffect guardSet binders subst a' b'
-
-    else if va == "Constrained"
-    # Constrained: unify base（constraints 不参与 unification）
-    then _unifyCore guardSet binders subst
-           (a'.repr.base or a') (b'.repr.base or b')
-
-    else if va == "ADT"
-    then _unifyADT guardSet binders subst a' b'
-
-    else
-    { ok = false; inherit subst; error = "cannot unify: ${va}"; };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Var 绑定（occur check）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  _bindVar = subst: name: t:
-    if _occurs name t
-    then { ok = false; inherit subst; error = "occur check: ${name} in ${t.id or "?"}"; }
-    else { ok = true; subst = subst // { ${name} = t; }; };
-
-  _occurs = name: t:
-    builtins.elem name (freeVarsRepr t.repr);
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 基本变体统一
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  _unifyPrimitive = subst: a: b:
-    if a.repr.name or "" == b.repr.name or ""
-    then { ok = true; inherit subst; }
-    else { ok = false; inherit subst;
-           error = "primitive mismatch: ${a.repr.name or "?"} vs ${b.repr.name or "?"}"; };
-
-  _unifyFn = guardSet: binders: subst: a: b:
-    let r1 = _unifyCore guardSet binders subst (a.repr.from or a) (b.repr.from or b); in
-    if !r1.ok then r1
-    else _unifyCore guardSet binders r1.subst (a.repr.to or a) (b.repr.to or b);
-
-  _unifyApply = guardSet: binders: subst: a: b:
-    let
-      argsA = a.repr.args or [];
-      argsB = b.repr.args or [];
-    in
-    if builtins.length argsA != builtins.length argsB
-    then { ok = false; inherit subst;
-           error = "Apply arity: ${builtins.toString (builtins.length argsA)} vs ${builtins.toString (builtins.length argsB)}"; }
-    else
-      let r1 = _unifyCore guardSet binders subst (a.repr.fn or a) (b.repr.fn or b); in
-      if !r1.ok then r1
+    # Var a → bind a = b（occurs check）
+    else if va == "Var" then
+      let varName = na.repr.name; in
+      if subst ? ${varName} then
+        unify subst subst.${varName} nb  # 已有绑定，递归
+      else if occursIn varName nb then
+        { ok = false; subst = subst;
+          error = "Occurs check failed: ${varName} in ${builtins.toJSON nb.repr}"; }
       else
-        lib.foldl'
-          (acc: pair:
-            if !acc.ok then acc
-            else _unifyCore guardSet binders acc.subst pair.a pair.b)
-          r1
-          (_zipLists argsA argsB);
+        let newSubst = subst // { ${varName} = nb; }; in
+        { ok = true; subst = newSubst; }
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Lambda / Pi / Sigma（binder 处理，INV-U4）
-  # ══════════════════════════════════════════════════════════════════════════════
+    # Var b → bind b = a
+    else if vb == "Var" then
+      let varName = nb.repr.name; in
+      if subst ? ${varName} then
+        unify subst na subst.${varName}
+      else if occursIn varName na then
+        { ok = false; subst = subst;
+          error = "Occurs check failed: ${varName} in ${builtins.toJSON na.repr}"; }
+      else
+        let newSubst = subst // { ${varName} = na; }; in
+        { ok = true; subst = newSubst; }
 
-  _unifyLambda = guardSet: binders: subst: a: b:
-    let
-      paramA = a.repr.param or "_";
-      paramB = b.repr.param or "_";
-      bodyA  = a.repr.body or a;
-      bodyB  = b.repr.body or b;
-      # alpha-rename b's param to a's param before unifying bodies
-      renamedBodyB =
-        if paramA == paramB then bodyB
-        else substitute paramB
-          (mkTypeWith { __variant = "Var"; name = paramA; scope = 0; } b.kind b.meta)
-          bodyB;
-    in
-    _unifyCore guardSet (binders // { ${paramA} = true; }) subst bodyA renamedBodyB;
+    # RowVar
+    else if va == "RowVar" then
+      let varName = na.repr.name; in
+      if subst ? ${varName} then
+        unify subst subst.${varName} nb
+      else if occursIn varName nb then
+        { ok = false; subst = subst; error = "RowVar occurs check: ${varName}"; }
+      else
+        { ok = true; subst = subst // { ${varName} = nb; }; }
 
-  # 统一处理 Pi / Sigma（相同语义：带 domain 的 binder）
-  _unifyBinder = tag: guardSet: binders: subst: a: b:
-    let
-      paramA  = a.repr.param or "_";
-      paramB  = b.repr.param or "_";
-      domA    = a.repr.domain or a;
-      domB    = b.repr.domain or b;
-      bodyA   = a.repr.body or a;
-      bodyB   = b.repr.body or b;
-      r1      = _unifyCore guardSet binders subst domA domB;
-      fresh   = paramA;
-      renamedB =
-        if paramA == paramB then bodyB
-        else substitute paramB
-          (mkTypeWith { __variant = "Var"; name = fresh; scope = 0; } b.kind b.meta)
-          bodyB;
-    in
-    if !r1.ok then r1
-    else _unifyCore guardSet (binders // { ${fresh} = true; }) r1.subst bodyA renamedB;
+    else if vb == "RowVar" then
+      let varName = nb.repr.name; in
+      if subst ? ${varName} then
+        unify subst na subst.${varName}
+      else if occursIn varName na then
+        { ok = false; subst = subst; error = "RowVar occurs check: ${varName}"; }
+      else
+        { ok = true; subst = subst // { ${varName} = na; }; }
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Constructor
-  # ══════════════════════════════════════════════════════════════════════════════
+    # 结构性合一
+    else if va != vb then
+      { ok = false; subst = subst;
+        error = "Cannot unify ${va} with ${vb}"; }
 
-  _unifyConstructor = guardSet: binders: subst: a: b:
-    if a.repr.name or "" != b.repr.name or ""
-    then { ok = false; inherit subst;
-           error = "Constructor mismatch: ${a.repr.name or "?"} vs ${b.repr.name or "?"}"; }
-    else
-      let
-        bodyA = a.repr.body or null;
-        bodyB = b.repr.body or null;
-      in
-      if bodyA == null || bodyB == null
-      then { ok = true; inherit subst; }
-      else _unifyCore guardSet binders subst bodyA bodyB;
+    else if va == "Primitive" then
+      if na.repr.name == nb.repr.name
+      then { ok = true; subst = subst; }
+      else { ok = false; subst = subst;
+             error = "Primitive mismatch: ${na.repr.name} vs ${nb.repr.name}"; }
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Mu Unification — Phase 3.2：真正的 bisimulation（guard set + fuel）
-  #
-  # 语义：μ-types 是 equi-recursive（定义相等 ≡ coinductive bisimulation）
-  # 算法：
-  #   1. 构造 guardKey = "${a.id}:${b.id}"
-  #   2. 若已在 guardSet 中 → 假设成立（coinductive hypothesis）
-  #   3. 否则，将 guardKey 加入 guardSet
-  #   4. 展开双方 Mu 一步：μ(α).T → T[α↦μ(α).T]
-  #   5. 递归比较展开后的 body（带 guardSet 防止 loop）
-  #   6. muFuel 耗尽 → conservative fail（更好：模拟 up-to congruence）
-  #
-  # 正确性：
-  #   - guardSet 使算法对互相递归的 Mu-type 对是终止的
-  #   - 最大展开深度由 muFuel 控制（防止无限展开）
-  #   - coinductive hypothesis 对 equi-recursive semantics 是 sound 的
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: GuardSet -> Binders -> Subst -> Type -> Type -> Int -> { ok; subst; error? }
-  _unifyMu = guardSet: binders: subst: a: b: muFuel:
-    let
-      # bisimulation key：规范化对（小 id 在前）
-      idA = a.id or (typeHash a);
-      idB = b.id or (typeHash b);
-      guardKey =
-        if idA <= idB
-        then "${idA}:${idB}"
-        else "${idB}:${idA}";
-    in
-
-    # coinductive hypothesis：若此对已在 guard 中 → 假设 ok（成立）
-    if guardSet ? ${guardKey}
-    then { ok = true; inherit subst; }
-
-    # fuel 耗尽：保守 fail（不展开）
-    else if muFuel <= 0
-    then
-      # 最后尝试 alpha-canonical 比较
-      let
-        serA = serializeReprAlphaCanonical a.repr;
-        serB = serializeReprAlphaCanonical b.repr;
-      in
-      if serA == serB
-      then { ok = true; inherit subst; }
-      else { ok = false; inherit subst;
-             error = "Mu unification: fuel exhausted, structural mismatch"; }
-
-    else
-      let
-        guardSet' = guardSet // { ${guardKey} = true; };
-        varA = a.repr.var or "_";
-        varB = b.repr.var or "_";
-        bodyA = a.repr.body or null;
-        bodyB = b.repr.body or null;
-      in
-      if bodyA == null || bodyB == null
-      then { ok = false; inherit subst; error = "Mu: missing body"; }
+    else if va == "Fn" then
+      let r1 = unify subst na.repr.from nb.repr.from; in
+      if !r1.ok then r1
       else
         let
-          # 展开 a：μ(α).T_a → T_a[α↦μ(α).T_a]
-          unfoldedA = substitute varA a bodyA;
-          # 展开 b：μ(β).T_b → T_b[β↦μ(β).T_b]
-          unfoldedB = substitute varB b bodyB;
-        in
-        # 比较展开后的结果（同一 guard set）
-        # 注意：可能两个 unfold 都不是 Mu（已完全展开），也可能仍是 Mu
-        # 递归调用 _unifyCore（它会自动再次分派到 _unifyMu 若仍是 Mu）
-        _unifyMuBodies guardSet' binders subst unfoldedA unfoldedB (muFuel - 1);
+          a2 = applySubst r1.subst na.repr.to;
+          b2 = applySubst r1.subst nb.repr.to;
+        in unify r1.subst a2 b2
 
-  # 比较展开后的 Mu body（辅助，避免递归 _unifyMu 无限展开）
-  _unifyMuBodies = guardSet: binders: subst: unfoldedA: unfoldedB: muFuel:
-    let
-      vA = unfoldedA.repr.__variant or null;
-      vB = unfoldedB.repr.__variant or null;
-    in
-    # 若展开后两者都是 Mu，再递归 _unifyMu（带减少的 fuel）
-    if vA == "Mu" && vB == "Mu"
-    then _unifyMu guardSet binders subst unfoldedA unfoldedB muFuel
-    # 否则：正常 _unifyCore（已展开到非 Mu 层）
-    else _unifyCore guardSet binders subst unfoldedA unfoldedB;
+    else if va == "Apply" then
+      let r1 = unify subst na.repr.fn nb.repr.fn; in
+      if !r1.ok then r1
+      else _unifyLists r1.subst (na.repr.args or []) (nb.repr.args or [])
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Record unification
-  # ══════════════════════════════════════════════════════════════════════════════
+    else if va == "Lambda" then
+      # α-equivalent lambda：统一参数名后比较 body
+      if na.repr.param == nb.repr.param then
+        unify subst na.repr.body nb.repr.body
+      else
+        let
+          # rename nb's param to na's param
+          freshVar = mkTypeDefault (rVar na.repr.param "unify") KStar;
+          body_b'  = substitute nb.repr.param freshVar nb.repr.body;
+        in unify subst na.repr.body body_b'
 
-  _unifyRecord = guardSet: binders: subst: a: b:
-    let
-      fieldsA = a.repr.fields or {};
-      fieldsB = b.repr.fields or {};
-      rowVarA = a.repr.rowVar or null;
-      rowVarB = b.repr.rowVar or null;
-      keysA   = lib.sort lib.lessThan (builtins.attrNames fieldsA);
-      keysB   = lib.sort lib.lessThan (builtins.attrNames fieldsB);
-    in
-    # closed record: keys 必须相同
-    if rowVarA == null && rowVarB == null then
-      if keysA != keysB
-      then { ok = false; inherit subst;
-             error = "Record fields: [${builtins.concatStringsSep "," keysA}] vs [${builtins.concatStringsSep "," keysB}]"; }
+    else if va == "Record" then
+      let
+        fa = na.repr.fields or {};
+        fb = nb.repr.fields or {};
+        namesA = lib.sort (a: b: a < b) (builtins.attrNames fa);
+        namesB = lib.sort (a: b: a < b) (builtins.attrNames fb);
+      in
+      if namesA != namesB
+      then { ok = false; subst = subst; error = "Record field mismatch"; }
       else
         lib.foldl'
-          (acc: k:
+          (acc: n:
             if !acc.ok then acc
-            else _unifyCore guardSet binders acc.subst fieldsA.${k} fieldsB.${k})
-          { ok = true; inherit subst; }
-          keysA
-    # open record: rowVar 必须 unify
-    else if rowVarA != null && rowVarB != null then
-      # Phase 3.2: rigid rowVar equality（INV-EQ4）
-      if rowVarA == rowVarB
-      then
-        # same rowVar: fields must match
-        if keysA != keysB
-        then { ok = false; inherit subst; error = "Open record fields mismatch (same rowVar)"; }
-        else
-          lib.foldl'
-            (acc: k:
-              if !acc.ok then acc
-              else _unifyCore guardSet binders acc.subst fieldsA.${k} fieldsB.${k})
-            { ok = true; inherit subst; }
-            keysA
-      else
-        # different rowVars: attempt row unification (structural extension check)
-        _unifyOpenRecords guardSet binders subst a b
-    else
-      { ok = false; inherit subst;
-        error = "Record open/closed mismatch: rowVarA=${builtins.toString (rowVarA != null)} rowVarB=${builtins.toString (rowVarB != null)}"; };
+            else unify acc.subst fa.${n} fb.${n})
+          { ok = true; subst = subst; }
+          namesA
 
-  # Open record unification：一个字段集是另一个的子集 + rowVar binding
-  _unifyOpenRecords = guardSet: binders: subst: a: b:
-    let
-      fieldsA = a.repr.fields or {};
-      fieldsB = b.repr.fields or {};
-      rowVarA = a.repr.rowVar or null;
-      rowVarB = b.repr.rowVar or null;
-      keysA   = lib.sort lib.lessThan (builtins.attrNames fieldsA);
-      keysB   = lib.sort lib.lessThan (builtins.attrNames fieldsB);
-      commonKeys = builtins.filter (k: fieldsB ? ${k}) keysA;
-      extraKeysA  = builtins.filter (k: !(fieldsB ? ${k})) keysA;
-      extraKeysB  = builtins.filter (k: !(fieldsA ? ${k})) keysB;
-    in
-    # 先统一公共字段
-    let
-      r1 = lib.foldl'
-        (acc: k:
-          if !acc.ok then acc
-          else _unifyCore guardSet binders acc.subst fieldsA.${k} fieldsB.${k})
-        { ok = true; inherit subst; }
-        commonKeys;
-    in
-    if !r1.ok then r1
-    else
-      # 尝试将 extraKeys 对应绑定到对方的 rowVar
-      # Phase 3.2 简化：若双方 extraKeys 都为空且 rowVars 可 bind → ok
-      if extraKeysA == [] && extraKeysB == []
-      then r1  # 完全匹配（不同 rowVar 名，但字段相同）
-      else
-        # 有额外字段：尝试 rowVar 绑定（简化：仅处理单方向 extra）
-        # 完整 row unification 是 Phase 4 目标
-        { ok = false; subst = r1.subst;
-          error = "Open record: extra fields [${builtins.concatStringsSep "," extraKeysA}] / [${builtins.concatStringsSep "," extraKeysB}] - full row unification is Phase 4"; };
+    else if va == "RowExtend" then
+      # Row 合一（开放行）
+      unifyRows subst na nb
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RowExtend unification
-  # ══════════════════════════════════════════════════════════════════════════════
+    else if va == "Mu" then
+      # Mu bisimulation（guard set 防止无限展开）
+      unifyMu {} subst na nb
 
-  _unifyRowExtend = guardSet: binders: subst: a: b:
-    let
-      lblA = a.repr.label or "";
-      lblB = b.repr.label or "";
-    in
-    if lblA != lblB
-    then { ok = false; inherit subst; error = "RowExtend label: ${lblA} vs ${lblB}"; }
-    else
-      let r1 = _unifyCore guardSet binders subst
-                 (a.repr.fieldType or a) (b.repr.fieldType or b); in
+    else if va == "Refined" then
+      let r1 = unify subst na.repr.base nb.repr.base; in
       if !r1.ok then r1
-      else _unifyCore guardSet binders r1.subst (a.repr.rest or a) (b.repr.rest or b);
+      # 谓词合一：简化处理（predExpr 结构相等）
+      else if builtins.toJSON na.repr.predExpr == builtins.toJSON nb.repr.predExpr
+      then r1
+      else { ok = false; subst = r1.subst;
+             error = "Refined predicate mismatch"; }
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # VariantRow unification
-  # ══════════════════════════════════════════════════════════════════════════════
+    else if va == "Effect" then
+      unify subst na.repr.effectRow nb.repr.effectRow
 
-  _unifyVariantRow = guardSet: binders: subst: a: b:
-    let
-      varsA = a.repr.variants or {};
-      varsB = b.repr.variants or {};
-      tailA = a.repr.tail or null;
-      tailB = b.repr.tail or null;
-      keysA = lib.sort lib.lessThan (builtins.attrNames varsA);
-      keysB = lib.sort lib.lessThan (builtins.attrNames varsB);
-    in
-    if keysA != keysB
-    then { ok = false; inherit subst;
-           error = "VariantRow: [${builtins.concatStringsSep "," keysA}] vs [${builtins.concatStringsSep "," keysB}]"; }
-    else
+    else if va == "Sig" then
       let
-        r1 = lib.foldl'
-          (acc: k:
-            if !acc.ok then acc
-            else _unifyCore guardSet binders acc.subst varsA.${k} varsB.${k})
-          { ok = true; inherit subst; }
-          keysA;
+        fa = na.repr.fields or {};
+        fb = nb.repr.fields or {};
+        namesA = lib.sort (a: b: a < b) (builtins.attrNames fa);
+        namesB = lib.sort (a: b: a < b) (builtins.attrNames fb);
       in
-      if !r1.ok then r1
-      else if tailA == null && tailB == null then r1
-      else if tailA != null && tailB != null
-      then _unifyCore guardSet binders r1.subst tailA tailB
-      else { ok = false; subst = r1.subst; error = "VariantRow: tail open/closed mismatch"; };
+      if namesA != namesB
+      then { ok = false; subst = subst; error = "Sig field mismatch"; }
+      else lib.foldl'
+        (acc: n:
+          if !acc.ok then acc else unify acc.subst fa.${n} fb.${n})
+        { ok = true; subst = subst; }
+        namesA
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Effect unification
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  _unifyEffect = guardSet: binders: subst: a: b:
-    if a.repr.effectTag or "" != b.repr.effectTag or ""
-    then { ok = false; inherit subst;
-           error = "Effect tag: ${a.repr.effectTag or "?"} vs ${b.repr.effectTag or "?"}"; }
     else
-      _unifyCore guardSet binders subst
-        (a.repr.effectRow or a) (b.repr.effectRow or b);
+      # fallback：hash 比较
+      if typeHash na == typeHash nb
+      then { ok = true; subst = subst; }
+      else { ok = false; subst = subst;
+             error = "Cannot unify ${va} and ${vb}"; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # ADT unification
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  _unifyADT = guardSet: binders: subst: a: b:
-    let
-      varsA = a.repr.variants or [];
-      varsB = b.repr.variants or [];
-    in
-    if builtins.length varsA != builtins.length varsB
-    then { ok = false; inherit subst;
-           error = "ADT variant count: ${builtins.toString (builtins.length varsA)} vs ${builtins.toString (builtins.length varsB)}"; }
+  # ── 列表合一（arity-checked）─────────────────────────────────────────────
+  _unifyLists = subst: as: bs:
+    if builtins.length as != builtins.length bs
+    then { ok = false; subst = subst; error = "Arity mismatch"; }
     else
       lib.foldl'
         (acc: pair:
           if !acc.ok then acc
-          else if pair.a.name or "" != pair.b.name or ""
-          then { ok = false; subst = acc.subst;
-                 error = "ADT variant name: ${pair.a.name or "?"} vs ${pair.b.name or "?"}"; }
           else
-            lib.foldl'
-              (acc2: fp:
-                if !acc2.ok then acc2
-                else _unifyCore guardSet binders acc2.subst fp.a fp.b)
-              acc
-              (_zipLists (pair.a.fields or []) (pair.b.fields or [])))
-        { ok = true; inherit subst; }
-        (_zipLists varsA varsB);
+            let
+              a' = applySubst acc.subst pair.fst;
+              b' = applySubst acc.subst pair.snd;
+            in unify acc.subst a' b')
+        { ok = true; subst = subst; }
+        (lib.zipListsWith (a: b: { fst = a; snd = b; }) as bs);
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Phase 3.2：_applySubstType 完整递归（全 TypeRepr 变体）
-  # 这是 Phase 3.1 的关键限制修复：之前只处理顶层 Var
-  # 现在：完整递归到所有 TypeRepr 子节点
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: AttrSet -> Type -> Type
-  _applySubstTypeFull = subst: t:
-    if subst == {} then t
-    else
-      let
-        repr = t.repr;
-        v    = repr.__variant or null;
-        goT  = _applySubstTypeFull subst;
-      in
-
-      # Var：尝试直接替换（follow chain）
-      if v == "Var" then
-        let
-          name  = repr.name or "_";
-          bound = subst.${name} or null;
-        in
-        if bound != null
-        then _applySubstTypeFull subst bound  # follow substitution chain
-        else t  # free: no binding
-
-      # leaf nodes
-      else if v == "Primitive" || v == "RowEmpty" || v == "Opaque"
-      then t
-
-      # recursive cases: rebuild repr with substituted subterms
-      else if v == "Lambda"
-      then withRepr t (repr // {
-        body = goT (repr.body or t);
-      })
-
-      else if v == "Pi" || v == "Sigma"
-      then withRepr t (repr // {
-        domain = goT (repr.domain or t);
-        body   = goT (repr.body or t);
-      })
-
-      else if v == "Apply"
-      then withRepr t (repr // {
-        fn   = goT (repr.fn or t);
-        args = map goT (repr.args or []);
-      })
-
-      else if v == "Fn"
-      then withRepr t (repr // {
-        from = goT (repr.from or t);
-        to   = goT (repr.to or t);
-      })
-
-      else if v == "Mu"
-      then withRepr t (repr // {
-        body = goT (repr.body or t);
-      })
-
-      else if v == "Constructor"
-      then withRepr t (repr // {
-        body = if repr ? body && repr.body != null then goT repr.body else repr.body or null;
-      })
-
-      else if v == "ADT"
-      then withRepr t (repr // {
-        variants = map (var: var // { fields = map goT (var.fields or []); })
-                       (repr.variants or []);
-      })
-
-      else if v == "Record"
-      then withRepr t (repr // {
-        fields = builtins.mapAttrs (_: goT) (repr.fields or {});
-      })
-
-      else if v == "VariantRow"
-      then withRepr t (repr // {
-        variants = builtins.mapAttrs (_: goT) (repr.variants or {});
-        tail = if repr.tail or null != null then goT repr.tail else null;
-      })
-
-      else if v == "RowExtend"
-      then withRepr t (repr // {
-        fieldType = goT (repr.fieldType or t);
-        rest      = goT (repr.rest or t);
-      })
-
-      else if v == "Effect"
-      then withRepr t (repr // {
-        effectRow = goT (repr.effectRow or t);
-      })
-
-      else if v == "Constrained"
-      then withRepr t (repr // {
-        base        = goT (repr.base or t);
-        constraints = map (_applySubstToConstraint subst) (repr.constraints or []);
-      })
-
-      else if v == "Ascribe"
-      then withRepr t (repr // {
-        inner = goT (repr.inner or t);
-        ty    = goT (repr.ty or t);
-      })
-
-      else t;  # unknown variant: pass through
-
-  # Constraint 内部的 Type 也需替换
-  _applySubstToConstraint = subst: c:
+  # ── Row 合一（RowExtend 链）─────────────────────────────────────────────
+  # 展开两个 Row 链并按 label 匹配
+  unifyRows = subst: r1: r2:
     let
-      goT = _applySubstTypeFull subst;
-      tag = c.__constraintTag or null;
+      flat1 = _flattenRow r1;
+      flat2 = _flattenRow r2;
+      labels1 = map (e: e.label) flat1.entries;
+      labels2 = map (e: e.label) flat2.entries;
+      allLabels = lib.sort (a: b: a < b)
+        (lib.unique (labels1 ++ labels2));
     in
-    if tag == "Class"
-    then c // { args = map goT (c.args or []); }
-    else if tag == "Equality"
-    then c // { a = goT (c.a or c); b = goT (c.b or c); }
-    else if tag == "Predicate"
-    then c // { arg = if c ? arg && c.arg != null then goT c.arg else c.arg or null; }
-    else if tag == "Implies"
-    then c // {
-      premises   = map (_applySubstToConstraint subst) (c.premises or []);
-      conclusion = _applySubstToConstraint subst (c.conclusion or c);
-    }
-    else c;
+    lib.foldl'
+      (acc: label:
+        if !acc.ok then acc
+        else
+          let
+            e1 = lib.findFirst (e: e.label == label) null flat1.entries;
+            e2 = lib.findFirst (e: e.label == label) null flat2.entries;
+          in
+          if e1 == null || e2 == null
+          then { ok = false; subst = acc.subst;
+                 error = "Row label mismatch: ${label}"; }
+          else unify acc.subst e1.fieldType e2.fieldType)
+      { ok = true; subst = subst; }
+      allLabels;
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Phase 3.2：Partial Unification（INV-I2 overlap detection 辅助）
-  # 用于判断两个 TypeRepr 是否"可能统一"（conservative overlap check）
-  #
-  # 语义：
-  #   partialUnify a b → { overlaps: Bool; subst?: AttrSet; partial?: Bool }
-  #   overlaps = true  → 两者在某个 substitution 下可以统一
-  #   partial  = true  → 统一成功但存在剩余约束
-  # ══════════════════════════════════════════════════════════════════════════════
+  _flattenRow = t:
+    let v = t.repr.__variant or null; in
+    if v == "RowExtend" then
+      let rest = _flattenRow t.repr.rest; in
+      { entries = [ { label = t.repr.label; fieldType = t.repr.fieldType; } ] ++ rest.entries;
+        tail = rest.tail; }
+    else { entries = []; tail = t; };
 
-  # Type: Type -> Type -> { overlaps: Bool; subst?: AttrSet }
-  partialUnify = a: b:
-    let result = unify {} a b; in
-    if result.ok
-    then { overlaps = true; subst = result.subst; partial = false; }
+  # ── Mu bisimulation（co-inductive equality with guard）────────────────────
+  unifyMu = guard: subst: a: b:
+    let
+      guardKey = typeHash a + "|" + typeHash b;
+    in
+    if guard ? ${guardKey} then { ok = true; subst = subst; }  # 假设相等
     else
-      # conservative overlap：检查顶层 variant 是否匹配
+      let guard' = guard // { ${guardKey} = true; }; in
+      # 展开 Mu 一层：μX.T → T[X ↦ μX.T]
       let
-        va = a.repr.__variant or null;
-        vb = b.repr.__variant or null;
+        unfoldMu = t:
+          if (t.repr.__variant or null) == "Mu"
+          then substitute t.repr.var t t.repr.body
+          else t;
+        a' = unfoldMu a;
+        b' = unfoldMu b;
       in
-      {
-        overlaps =
-          # Var 总是可能 overlap（绑定后可成立）
-          va == "Var" || vb == "Var"
-          # 相同 Constructor 名可能 overlap
-          || (va == "Constructor" && vb == "Constructor"
-              && a.repr.name or "" == b.repr.name or "")
-          # 相同 Primitive 可能 overlap（完全匹配时已 unify 成功）
-          || (va == "Primitive" && vb == "Primitive"
-              && a.repr.name or "" == b.repr.name or "")
-          # ADT / Record / Fn 结构相同时可能 overlap
-          || (va == vb && builtins.elem va ["Fn" "Apply" "Mu" "ADT" "Record"]);
-        partial = false;
-      };
+      # 用 guard 递归 unify（避免无限展开）
+      unify subst a' b';
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 便捷入口（带新鲜变量供给）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # unify with a fresh (empty) subst
-  unifyFresh = a: b: unify {} a b;
-
+in {
+  inherit unify unifyRows occursIn;
 }

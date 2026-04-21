@@ -1,276 +1,163 @@
-# effect/handlers.nix — Phase 4.0
-#
-# Effect Handlers（代数效果分发）
-#
-# 设计原则：
-#   handle : Eff(E ++ R, A) → Handler(E, A, B) → Eff(R, B)
-#   - Handler = { effectTag; branches: [HandlerBranch]; returnClause }
-#   - HandlerBranch = { opName; params; resume; body }
-#   - handle 后 effect row 中 E 被精确移除（INV-EFF-4）
-#   - subtractEffect 正确计算残余 effect（INV-EFF-5）
-#
-# Phase 4.0 新增（基于 Phase 3.3 subtractEffect）：
-#   - Handler TypeIR（完整结构，∈ TypeIR）
-#   - open effect row（RowVar tail）支持
-#   - Handler 类型检查
-#   - 多 handler 组合（handleAll）
-#
-# 不变量：
-#   INV-EFF-4: handle 后 effect row 中 E 被移除（soundness）
-#   INV-EFF-5: 残余 effect = original - handled（精确 subtract）
-#   INV-EFF-6: open effect row（RowVar）在 subtract 后保留 tail
-#   INV-EFF-7: Handler 操作名不重复（coherence）
-
-{ lib, typeLib, kindLib, reprLib, normalizeLib, hashLib }:
+# effect/handlers.nix — Phase 4.1
+# Effect Handler 系统（algebraic effects）
+# INV-EFF-4: Handler ∈ TypeRepr
+# INV-EFF-5: checkHandler 类型安全
+# INV-EFF-6: EffectMerge 支持 open RowVar tail（由 rules.nix 规范化）
+# INV-EFF-7: subtractEffect 精确消除
+# INV-EFF-8: deep handler = handle all occurrences（Phase 4.1）
+# INV-EFF-9: shallow handler = handle first only（Phase 4.1）
+{ lib, typeLib, reprLib, kindLib, normalizeLib, hashLib }:
 
 let
-  inherit (typeLib) mkTypeDefault mkTypeWith;
-  inherit (kindLib) KStar KArrow KEffect;
+  inherit (typeLib) isType mkTypeDefault mkTypeWith;
   inherit (reprLib)
-    rPrimitive rVar rFn rADT rConstrained rEffect
-    rVariantRow rRowEmpty rRowVar rRowExtend rOpaque;
+    rHandler rVariantRow rEffect rEffectMerge rRowEmpty rRowVar
+    isEffect isEffectMerge isVariantRow isRowEmpty isRowVar;
+  inherit (kindLib) KStar KEffect KRow;
+  inherit (normalizeLib) normalize';
+  inherit (hashLib) typeHash;
 
 in rec {
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Handler TypeRepr
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Effect Label 构造器 ════════════════════════════════════════════════════
 
-  rHandler = effectTag: branches: returnType: {
-    __variant = "Handler";
-    inherit effectTag branches;
-    returnType = returnType;
-  };
+  mkEffectLabel = name: paramType: returnType:
+    { __type = "EffectLabel";
+      inherit name paramType returnType; };
 
-  rHandlerBranch = opName: params: resumeParam: body: {
-    inherit opName params resumeParam body;
-  };
+  # ══ Handler Branch 构造器 ═════════════════════════════════════════════════
 
+  mkBranch = effectTag: paramType: body:
+    { __type = "HandlerBranch";
+      inherit effectTag paramType body; };
+
+  # Phase 4.1: Branch with continuation（INV-EFF-8/9）
+  mkBranchWithCont = effectTag: paramType: contType: body:
+    { __type    = "HandlerBranch";
+      hasResume = true;
+      inherit effectTag paramType contType body; };
+
+  # ══ Handler 类型构造器 ════════════════════════════════════════════════════
+
+  # Type: String -> [Branch] -> Type -> Type
   mkHandler = effectTag: branches: returnType:
     mkTypeDefault (rHandler effectTag branches returnType) KStar;
 
-  # ── Effect 操作类型构造器 ────────────────────────────────────────────────────
+  # Deep handler（处理所有 occurrence，INV-EFF-8）
+  mkDeepHandler = effectTag: branches: returnType:
+    let base = mkHandler effectTag branches returnType; in
+    mkTypeWith
+      (base.repr // { shallow = false; deep = true; })
+      base.kind base.meta;
 
-  # mkEffOp: 声明一个 effect 操作
-  # opName: String, paramTypes: [Type], returnType: Type
-  mkEffOp = opName: paramTypes: retType: {
-    inherit opName paramTypes retType;
-  };
+  # Shallow handler（仅处理第一次 occurrence，INV-EFF-9）
+  mkShallowHandler = effectTag: branches: returnType:
+    let base = mkHandler effectTag branches returnType; in
+    mkTypeWith
+      (base.repr // { shallow = true; deep = false; })
+      base.kind base.meta;
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Effect Row 操作（Phase 3.3 subtractEffect 升级版）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Effect Row 构造器 ═════════════════════════════════════════════════════
 
-  # _flattenEffect：将 Effect/EffectMerge 展开为 flat variants map + tail
-  # Phase 4.0：支持 RowVar tail（INV-EFF-6）
-  _flattenEffectFull = effTy:
-    let r = effTy.repr or {}; in
-    if r.__variant == "Effect" then
-      let rowR = (r.effectRow or { repr = { __variant = "RowEmpty"; }; }).repr or {}; in
-      if rowR.__variant == "VariantRow" then
-        { variants = rowR.variants or {}; tail = rowR.extension or null; }
-      else if rowR.__variant == "RowVar" then
-        { variants = {}; tail = effTy; }  # Phase 4.0 fix: 保留 RowVar tail
-      else if rowR.__variant == "RowEmpty" then
-        { variants = {}; tail = null; }
-      else { variants = {}; tail = null; }
-    else if r.__variant == "EffectMerge" then
-      let
-        l = _flattenEffectFull r.left;
-        rr = _flattenEffectFull r.right;
-        merged = l.variants // rr.variants;  # right-biased
-        # tail 合并：若 rr 有 tail 则用 rr 的，否则用 l 的
-        tail = if rr.tail != null then rr.tail
-               else if l.tail != null then l.tail
-               else null;
-      in
-      { variants = merged; tail = tail; }
-    else if r.__variant == "RowVar" then
-      { variants = {}; tail = effTy; }  # 直接 RowVar
-    else { variants = {}; tail = null; };
+  # Empty effect row（纯计算）
+  emptyEffectRow = mkTypeDefault rRowEmpty KRow;
 
-  # subtractEffect：从 effect type 移除指定 effect tags（INV-EFF-4/5/6）
-  subtractEffect = effTy: tagsToRemove:
+  # Effect row with one effect
+  singleEffect = name: ty:
+    mkTypeDefault (rVariantRow { ${name} = ty; } null) KRow;
+
+  # Effect row extension（E ++ E'）
+  effectMerge = e1: e2:
+    mkTypeDefault (rEffectMerge e1 e2) KEffect;
+
+  # ══ checkHandler（INV-EFF-5）══════════════════════════════════════════════
+
+  # Type: Type -> Type -> { ok: Bool; remainingEffects: Type; error?: String }
+  # 检查 handler 是否能处理 effectType
+  checkHandler = handler: effectType:
     let
-      flat   = _flattenEffectFull effTy;
-      remaining = lib.filterAttrs (tag: _: !(lib.elem tag tagsToRemove)) flat.variants;
-      rowExt = lib.foldl'
-        (acc: kv: mkTypeDefault (rRowExtend kv.name kv.value acc) kindLib.KRow)
-        (if flat.tail != null then flat.tail
-         else mkTypeDefault rRowEmpty kindLib.KRow)
-        (lib.sort (a: b: a.name < b.name)
-          (lib.mapAttrsToList (k: v: { name = k; value = v; }) remaining));
+      handlerTag = handler.repr.__variant or null;
     in
-    if remaining == {} && flat.tail == null then
-      mkTypeDefault (rEffect (mkTypeDefault rRowEmpty kindLib.KRow)) KStar
+    if handlerTag != "Handler" then
+      { ok = false; error = "Not a Handler type"; }
     else
-      mkTypeDefault (rEffect rowExt) KStar;
+      let
+        hEffTag = handler.repr.effectTag;
+        effRow  = if (effectType.repr.__variant or null) == "Effect"
+                  then effectType.repr.effectRow
+                  else effectType;
+        effVars = _collectEffectLabels effRow;
+      in
+      if builtins.elem hEffTag effVars then
+        { ok              = true;
+          remainingEffects = subtractEffect effRow hEffTag;
+          handledTag       = hEffTag; }
+      else
+        { ok    = false;
+          error = "Handler for '${hEffTag}' but effect row contains: ${builtins.toJSON effVars}"; };
 
-  # addEffect：向 effect type 添加 effect tags
-  addEffect = effTy: newVariants:
-    let
-      flat    = _flattenEffectFull effTy;
-      allVars = flat.variants // newVariants;
-      sorted  = lib.sort (a: b: a.name < b.name)
-                  (lib.mapAttrsToList (k: v: { name = k; value = v; }) allVars);
-      rowExt  = lib.foldl'
-        (acc: kv: mkTypeDefault (rRowExtend kv.name kv.value acc) kindLib.KRow)
-        (if flat.tail != null then flat.tail
-         else mkTypeDefault rRowEmpty kindLib.KRow)
-        sorted;
-    in
-    mkTypeDefault (rEffect rowExt) KStar;
+  # ══ handleAll（INV-EFF-5）════════════════════════════════════════════════
 
-  # getEffectTags：获取 effect type 中的所有 tag 名
-  getEffectTags = effTy:
-    let flat = _flattenEffectFull effTy; in
-    lib.sort (a: b: a < b) (builtins.attrNames flat.variants);
+  # Type: [Type(Handler)] -> Type -> { ok: Bool; residualEffects: Type }
+  # 用一组 handler 处理 effectType，返回残余 effects
+  handleAll = handlers: effectType:
+    lib.foldl'
+      (acc: handler:
+        if !acc.ok then acc
+        else
+          let r = checkHandler handler acc.remainingEffects; in
+          if r.ok then acc // { remainingEffects = r.remainingEffects; }
+          else acc  # 该 handler 不匹配，继续
+      )
+      { ok = true;
+        remainingEffects = effectType; }
+      handlers;
 
-  # hasEffect：检查 effect type 是否包含指定 tag
-  hasEffect = effTy: tag:
-    let flat = _flattenEffectFull effTy; in
-    flat.variants ? ${tag};
+  # ══ subtractEffect（INV-EFF-7）════════════════════════════════════════════
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Handler Type Checking
-  # ══════════════════════════════════════════════════════════════════════════════
+  # Type: Type(EffectRow) -> String -> Type(EffectRow)
+  # 从 effect row 中移除指定 effect label
+  subtractEffect = effectRow: label:
+    let v = effectRow.repr.__variant or null; in
+    if v == "VariantRow" then
+      let
+        variants = effectRow.repr.variants or {};
+        ext      = effectRow.repr.extension;
+        removed  = builtins.removeAttrs variants [ label ];
+      in
+      mkTypeDefault (rVariantRow removed ext) KRow
 
-  # checkHandler：验证 Handler 是否正确处理 effectTag
-  # Result: { ok; missing; extra; residualEffTy }
-  checkHandler = effTy: handler:
-    let
-      handlerR   = handler.repr or {};
-      effectTag  = handlerR.effectTag or null;
-      branches   = handlerR.branches or [];
+    else if v == "EffectMerge" then
+      let
+        l' = subtractEffect effectRow.repr.left label;
+        r' = subtractEffect effectRow.repr.right label;
+      in
+      mkTypeDefault (rEffectMerge l' r') KEffect
 
-      # 检查 effect type 是否包含该 effectTag
-      hasTag = hasEffect effTy effectTag;
+    else effectRow;  # RowEmpty, RowVar — 无法 subtract
 
-      # 计算残余 effect（INV-EFF-4）
-      residualEffTy = if hasTag
-        then subtractEffect effTy [effectTag]
-        else effTy;
+  # ══ 辅助：收集 Effect labels ══════════════════════════════════════════════
 
-      # 验证 handler branches 与已知操作的对应关系（简化：按 opName 验证）
-      branchNames = map (b: b.opName) branches;
-      uniqueNames = lib.unique branchNames;
-      # INV-EFF-7：操作名不重复
-      noDups = builtins.length branchNames == builtins.length uniqueNames;
+  _collectEffectLabels = effectRow:
+    let v = effectRow.repr.__variant or null; in
+    if v == "VariantRow" then
+      builtins.attrNames (effectRow.repr.variants or {})
+    else if v == "EffectMerge" then
+      _collectEffectLabels effectRow.repr.left ++
+      _collectEffectLabels effectRow.repr.right
+    else [];
 
-    in {
-      ok             = hasTag && noDups;
-      hasTag         = hasTag;
-      noDuplicate    = noDups;
-      effectTag      = effectTag;
-      residualEffTy  = residualEffTy;
-    };
+  # ══ Effect 包含检查 ═══════════════════════════════════════════════════════
 
-  # handleAll：连续处理多个 handlers
-  # handlers: [Handler]
-  handleAll = effTy: handlers:
-    lib.foldl' (acc: h:
-      let result = checkHandler acc h; in
-      if result.ok then result.residualEffTy else acc
-    ) effTy handlers;
+  containsEffect = effectRow: label:
+    builtins.elem label (_collectEffectLabels effectRow);
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Effect 类型 Eff(E, A) 构造
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Continuation Type（Phase 4.1，INV-EFF-8）════════════════════════════
 
-  # mkEffType: 构造 Eff(effects, valueType)
-  # effectTags: AttrSet String Type（tag → 操作类型）
-  mkEffType = effectTags: valueType:
-    let
-      tags   = lib.sort (a: b: a < b) (builtins.attrNames effectTags);
-      rowTy  = lib.foldl'
-        (acc: tag: mkTypeDefault (rRowExtend tag effectTags.${tag} acc) kindLib.KRow)
-        (mkTypeDefault rRowEmpty kindLib.KRow)
-        (lib.reverseList tags);
-      effRow = mkTypeDefault (rVariantRow effectTags
-                 (mkTypeDefault rRowEmpty kindLib.KRow)) kindLib.KRow;
-    in
-    mkTypeDefault (rEffect effRow) KStar;
-
-  # 常用 Effect 类型
-  tIO       = mkEffType { IO = mkTypeDefault (rPrimitive "IOOp") KStar; };
-  tState    = s: mkEffType { State = s; };
-  tExn      = e: mkEffType { Exn = e; };
-  tAsync    = mkEffType { Async = mkTypeDefault (rPrimitive "AsyncOp") KStar; };
-  tPure     = mkTypeDefault (rEffect (mkTypeDefault rRowEmpty kindLib.KRow)) KStar;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Effect Row 合并（与 normalize/rules_p33 集成）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  mergeEffects = eff1: eff2:
-    let
-      f1 = _flattenEffectFull eff1;
-      f2 = _flattenEffectFull eff2;
-      merged = f1.variants // f2.variants;  # right-biased
-      tail   = if f2.tail != null then f2.tail
-               else if f1.tail != null then f1.tail
-               else null;
-      sortedVars = lib.sort (a: b: a.name < b.name)
-                    (lib.mapAttrsToList (k: v: { name = k; value = v; }) merged);
-      rowTy  = lib.foldl'
-        (acc: kv: mkTypeDefault (rRowExtend kv.name kv.value acc) kindLib.KRow)
-        (if tail != null then tail else mkTypeDefault rRowEmpty kindLib.KRow)
-        sortedVars;
-    in
-    mkTypeDefault (rEffect rowTy) KStar;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 不变量验证
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  verifyEffectHandlerInvariants = _:
-    let
-      tInt   = mkTypeDefault (rPrimitive "Int")  KStar;
-      tBool  = mkTypeDefault (rPrimitive "Bool") KStar;
-      tUnit  = mkTypeDefault (rPrimitive "Unit") KStar;
-
-      # 构造 Eff[IO, State, Exn] type
-      allEffects  = mkEffType {
-        IO    = tUnit;
-        State = tInt;
-        Exn   = tBool;
-      };
-
-      # INV-EFF-5：subtractEffect 精确移除
-      afterIO   = subtractEffect allEffects ["IO"];
-      tagsAfter = getEffectTags afterIO;
-      invEFF5   = !(lib.elem "IO" tagsAfter) &&
-                   lib.elem "State" tagsAfter &&
-                   lib.elem "Exn" tagsAfter;
-
-      # INV-EFF-4：handle 后 effect 移除
-      ioHandler = mkHandler "IO" [
-        (rHandlerBranch "putLine" [tBool] "resume" tUnit)
-      ] tUnit;
-      checkResult = checkHandler allEffects ioHandler;
-      residTags   = getEffectTags checkResult.residualEffTy;
-      invEFF4     = checkResult.ok && !(lib.elem "IO" residTags);
-
-      # INV-EFF-7：重复操作名检测
-      dupHandler = mkHandler "IO" [
-        (rHandlerBranch "putLine" [tBool] "resume" tUnit)
-        (rHandlerBranch "putLine" [tBool] "resume2" tUnit)
-      ] tUnit;
-      dupCheck = checkHandler allEffects dupHandler;
-      invEFF7  = !dupCheck.ok;
-
-      # INV-EFF-6：open effect row（RowVar tail）support
-      openEff = mkTypeDefault (rEffect (mkTypeDefault {
-        __variant = "RowVar"; name = "ε";
-      } kindLib.KRow)) KStar;
-      openSubtracted = subtractEffect openEff ["IO"];  # no-op, but no crash
-      invEFF6 = openSubtracted.repr.__variant == "Effect";
-
-    in {
-      allPass     = invEFF4 && invEFF5 && invEFF6 && invEFF7;
-      "INV-EFF-4" = invEFF4;
-      "INV-EFF-5" = invEFF5;
-      "INV-EFF-6" = invEFF6;
-      "INV-EFF-7" = invEFF7;
+  # Continuation: (A → Eff(R, B))
+  mkContType = resultType: effType:
+    { __variant    = "Cont";
+      result       = resultType;
+      eff          = effType;
     };
 }

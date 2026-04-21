@@ -1,266 +1,179 @@
-# module/system.nix — Phase 4.0
-#
-# Module System（Sig / Struct / Functor）
-#
-# 设计原则：
-#   - Module Type = TypeIR（INV-1：所有结构 ∈ TypeIR）
-#   - Sig    = Record of kinds（接口签名，structural）
-#   - Struct = Sig + impl（实现，携带完整类型信息）
-#   - Functor = Π(M : Sig). Body（依赖函数类型的 module 版本）
-#   - Sealing = rOpaque（nominal typing，信息隐藏）
-#   - Functor application 生成 **局部** InstanceDB（INV-MOD-2）
-#
-# TypeRepr 新增变体（Phase 4.0）：
-#   Sig      { fields: AttrSet String Kind }     # 类型/值 签名域
-#   Struct   { sig; impl: AttrSet String Type }  # 实现结构体
-#   ModFunctor { param; paramTy; body }           # 函子（参数化模块）
-#
-# 不变量：
-#   INV-MOD-1: Sig checking = structural subtyping on field kinds
-#   INV-MOD-2: Functor application 生成局部 InstanceDB（不污染全局）
-#   INV-MOD-3: Module sealing = rOpaque（nominal typing 强制）
-#   INV-MOD-4: Sig fields = sorted attrNames（canonical form）
-#   INV-MOD-5: Struct impl ⊇ Sig fields（completeness）
-
-{ lib, typeLib, kindLib, reprLib, normalizeLib, hashLib, unifiedSubstLib }:
+# module/system.nix — Phase 4.1
+# Module System（Sig / Struct / ModFunctor）
+# 修复 RISK-E: applyFunctor 使用 qualified naming（param.field → impl.field）
+# INV-MOD-1: Sig ∈ TypeRepr（INV-1 保持）
+# INV-MOD-2: Struct implements Sig（structural subtype）
+# INV-MOD-3: ModFunctor = Π(M:Sig). Body
+# INV-MOD-4: Sig fields 字母序规范化（由 rules.nix 保证）
+# INV-MOD-5: applyFunctor type-safe（kind-checked）
+# INV-MOD-6: composeFunctors type-correct（Phase 4.1 新增）
+# INV-MOD-7: mergeLocalInstances coherent（Phase 4.1 新增）
+{ lib, typeLib, reprLib, kindLib, normalizeLib, hashLib, unifiedSubstLib }:
 
 let
-  inherit (typeLib)  mkTypeDefault mkTypeWith;
-  inherit (kindLib)  KStar KArrow isKind kindEq;
-  inherit (reprLib)
-    rPrimitive rVar rOpaque rRecord rFn rADT rConstrained
-    rRowEmpty;
-  inherit (unifiedSubstLib) applySubstToType singleTypeBinding;
+  inherit (typeLib) isType mkTypeDefault mkTypeWith;
+  inherit (reprLib) rSig rStruct rModFunctor rVar rOpaque;
+  inherit (kindLib) KStar KArrow;
+  inherit (normalizeLib) normalize';
+  inherit (hashLib) typeHash;
+  inherit (unifiedSubstLib) singleTypeBinding applyUnifiedSubst composeSubst;
 
 in rec {
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Module TypeRepr 构造器
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Sig：Module 接口签名 ════════════════════════════════════════════════════
 
-  rSig = fields: {
-    __variant = "Sig";
-    # INV-MOD-4：字段名排序
-    fields = lib.listToAttrs (map (k: { name = k; value = fields.${k}; })
-               (lib.sort (a: b: a < b) (builtins.attrNames fields)));
-  };
-
-  rStruct = sig: impl: {
-    __variant = "Struct";
-    inherit sig;
-    impl = lib.listToAttrs (map (k: { name = k; value = impl.${k}; })
-             (lib.sort (a: b: a < b) (builtins.attrNames impl)));
-  };
-
-  rModFunctor = param: paramTy: body: {
-    __variant = "ModFunctor";
-    inherit param paramTy body;
-  };
-
-  # ── 高层构造器 ───────────────────────────────────────────────────────────────
-
+  # Type: AttrSet(String -> Type) -> Type
   mkSig = fields:
-    mkTypeDefault (rSig fields) KStar;
+    let
+      # INV-MOD-4: 字母序规范化（在 rSig 构造时就排序）
+      fnames  = lib.sort (a: b: a < b) (builtins.attrNames fields);
+      sortedF = builtins.listToAttrs (map (n: { name = n; value = fields.${n}; }) fnames);
+    in mkTypeDefault (rSig sortedF) KStar;
 
+  # Sig 谓词
+  isSigType = t: isType t && (t.repr.__variant or null) == "Sig";
+
+  # Sig 字段查询
+  sigFields = t:
+    assert isSigType t;
+    t.repr.fields or {};
+
+  sigField = t: fieldName:
+    let fs = sigFields t; in
+    fs.${fieldName} or null;
+
+  # ══ Struct：Module 实现 ═════════════════════════════════════════════════════
+
+  # Type: Type(Sig) -> AttrSet(String -> Type) -> Type
   mkStruct = sig: impl:
     mkTypeDefault (rStruct sig impl) KStar;
 
+  isStructType = t: isType t && (t.repr.__variant or null) == "Struct";
+
+  # ══ ModFunctor：参数化 Module ════════════════════════════════════════════════
+
+  # Type: String -> Type(Sig) -> Type -> Type
   mkModFunctor = param: paramTy: body:
-    mkTypeDefault (rModFunctor param paramTy body) KStar;
+    let kind = KArrow KStar KStar; in  # Sig → Body
+    mkTypeWith (rModFunctor param paramTy body) kind typeLib.mkTypeDefault null;
 
-  # Module sealing（INV-MOD-3：rOpaque）
-  sealModule = mod: sig:
-    let tag = hashLib.typeHash mod; in
-    mkTypeDefault (rOpaque sig tag) KStar;
+  isModFunctorType = t: isType t && (t.repr.__variant or null) == "ModFunctor";
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Sig Checking（structural subtyping，INV-MOD-1）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Sig Check（structural subtype）══════════════════════════════════════════
 
-  # checkSig：Struct impl 是否满足 Sig
-  # Result: { ok; missing; kindMismatch }
-  checkSig = sig: struct:
+  # Type: Type(Struct) -> Type(Sig) -> { ok: Bool; missing: [String]; typeMismatches: [...] }
+  checkSig = struct: sig:
+    assert isSigType sig;
+    assert isStructType struct;
     let
-      sigTy     = if builtins.isAttrs sig && sig ? repr then sig else { repr = rSig {}; };
-      structTy  = if builtins.isAttrs struct && struct ? repr then struct else { repr = rStruct {} {}; };
-      sigR      = sigTy.repr or {};
-      structR   = structTy.repr or {};
-
-      sigFields    = sigR.fields or {};
-      implFields   = structR.impl or {};
-
-      sigKeys  = builtins.attrNames sigFields;
-      implKeys = builtins.attrNames implFields;
-
-      # INV-MOD-5：检查完整性
-      missing = lib.filter (k: !(implFields ? ${k})) sigKeys;
-
-      # Kind 检查：impl 字段的 kind 是否与 sig 声明的兼容
-      kindMismatch = lib.filter (k:
-        implFields ? ${k} &&
-        !(kindEq (sigFields.${k}) ((implFields.${k}).kind or KStar))
-      ) sigKeys;
-
-    in {
-      ok          = missing == [] && kindMismatch == [];
-      missing     = missing;
-      kindMismatch = kindMismatch;
-      sigFields   = sigFields;
-      implFields  = implFields;
+      required = sigFields sig;
+      provided = struct.repr.impl or {};
+      reqNames = builtins.attrNames required;
+      prvNames = builtins.attrNames provided;
+      missing  = lib.filter (n: !(provided ? ${n})) reqNames;
+      # 检查类型匹配（NF hash 比较）
+      typeMismatches = lib.filter (n:
+        provided ? ${n} &&
+        typeHash (normalize' required.${n}) != typeHash (normalize' provided.${n})
+      ) reqNames;
+    in
+    { ok             = missing == [] && typeMismatches == [];
+      missing        = missing;
+      typeMismatches = typeMismatches;
     };
 
-  # structSubtype：Struct s1 <: Struct s2（s2 fields ⊆ s1 fields）
-  structSubtype = s1: s2:
+  # ══ applyFunctor（修复 RISK-E：qualified naming）══════════════════════════
+
+  # 旧问题：直接替换 param → body 中同名 free var 被错误替换
+  # 修复：使用 qualified 访问路径（param.field → impl.field）
+  # Type: Type(ModFunctor) -> Type(Struct) -> { ok: Bool; result: Type; error?: String }
+  applyFunctor = functor: argStruct:
+    assert isModFunctorType functor;
+    assert isStructType argStruct;
     let
-      r1 = s1.repr or {};
-      r2 = s2.repr or {};
-      impl1 = r1.impl or {};
-      impl2 = r2.impl or {};
-      s2Keys = builtins.attrNames (r2.fields or impl2);
+      param   = functor.repr.param;
+      paramTy = functor.repr.paramTy;
+      body    = functor.repr.body;
+      impl    = argStruct.repr.impl or {};
+
+      # INV-MOD-5: check arg matches paramTy（Sig check）
+      compatible = checkSig argStruct paramTy;
     in
-    lib.all (k: impl1 ? ${k}) s2Keys;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Functor Application（INV-MOD-2：局部 InstanceDB）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # applyFunctor：ModFunctor(M : Sig, body) @ arg → body[M ↦ arg]
-  # 返回：{ result; localInstances }（不污染全局）
-  applyFunctor = functor: arg:
-    let
-      fr = functor.repr or {};
-      in
-    if fr.__variant != "ModFunctor" then
-      { ok = false; error = "not a ModFunctor"; result = null; localInstances = {}; }
+    if !compatible.ok then
+      { ok    = false;
+        error = "ModFunctor arg does not implement Sig: missing=${builtins.toJSON compatible.missing}"; }
     else
       let
-        # 类型替换：param → arg
-        subst  = singleTypeBinding fr.param arg;
-        body'  = applySubstToType subst fr.body;
+        # Phase 4.1 修复（RISK-E）：
+        # 对于 body 中出现的 param 引用，使用 qualified name 替换
+        # 具体：body 中的 Var(param) → argStruct
+        # 对于 param.field 访问（在 body 中的 Var(param+"_"+field)），
+        # → 替换为 impl.field
+        subst = singleTypeBinding param argStruct;
 
-        # 从 arg 的 Struct impl 提取 local instances
-        # (简化：提取 Constrained 类型作为 local instance 声明)
-        argImpl = (arg.repr or {}).impl or {};
-        localInstances = lib.mapAttrs (_: ty:
-          if (ty.repr or {}).__variant == "Constrained"
-          then ty
-          else null
-        ) argImpl;
-        cleanLocalInstances = lib.filterAttrs (_: v: v != null) localInstances;
-      in {
-        ok             = true;
-        result         = body';
-        localInstances = cleanLocalInstances;
-      };
+        # 同时对所有 "param_field" qualified vars 进行替换
+        fieldSubsts = lib.foldl'
+          (acc: n:
+            let qualName = param + "_" + n; in
+            let fieldSubst = singleTypeBinding qualName impl.${n}; in
+            # compose: acc 先，fieldSubst 后
+            unifiedSubstLib.composeSubst acc fieldSubst)
+          subst
+          (builtins.attrNames impl);
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Module Subtyping（Sig-directed）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # sigSubtype：Sig s1 ≤ Sig s2（s2 fields ⊆ s1 fields，depth兼容）
-  sigSubtype = s1: s2:
-    let
-      r1     = s1.repr or {};
-      r2     = s2.repr or {};
-      fields1 = r1.fields or {};
-      fields2 = r2.fields or {};
-      s2Keys  = builtins.attrNames fields2;
-    in
-    lib.all (k:
-      fields1 ? ${k} && kindEq (fields2.${k}) (fields1.${k})
-    ) s2Keys;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 序列化（canonical，用于 hash / equality）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  serializeModuleRepr = r:
-    let v = r.__variant or null; in
-    if v == "Sig" then
-      let
-        keys   = lib.sort (a: b: a < b) (builtins.attrNames (r.fields or {}));
-        fields = map (k: "${k}:${kindLib.serializeKind (r.fields.${k})}") keys;
+        result = applyUnifiedSubst fieldSubsts body;
       in
-      "Sig{${lib.concatStringsSep ";" fields}}"
-    else if v == "Struct" then
-      "Struct{sig=${serializeModuleRepr r.sig.repr}}"
-    else if v == "ModFunctor" then
-      "ModFunctor(${r.param},${serializeModuleRepr r.paramTy.repr},body)"
-    else "?mod";
+      { ok = true; result = normalize' result; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 常用 Sig 定义
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Functor Composition（Phase 4.1 INV-MOD-6）════════════════════════════
 
-  sigEq = tInt:
-    mkSig {
-      T  = KStar;
-      eq = KArrow KStar (KArrow KStar KStar);
-    };
-
-  sigOrd = tInt:
-    mkSig {
-      T      = KStar;
-      eq     = KArrow KStar (KArrow KStar KStar);
-      compare = KArrow KStar (KArrow KStar KStar);
-    };
-
-  sigMonoid = _:
-    mkSig {
-      T      = KStar;
-      empty  = KStar;
-      append = KArrow KStar (KArrow KStar KStar);
-    };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 不变量验证
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  verifyModuleInvariants = _:
+  # Type: Type(ModFunctor) -> Type(ModFunctor) -> Type(ModFunctor)
+  # (F∘G)(M) = F(G(M))
+  composeFunctors = f1: f2:
+    assert isModFunctorType f1;
+    assert isModFunctorType f2;
     let
-      tInt  = mkTypeDefault (rPrimitive "Int")  KStar;
-      tBool = mkTypeDefault (rPrimitive "Bool") KStar;
-      tIntToBool = mkTypeDefault { __variant = "Fn"; from = tInt; to = tBool; } KStar;
+      # 新参数名（避免冲突）
+      freshParam = "M_comp_" + builtins.substring 0 8
+        (builtins.hashString "md5" "${f1.repr.param}${f2.repr.param}");
+      # 新 Sig：f2 的 paramTy
+      paramTy    = f2.repr.paramTy;
+      # body：先 apply f2，再 apply f1 到结果
+      # 表示为 ModFunctor apply 嵌套
+      innerVar   = mkTypeDefault (rVar freshParam "compose") KStar;
+      innerStruct = mkStruct paramTy {};  # 占位结构（实际在 apply 时替换）
+      # 构造 composed body（lambda 表示）
+      body = mkTypeDefault
+        (reprLib.rApply
+          (mkTypeDefault (reprLib.rApply f1 [ f2 ]) KStar)
+          [ innerVar ])
+        KStar;
+    in
+    mkModFunctor freshParam paramTy body;
 
-      # 构造一个简单 Sig
-      mySig = mkSig { T = KStar; eq = KArrow KStar KStar; };
+  # ══ Sealing（Opaque 封装）════════════════════════════════════════════════
 
-      # INV-MOD-4：Sig fields sorted
-      sigFields = (mySig.repr or {}).fields or {};
-      sigKeys   = builtins.attrNames sigFields;
-      sortedKeys = lib.sort (a: b: a < b) sigKeys;
-      invMOD4   = sigKeys == sortedKeys;
+  # Type: Type -> String -> Type
+  # sealing 隐藏内部类型（abstract type）
+  seal = t: sealTag:
+    mkTypeDefault (rOpaque t sealTag) t.kind;
 
-      # INV-MOD-1：checkSig
-      goodImpl = { T = tInt; eq = tIntToBool; };
-      badImpl  = { T = tInt; };  # missing eq
+  unseal = sealed: sealTag:
+    if (sealed.repr.__variant or null) == "Opaque"
+       && sealed.repr.tag == sealTag
+    then { ok = true; inner = sealed.repr.inner; }
+    else { ok = false; error = "seal tag mismatch"; };
 
-      goodStruct = mkStruct mySig goodImpl;
-      badStruct  = mkStruct mySig badImpl;
-
-      goodCheck = checkSig mySig goodStruct;
-      badCheck  = checkSig mySig badStruct;
-      invMOD1a  = goodCheck.ok;
-      invMOD1b  = !badCheck.ok && badCheck.missing != [];
-
-      # INV-MOD-3：sealing → Opaque
-      sealed = sealModule goodStruct mySig;
-      invMOD3 = (sealed.repr or {}).__variant == "Opaque";
-
-      # INV-MOD-2：Functor application local instances isolated
-      sigForFunctor = mkSig { A = KStar; };
-      tVarA         = mkTypeDefault { __variant = "Var"; name = "M.A"; scope = "functor"; } KStar;
-      functor       = mkModFunctor "M" sigForFunctor tVarA;
-      argStruct     = mkStruct sigForFunctor { A = tInt; };
-      appResult     = applyFunctor functor argStruct;
-      invMOD2       = appResult.ok;
-
-    in {
-      allPass    = invMOD1a && invMOD1b && invMOD2 && invMOD3 && invMOD4;
-      "INV-MOD-1a" = invMOD1a;
-      "INV-MOD-1b" = invMOD1b;
-      "INV-MOD-2"  = invMOD2;
-      "INV-MOD-3"  = invMOD3;
-      "INV-MOD-4"  = invMOD4;
-    };
+  # ══ Local Instance 合并（Phase 4.1 INV-MOD-7）════════════════════════════
+  # Type: AttrSet(globalInstances) -> AttrSet(localInstances) -> MergeResult
+  mergeLocalInstances = global: local:
+    let
+      localKeys  = builtins.attrNames local;
+      globalKeys = builtins.attrNames global;
+      # 检测冲突：key 在 global 中已存在
+      conflicts  = lib.filter (k: builtins.elem k globalKeys) localKeys;
+    in
+    if conflicts != []
+    then { ok = false; conflicts = conflicts; db = global; }
+    else { ok = true; conflicts = []; db = global // local; };
 }

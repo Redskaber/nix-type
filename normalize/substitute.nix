@@ -1,293 +1,263 @@
-# normalize/substitute.nix — Phase 3.1
-# 捕获安全替换（α-rename + de Bruijn + row spine）
-#
-# Phase 3.1 关键修复：
-#   1. substituteAll：显式 lexicographic 排序（消除 attrNames 不稳定顺序）
-#   2. composeSubst：weakly closed composition（σ₂ ∘ σ₁ 正确顺序）
-#   3. freeVarsRepr：全 21 变体覆盖（通过 reprLib）
-#   4. Lambda/Pi/Sigma：capture check + fresh name generation
-#   5. substituteType：完整递归替换（INV-C3，不仅顶层 Var）
-#
-# 不变量：
-#   SUBST-1: substitute(x, t, e)[x ∉ freeVars] = e（不相关替换无影响）
-#   SUBST-2: capture-safe：substitution 不捕获自由变量
-#   SUBST-3: substituteAll 顺序稳定（lexicographic）
-{ lib, typeLib, reprLib }:
+# normalize/substitute.nix — Phase 4.1
+# Capture-safe substitution（β-reduction 正确性前提）
+# INV-2: 所有计算 = Rewrite(TypeIR)
+# 扩展：支持 Phase 4.0 所有 TypeRepr 变体（Mu/Pi/Sigma/Effect/Refined/Sig/Struct）
+{ lib, typeLib, reprLib, kindLib }:
 
 let
-  inherit (typeLib) isType mkTypeWith withRepr;
-  inherit (reprLib) freeVarsRepr;
+  inherit (typeLib) isType mkTypeWith mkTypeDefault stableId;
+  inherit (reprLib)
+    rVar rLambda rLambdaK rApply rConstructor rFn rADT rConstrained
+    rMu rRecord rRowExtend rRowVar rVariantRow rPi rSigma
+    rEffect rEffectMerge rOpaque rAscribe rRefined rSig rStruct rModFunctor rHandler
+    isVar isLambda isApply isFn isConstrained;
 
-  # ── 辅助：新鲜名生成 ─────────────────────────────────────────────────────────
-  # 简单计数后缀（Phase 3.1 实用策略，非 Barendregt 完整）
-  _freshName = name: fvs:
-    let
-      go = n:
-        let candidate = "${name}_${builtins.toString n}"; in
-        if !builtins.elem candidate fvs then candidate
-        else go (n + 1);
-    in
-    if !builtins.elem name fvs then name else go 0;
+  # ── 自由变量收集（Free Variable Collection）───────────────────────────────
+  # Type: Type -> AttrSet(varName -> true)
+  freeVars = t:
+    if !isType t then {}
+    else
+      let v = t.repr.__variant or null; in
+      if v == "Var"        then { ${t.repr.name} = true; }
+      else if v == "Lambda" then
+        # λ param 绑定，param 不是自由变量
+        builtins.removeAttrs (freeVars t.repr.body) [ t.repr.param ]
+      else if v == "Apply" then
+        lib.foldl'
+          (acc: arg: acc // freeVars arg)
+          (freeVars t.repr.fn)
+          (t.repr.args or [])
+      else if v == "Fn" then
+        freeVars t.repr.from // freeVars t.repr.to
+      else if v == "Constrained" then freeVars t.repr.base
+      else if v == "Mu" then
+        # μ var 绑定
+        builtins.removeAttrs (freeVars t.repr.body) [ t.repr.var ]
+      else if v == "Pi" then
+        freeVars t.repr.domain //
+        builtins.removeAttrs (freeVars t.repr.body) [ t.repr.param ]
+      else if v == "Sigma" then
+        freeVars t.repr.domain //
+        builtins.removeAttrs (freeVars t.repr.body) [ t.repr.param ]
+      else if v == "ModFunctor" then
+        builtins.removeAttrs (freeVars t.repr.body) [ t.repr.param ]
+      else if v == "Record" then
+        let fnames = builtins.attrNames (t.repr.fields or {}); in
+        lib.foldl' (acc: n: acc // freeVars t.repr.fields.${n}) {} fnames
+      else if v == "RowExtend" then
+        freeVars t.repr.fieldType // freeVars t.repr.rest
+      else if v == "RowVar" then { ${t.repr.name} = true; }
+      else if v == "Effect" then freeVars t.repr.effectRow
+      else if v == "EffectMerge" then
+        freeVars t.repr.left // freeVars t.repr.right
+      else if v == "Refined" then
+        freeVars t.repr.base  # predVar 在 predExpr scope 中，不是 type-level free
+      else {};
 
-in rec {
+  # ── α-rename（避免变量捕获）──────────────────────────────────────────────
+  # Type: String -> String -> Type -> Type
+  rename = oldName: newName: t:
+    if !isType t then t
+    else
+      let v = t.repr.__variant or null; in
+      if v == "Var" then
+        if t.repr.name == oldName
+        then mkTypeDefault (rVar newName (t.repr.scope or "")) t.kind
+        else t
+      else if v == "Lambda" then
+        if t.repr.param == oldName
+        then t  # 绑定变量遮蔽，停止
+        else
+          let body' = rename oldName newName t.repr.body; in
+          mkTypeWith (rLambdaK t.repr.param (t.repr.paramKind or kindLib.KStar) body')
+                     t.kind t.meta
+      else if v == "Apply" then
+        let
+          fn'   = rename oldName newName t.repr.fn;
+          args' = map (rename oldName newName) (t.repr.args or []);
+        in mkTypeWith (rApply fn' args') t.kind t.meta
+      else if v == "Fn" then
+        let
+          from' = rename oldName newName t.repr.from;
+          to'   = rename oldName newName t.repr.to;
+        in mkTypeWith (rFn from' to') t.kind t.meta
+      else if v == "Mu" then
+        if t.repr.var == oldName then t  # μ var 绑定遮蔽
+        else
+          let body' = rename oldName newName t.repr.body; in
+          mkTypeWith (rMu t.repr.var body') t.kind t.meta
+      else if v == "Pi" then
+        let
+          domain' = rename oldName newName t.repr.domain;
+          body'   = if t.repr.param == oldName then t.repr.body
+                    else rename oldName newName t.repr.body;
+        in mkTypeWith (rPi t.repr.param domain' body') t.kind t.meta
+      else if v == "Sigma" then
+        let
+          domain' = rename oldName newName t.repr.domain;
+          body'   = if t.repr.param == oldName then t.repr.body
+                    else rename oldName newName t.repr.body;
+        in mkTypeWith (rSigma t.repr.param domain' body') t.kind t.meta
+      else t;
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 核心替换（capture-safe，INV-SUBST-2）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # substitute varName replacementType typeExpr → typeExpr[varName ↦ replacementType]
+  # ── 主置换函数（capture-safe）────────────────────────────────────────────
   # Type: String -> Type -> Type -> Type
+  # substitute varName replacement targetType
   substitute = varName: replacement: t:
-    assert isType t;
-    let
-      fvReplacement = freeVarsRepr replacement.repr;
-    in
-    _subst varName replacement fvReplacement t;
+    if !isType t then t
+    else
+      let v = t.repr.__variant or null; in
 
-  _subst = varName: replacement: fvRepl: t:
-    let
-      repr = t.repr;
-      v    = repr.__variant or null;
-      goT  = _subst varName replacement fvRepl;  # recurse
-    in
+      if v == "Var" then
+        if t.repr.name == varName then replacement else t
 
-    if v == "Var" then
-      if repr.name or "_" == varName then replacement else t
+      else if v == "Lambda" then
+        if t.repr.param == varName
+        then t  # 绑定变量遮蔽，停止替换
+        else
+          let fvRepl = freeVars replacement; in
+          if fvRepl ? ${t.repr.param}
+          then
+            # 捕获危险！先 α-rename
+            let
+              freshName = t.repr.param + "_fr_" +
+                          builtins.substring 0 8
+                            (builtins.hashString "md5" "${varName}${t.repr.param}");
+              body'  = rename t.repr.param freshName t.repr.body;
+              body'' = substitute varName replacement body';
+            in mkTypeWith (rLambdaK freshName (t.repr.paramKind or kindLib.KStar) body'')
+                          t.kind t.meta
+          else
+            let body' = substitute varName replacement t.repr.body; in
+            mkTypeWith (rLambdaK t.repr.param (t.repr.paramKind or kindLib.KStar) body')
+                       t.kind t.meta
 
-    else if v == "Primitive" then t
-
-    else if v == "Lambda" then
-      let param = repr.param or "_"; in
-      if param == varName then t  # 绑定 shadow：不替换 body
-      else if builtins.elem param fvRepl then
-        # capture 风险：alpha-rename param
+      else if v == "Apply" then
         let
-          allFv = fvRepl ++ freeVarsRepr repr;
-          fresh = _freshName param allFv;
-          freshT = _subst param
-            (mkTypeWith { __variant = "Var"; name = fresh; scope = 0; } t.kind t.meta)
-            [fresh]  # fvRepl for inner rename (safe: no capture)
-            (repr.body or t);
-          renamedRepr = repr // { param = fresh; body = freshT; };
-          newBody = goT (repr.body or t);
-        in
-        # rename first, then substitute
-        withRepr t (renamedRepr // { body = goT freshT; })
-      else
-        withRepr t (repr // { body = goT (repr.body or t); })
+          fn'   = substitute varName replacement t.repr.fn;
+          args' = map (substitute varName replacement) (t.repr.args or []);
+        in mkTypeWith (rApply fn' args') t.kind t.meta
 
-    else if v == "Pi" then
-      let param = repr.param or "_"; in
-      let newDomain = goT (repr.domain or t); in
-      if param == varName then withRepr t (repr // { domain = newDomain; })
-      else if builtins.elem param fvRepl then
+      else if v == "Fn" then
         let
-          allFv = fvRepl ++ freeVarsRepr repr;
-          fresh = _freshName param allFv;
-          renamedBody = _subst param
-            (mkTypeWith { __variant = "Var"; name = fresh; scope = 0; } t.kind t.meta)
-            []
-            (repr.body or t);
-          newBody = goT renamedBody;
-        in
-        withRepr t (repr // { param = fresh; domain = newDomain; body = newBody; })
-      else
-        withRepr t (repr // { domain = newDomain; body = goT (repr.body or t); })
+          from' = substitute varName replacement t.repr.from;
+          to'   = substitute varName replacement t.repr.to;
+        in mkTypeWith (rFn from' to') t.kind t.meta
 
-    else if v == "Sigma" then
-      let param = repr.param or "_"; in
-      let newDomain = goT (repr.domain or t); in
-      if param == varName then withRepr t (repr // { domain = newDomain; })
-      else if builtins.elem param fvRepl then
+      else if v == "Constrained" then
+        let base' = substitute varName replacement t.repr.base; in
+        mkTypeWith (rConstrained base' t.repr.constraints) t.kind t.meta
+
+      else if v == "Mu" then
+        if t.repr.var == varName
+        then t  # μ var 绑定遮蔽
+        else
+          let body' = substitute varName replacement t.repr.body; in
+          mkTypeWith (rMu t.repr.var body') t.kind t.meta
+
+      else if v == "Record" then
         let
-          allFv = fvRepl ++ freeVarsRepr repr;
-          fresh = _freshName param allFv;
-          renamedBody = _subst param
-            (mkTypeWith { __variant = "Var"; name = fresh; scope = 0; } t.kind t.meta)
-            []
-            (repr.body or t);
-          newBody = goT renamedBody;
-        in
-        withRepr t (repr // { param = fresh; domain = newDomain; body = newBody; })
-      else
-        withRepr t (repr // { domain = newDomain; body = goT (repr.body or t); })
+          fnames  = builtins.attrNames (t.repr.fields or {});
+          fields' = builtins.listToAttrs (map (n: {
+            name  = n;
+            value = substitute varName replacement t.repr.fields.${n};
+          }) fnames);
+        in mkTypeWith (rRecord fields') t.kind t.meta
 
-    else if v == "Mu" then
-      let var = repr.var or "_"; in
-      if var == varName then t  # 绑定 shadow
-      else withRepr t (repr // { body = goT (repr.body or t); })
+      else if v == "RowExtend" then
+        let
+          ft'   = substitute varName replacement t.repr.fieldType;
+          rest' = substitute varName replacement t.repr.rest;
+        in mkTypeWith (rRowExtend t.repr.label ft' rest') t.kind t.meta
 
-    else if v == "Apply" then
-      withRepr t (repr // {
-        fn   = goT (repr.fn or t);
-        args = map goT (repr.args or []);
-      })
+      else if v == "RowVar" then
+        # RowVar substitution（行变量替换）
+        if t.repr.name == varName then replacement else t
 
-    else if v == "Fn" then
-      withRepr t (repr // {
-        from = goT (repr.from or t);
-        to   = goT (repr.to or t);
-      })
+      else if v == "VariantRow" then
+        let
+          vnames    = builtins.attrNames (t.repr.variants or {});
+          variants' = builtins.listToAttrs (map (n: {
+            name  = n;
+            value = substitute varName replacement t.repr.variants.${n};
+          }) vnames);
+          ext' = if t.repr.extension == null then null
+                 else substitute varName replacement t.repr.extension;
+        in mkTypeWith (rVariantRow variants' ext') t.kind t.meta
 
-    else if v == "Constructor" then
-      let
-        paramNames = map (p: p.name or "_") (repr.params or []);
-      in
-      if builtins.elem varName paramNames then
-        # varName is shadowed by Constructor param
-        t
-      else
-        withRepr t (repr // {
-          body = if repr ? body then goT repr.body else null;
-        })
+      else if v == "Pi" then
+        let
+          domain' = substitute varName replacement t.repr.domain;
+          body' = if t.repr.param == varName then t.repr.body
+                  else
+                    let fvRepl = freeVars replacement; in
+                    if fvRepl ? ${t.repr.param}
+                    then
+                      let
+                        fresh = t.repr.param + "_pi_" +
+                                builtins.substring 0 8
+                                  (builtins.hashString "md5" "${varName}${t.repr.param}");
+                        b' = rename t.repr.param fresh t.repr.body;
+                      in substitute varName replacement b'
+                    else substitute varName replacement t.repr.body;
+          param' = if t.repr.param == varName then t.repr.param  # shadowed
+                   else
+                     let fvRepl = freeVars replacement; in
+                     if fvRepl ? ${t.repr.param}
+                     then t.repr.param + "_pi_" +
+                          builtins.substring 0 8
+                            (builtins.hashString "md5" "${varName}${t.repr.param}")
+                     else t.repr.param;
+        in mkTypeWith (rPi param' domain' body') t.kind t.meta
 
-    else if v == "ADT" then
-      withRepr t (repr // {
-        variants = map (var:
-          var // { fields = map goT (var.fields or []); }
-        ) (repr.variants or []);
-      })
+      else if v == "Sigma" then
+        let
+          domain' = substitute varName replacement t.repr.domain;
+          body'   = if t.repr.param == varName then t.repr.body
+                    else substitute varName replacement t.repr.body;
+        in mkTypeWith (rSigma t.repr.param domain' body') t.kind t.meta
 
-    else if v == "Constrained" then
-      withRepr t (repr // {
-        base        = goT (repr.base or t);
-        constraints = _substConstraints varName replacement fvRepl (repr.constraints or []);
-      })
+      else if v == "Effect" then
+        let er' = substitute varName replacement t.repr.effectRow; in
+        mkTypeWith (rEffect er') t.kind t.meta
 
-    else if v == "Record" then
-      withRepr t (repr // {
-        fields = builtins.mapAttrs (_: goT) (repr.fields or {});
-      })
+      else if v == "EffectMerge" then
+        let
+          l' = substitute varName replacement t.repr.left;
+          r' = substitute varName replacement t.repr.right;
+        in mkTypeWith (rEffectMerge l' r') t.kind t.meta
 
-    else if v == "VariantRow" then
-      withRepr t (repr // {
-        variants = builtins.mapAttrs (_: goT) (repr.variants or {});
-        tail = if repr ? tail then goT repr.tail else null;
-      })
+      else if v == "Refined" then
+        let base' = substitute varName replacement t.repr.base; in
+        # predVar/predExpr 在 predicate scope，不参与 type substitution
+        mkTypeWith (rRefined base' t.repr.predVar t.repr.predExpr) t.kind t.meta
 
-    else if v == "RowExtend" then
-      withRepr t (repr // {
-        fieldType = goT (repr.fieldType or t);
-        rest      = goT (repr.rest or t);
-      })
+      else if v == "ModFunctor" then
+        if t.repr.param == varName
+        then t  # module param 绑定遮蔽
+        else
+          let body' = substitute varName replacement t.repr.body; in
+          mkTypeWith (rModFunctor t.repr.param t.repr.paramTy body') t.kind t.meta
 
-    else if v == "Effect" then
-      withRepr t (repr // {
-        effectRow = goT (repr.effectRow or t);
-      })
+      else t;  # Primitive, ADT, RowEmpty, Sig, Struct, Handler, Kind — 无 type vars
 
-    else if v == "Ascribe" then
-      withRepr t (repr // {
-        inner = goT (repr.inner or t);
-        ty    = goT (repr.ty or t);
-      })
+  # ── 批量置换 ─────────────────────────────────────────────────────────────
+  # Type: [String] -> [Type] -> Type -> Type
+  substituteAll = params: args: t:
+    lib.foldl'
+      (acc: pair: substitute pair.fst pair.snd acc)
+      t
+      (lib.zipListsWith (p: a: { fst = p; snd = a; }) params args);
 
-    else t;  # Primitive, RowEmpty, Opaque：无 Var，返回原样
+  # ── 从 AttrSet 批量置换（subst map: varName → Type）────────────────────
+  # Type: AttrSet(String -> Type) -> Type -> Type
+  applySubst = substMap: t:
+    let varNames = builtins.attrNames substMap; in
+    lib.foldl'
+      (acc: varName: substitute varName substMap.${varName} acc)
+      t
+      varNames;
 
-  # ── 约束内替换（INV-C3：完整递归）────────────────────────────────────────────
-  _substConstraints = varName: replacement: fvRepl: cs:
-    map (c:
-      let tag = c.__constraintTag or null; in
-      if tag == "Class"     then c // { args = map (_subst varName replacement fvRepl) (c.args or []); }
-      else if tag == "Equality" then c // {
-        a = _subst varName replacement fvRepl (c.a or c);
-        b = _subst varName replacement fvRepl (c.b or c);
-      }
-      else if tag == "Predicate" then c // {
-        arg = _subst varName replacement fvRepl (c.arg or c);
-      }
-      else c
-    ) cs;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # substituteAll（多变量替换，Phase 3.1：显式稳定排序）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Phase 3.1 修复：attrNames 排序不稳定 → 显式 lexicographic 排序
-  # Type: AttrSet String Type -> Type -> Type
-  substituteAll = subst: t:
-    let
-      # 稳定排序（INV-SUBST-3）
-      vars = lib.sort (a: b: a < b) (builtins.attrNames subst);
-    in
-    lib.foldl' (acc: varName: substitute varName subst.${varName} acc) t vars;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # composeSubst（σ₂ ∘ σ₁，正确语义）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # σ₂ ∘ σ₁：先应用 σ₁，再应用 σ₂
-  # 等价于：compose(σ₁, σ₂)(x) = σ₂(σ₁(x))
-  # Type: AttrSet -> AttrSet -> AttrSet
-  composeSubst = sigma1: sigma2:
-    let
-      # σ₁ 的值 apply σ₂
-      applied = builtins.mapAttrs (_: t: substituteAll sigma2 t) sigma1;
-      # σ₂ 中不被 σ₁ 覆盖的额外绑定
-      extra = lib.filterAttrs (k: _: !(sigma1 ? ${k})) sigma2;
-    in
-    applied // extra;
-
-  # 恒等替换
-  idSubst = {};
-
-  # 单点替换
-  singleSubst = name: t: { ${name} = t; };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # de Bruijn 序列化辅助（α-equivalence 检查）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # 将 Type 转换为 de Bruijn 形式（用于 α-equality 比较）
-  # Type: Type -> Type（in-place repr transformation）
-  deBruijnify = t: _deBruijn {} 0 t;
-
-  _deBruijn = env: depth: t:
-    let
-      repr = t.repr;
-      v    = repr.__variant or null;
-      go   = _deBruijn env depth;
-    in
-    if v == "Var" then
-      let
-        name = repr.name or "_";
-        idx  = env.${name} or null;
-      in
-      if idx != null
-      then withRepr t (repr // { name = "db${builtins.toString (depth - idx - 1)}"; scope = depth - idx - 1; })
-      else t  # 自由变量：保留
-
-    else if v == "Lambda" then
-      let
-        param  = repr.param or "_";
-        newEnv = env // { ${param} = depth; };
-        newBody = _deBruijn newEnv (depth + 1) (repr.body or t);
-      in
-      withRepr t (repr // { param = "db${builtins.toString depth}"; body = newBody; })
-
-    else if v == "Pi" || v == "Sigma" then
-      let
-        param   = repr.param or "_";
-        newEnv  = env // { ${param} = depth; };
-        newDom  = go (repr.domain or t);
-        newBody = _deBruijn newEnv (depth + 1) (repr.body or t);
-      in
-      withRepr t (repr // { param = "db${builtins.toString depth}"; domain = newDom; body = newBody; })
-
-    else if v == "Mu" then
-      let
-        var    = repr.var or "_";
-        newEnv = env // { ${var} = depth; };
-        newBody = _deBruijn newEnv (depth + 1) (repr.body or t);
-      in
-      withRepr t (repr // { var = "db${builtins.toString depth}"; body = newBody; })
-
-    else if v == "Apply" then
-      withRepr t (repr // { fn = go (repr.fn or t); args = map go (repr.args or []); })
-
-    else if v == "Fn" then
-      withRepr t (repr // { from = go (repr.from or t); to = go (repr.to or t); })
-
-    else t;
-
+in {
+  inherit freeVars rename substitute substituteAll applySubst;
 }

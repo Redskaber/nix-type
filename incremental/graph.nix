@@ -1,312 +1,246 @@
-# incremental/graph.nix — Phase 3.1
-# 增量依赖图（BFS worklist，Kahn 修正）
-#
-# Phase 3.1 关键修复：
-#   BUG-1: Kahn 算法 in-degree 方向错误 → 修正为正确 in-degree model
-#   BUG-2: topologicalSort newReady logic 错误 → 基于 predecessor 消除
-#   BUG-3: BFS queue dedup 未强制 → queueSet 防止重复 BFS expansion
-#   BUG-4: stale-clean distinction 缺失 → 添加 stale 状态
-#   BUG-5: error provenance 缺失 → errorMeta 记录 cause/originNode
-#
-# 图结构：
-#   Graph = { nodes: AttrSet NodeId NodeEntry; edges: AttrSet NodeId [NodeId]; revEdges: AttrSet NodeId [NodeId] }
-#   NodeEntry = { id; data; state; errorMeta? }
-#   State = "clean" | "dirty" | "computing" | "stale" | "error"
-#
-# 不变量：
-#   INV-G1: BFS worklist 不重复（queueSet 保证）
-#   INV-G2: edges ↔ revEdges 对称（addEdge 维护）
-#   INV-G3: batchUpdate = coalesced invalidation（单次 BFS）
-#   INV-G4: removeNode 清理 revEdges 优先于 edges（无 dangling）
-#   INV-G5: topologicalSort 正确（Kahn，in-degree = 前驱数）
+# incremental/graph.nix — Phase 4.1
+# 增量依赖图（Dependency Graph）
+# INV-G1: BFS propagation 正确（in-degree 方向修正）
+# INV-G2: FSM 状态清晰（clean-valid / clean-stale / dirty / computing / error）
+# INV-G3: batchUpdate 语义正确（coalesced invalidation）
+# INV-G4: removeNode 无 dangling edge
 { lib }:
 
 rec {
+  # ── Node FSM 状态 ─────────────────────────────────────────────────────────
+  # Phase 4.1 修复 INV-G2：区分 clean-valid 和 clean-stale
+  STATE_CLEAN_VALID  = "clean-valid";   # 已计算 + 仍有效
+  STATE_CLEAN_STALE  = "clean-stale";   # 已计算 + 可能过时（deps 变化）
+  STATE_DIRTY        = "dirty";          # 需要重算
+  STATE_COMPUTING    = "computing";      # 正在计算
+  STATE_ERROR        = "error";          # 计算出错
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # State Machine
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ── Graph 结构 ────────────────────────────────────────────────────────────
+  # { nodes   : AttrSet(nodeId -> Node)
+  # , edges   : AttrSet(nodeId -> [nodeId])      -- 正向依赖（from → to）
+  # , revEdges: AttrSet(nodeId -> [nodeId])      -- 反向依赖（to ← from）
+  # }
+  # Node = { state; data; errorMeta? }
+  # errorMeta = { cause; timestamp; originNode }
 
-  stateClean     = "clean";
-  stateDirty     = "dirty";
-  stateComputing = "computing";
-  stateStale     = "stale";   # Phase 3.1 新增：clean 但可能过时
-  stateError     = "error";
+  emptyGraph = { nodes = {}; edges = {}; revEdges = {}; };
 
-  # 合法状态转换
-  isValidTransition = from: to:
-    (from == stateClean     && (to == stateDirty || to == stateComputing || to == stateStale))
-    || (from == stateDirty  && (to == stateComputing || to == stateClean || to == stateError))
-    || (from == stateComputing && (to == stateClean || to == stateDirty || to == stateError))
-    || (from == stateStale  && (to == stateDirty || to == stateClean))
-    || (from == stateError  && to == stateDirty);  # error → retry
+  # ── Node 操作 ─────────────────────────────────────────────────────────────
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # NodeEntry 构造
-  # ══════════════════════════════════════════════════════════════════════════════
+  addNode = graph: nodeId: data:
+    let node = { state = STATE_DIRTY; data = data; errorMeta = null; }; in
+    graph // { nodes = graph.nodes // { ${nodeId} = node; }; };
 
-  mkNode = id: data: {
-    inherit id data;
-    state     = stateClean;
-    errorMeta = null;
-  };
-
-  # Phase 3.1 新增：errorMeta 携带 cause + originNode
-  mkErrorNode = id: data: cause:
-    { inherit id data;
-      state     = stateError;
-      errorMeta = { inherit cause; originNode = id; timestamp = 0; };
-    };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 空图
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  emptyGraph = {
-    nodes    = {};
-    edges    = {};   # NodeId → [NodeId]（successors，依赖方向）
-    revEdges = {};   # NodeId → [NodeId]（predecessors，反向）
-  };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 添加节点
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  addNode = g: node:
-    g // {
-      nodes    = g.nodes    // { ${node.id} = node; };
-      edges    = g.edges    // { ${node.id} = g.edges.${node.id}    or []; };
-      revEdges = g.revEdges // { ${node.id} = g.revEdges.${node.id} or []; };
-    };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 添加边（from → to 表示"to 依赖 from"）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # addEdge: from 改变会 dirty to（to 是 from 的 dependent）
-  addEdge = g: fromId: toId:
-    let
-      fromEdges = g.edges.${fromId} or [];
-      toRevEdges = g.revEdges.${toId} or [];
-    in
-    g // {
-      edges    = g.edges    // { ${fromId} = _addUniq toId fromEdges; };
-      revEdges = g.revEdges // { ${toId}   = _addUniq fromId toRevEdges; };
-    };
-
-  # 添加边（带环检测）
-  addEdgeSafe = g: fromId: toId:
-    let hasCycle = _pathExists g toId fromId; in
-    if hasCycle
-    then { ok = false; error = "Cycle: ${fromId} → ${toId}"; graph = g; }
-    else { ok = true;  error = null; graph = addEdge g fromId toId; };
-
-  _addUniq = item: lst:
-    if builtins.elem item lst then lst else lst ++ [item];
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 路径检测（DFS，用于环检测）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  _pathExists = g: from: to:
-    _pathDFS g from to {};
-
-  _pathDFS = g: current: target: visited:
-    if current == target then true
-    else if visited ? ${current} then false
+  updateNode = graph: nodeId: data:
+    let existing = graph.nodes.${nodeId} or null; in
+    if existing == null
+    then addNode graph nodeId data
     else
-      let
-        visited' = visited // { ${current} = true; };
-        nexts = g.edges.${current} or [];
-      in
-      lib.any (n: _pathDFS g n target visited') nexts;
+      let node' = existing // { data = data; state = STATE_DIRTY; }; in
+      graph // { nodes = graph.nodes // { ${nodeId} = node'; }; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 删除节点（INV-G4：revEdges 优先）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  removeNode = g: nodeId:
+  # INV-G4: removeNode 先清理 edges，再删 node（无 dangling edge）
+  removeNode = graph: nodeId:
     let
-      # 1. 清理所有指向 nodeId 的 edges（其他节点的 forward edges）
-      edges' = builtins.mapAttrs
-        (k: succs: builtins.filter (s: s != nodeId) succs)
-        (builtins.removeAttrs g.edges [nodeId]);
+      # 清理指向 nodeId 的反向边（其他 node 的 edges 中移除 nodeId）
+      affectedSources = graph.revEdges.${nodeId} or [];
+      newEdges = lib.foldl'
+        (acc: src:
+          let
+            oldTargets = acc.${src} or [];
+            newTargets = lib.filter (t: t != nodeId) oldTargets;
+          in acc // { ${src} = newTargets; })
+        graph.edges
+        affectedSources;
 
-      # 2. 清理所有从 nodeId 出发的 revEdges（其他节点的 reverse edges）
-      predecessors = g.revEdges.${nodeId} or [];
-      revEdges' = builtins.mapAttrs
-        (k: preds: builtins.filter (p: p != nodeId) preds)
-        (builtins.removeAttrs g.revEdges [nodeId]);
+      # 清理 nodeId 的 revEdges 条目
+      targets  = graph.edges.${nodeId} or [];
+      newRevEdges = lib.foldl'
+        (acc: tgt:
+          let
+            oldSources = acc.${tgt} or [];
+            newSources = lib.filter (s: s != nodeId) oldSources;
+          in acc // { ${tgt} = newSources; })
+        (builtins.removeAttrs graph.revEdges [ nodeId ])
+        targets;
 
-      # 3. 删除节点本身
-      nodes' = builtins.removeAttrs g.nodes [nodeId];
+      # 移除 node 本身
+      newNodes = builtins.removeAttrs graph.nodes [ nodeId ];
+      # 移除 nodeId 在 edges 中的条目
+      finalEdges = builtins.removeAttrs newEdges [ nodeId ];
     in
-    g // {
-      nodes    = nodes';
-      edges    = edges';
-      revEdges = revEdges';
+    graph // { nodes = newNodes; edges = finalEdges; revEdges = newRevEdges; };
+
+  # ── Edge 操作 ─────────────────────────────────────────────────────────────
+
+  addEdge = graph: fromId: toId:
+    let
+      oldEdges    = graph.edges.${fromId} or [];
+      newEdges    = if builtins.elem toId oldEdges then oldEdges
+                    else oldEdges ++ [ toId ];
+      oldRevEdges = graph.revEdges.${toId} or [];
+      newRevEdges = if builtins.elem fromId oldRevEdges then oldRevEdges
+                    else oldRevEdges ++ [ fromId ];
+    in
+    graph // {
+      edges    = graph.edges    // { ${fromId} = newEdges; };
+      revEdges = graph.revEdges // { ${toId}   = newRevEdges; };
     };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 失效传播（BFS worklist，INV-G1：queueSet 去重）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ── State transitions ──────────────────────────────────────────────────────
 
-  # Type: Graph -> NodeId -> Graph
-  propagateInvalidation = g: startId:
-    _bfsPropagate g [startId] { ${startId} = true; };
-
-  # BFS 传播（Phase 3.1 修复：queueSet 防止重复）
-  _bfsPropagate = g: worklist: visited:
-    if worklist == [] then g
+  markDirty = graph: nodeId:
+    let node = graph.nodes.${nodeId} or null; in
+    if node == null then graph
     else
-      let
-        nodeId = builtins.head worklist;
-        rest   = builtins.tail worklist;
+      graph // { nodes = graph.nodes // { ${nodeId} = node // { state = STATE_DIRTY; }; }; };
 
-        # 标记当前节点为 dirty
-        g' = if g.nodes ? ${nodeId}
-             then g // { nodes = g.nodes // { ${nodeId} = g.nodes.${nodeId} // { state = stateDirty; }; }; }
-             else g;
-
-        # 获取 dependents（successor nodes，即依赖 nodeId 的节点）
-        dependents = g.edges.${nodeId} or [];
-
-        # Phase 3.1 修复：queueSet = visited ∪ enqueued（去重）
-        newWork = builtins.filter (id: !(visited ? ${id})) dependents;
-        visited' = lib.foldl' (acc: id: acc // { ${id} = true; }) visited newWork;
-        worklist' = rest ++ newWork;
-      in
-      _bfsPropagate g' worklist' visited';
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 批量更新（INV-G3：coalesced invalidation）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Type: Graph -> AttrSet NodeId Any -> Graph
-  batchUpdate = g: updates:
-    let
-      nodeIds = builtins.attrNames updates;
-
-      # 1. 更新数据
-      g' = lib.foldl'
-        (acc: id:
-          if acc.nodes ? ${id}
-          then acc // { nodes = acc.nodes // { ${id} = acc.nodes.${id} // { data = updates.${id}; }; }; }
-          else acc)
-        g
-        nodeIds;
-
-      # 2. 收集所有受影响的根节点
-      roots = nodeIds;
-
-      # 3. 单次 BFS 传播（INV-G3：coalesced）
-      initVisited = builtins.listToAttrs (map (id: { name = id; value = true; }) roots);
-    in
-    _bfsPropagate g' roots initVisited;
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Topological Sort（Phase 3.1 修复：Kahn 算法，正确 in-degree）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # Phase 3.1 修复 BUG-1/BUG-2：
-  #   in-degree = 节点的"前驱数"（predecessors count）
-  #   Kahn：每次取 in-degree = 0 的节点（即无前驱），从中移除后更新 successors
-  #
-  # Type: Graph -> { ok: Bool; order: [NodeId]; cycle: [NodeId]? }
-  topologicalSort = g:
-    let
-      allNodes = builtins.attrNames g.nodes;
-
-      # INV-G5：in-degree = 前驱数（revEdges 长度）
-      initDegrees = builtins.listToAttrs
-        (map (id: {
-          name  = id;
-          value = builtins.length (g.revEdges.${id} or []);
-        }) allNodes);
-
-      # 初始 ready queue：in-degree = 0（稳定排序，deterministic）
-      initReady = lib.sort lib.lessThan
-        (builtins.filter (id: initDegrees.${id} == 0) allNodes);
-    in
-    _kahnStep g initDegrees initReady [] (builtins.length allNodes);
-
-  # Kahn 步骤
-  _kahnStep = g: degrees: ready: order: remaining:
-    if ready == [] then
-      if remaining == 0 then { ok = true; order = order; cycle = null; }
-      else { ok = false; order = order; cycle = _findCycle g order; }
+  markComputing = graph: nodeId:
+    let node = graph.nodes.${nodeId} or null; in
+    if node == null then graph
     else
-      let
-        nodeId = builtins.head ready;
-        rest   = builtins.tail ready;
+      graph // { nodes = graph.nodes // { ${nodeId} = node // { state = STATE_COMPUTING; }; }; };
 
-        # 减少所有 successor 的 in-degree（移除 nodeId 后）
-        succs = g.edges.${nodeId} or [];
-        degrees' = lib.foldl'
-          (acc: s: acc // { ${s} = (acc.${s} or 1) - 1; })
-          degrees
-          succs;
+  markClean = graph: nodeId: result:
+    let node = graph.nodes.${nodeId} or null; in
+    if node == null then graph
+    else
+      graph // {
+        nodes = graph.nodes // {
+          ${nodeId} = node // { state = STATE_CLEAN_VALID; data = result; errorMeta = null; };
+        };
+      };
 
-        # Phase 3.1 修复 BUG-2：新的 ready = successor 中 degree 变为 0 的（sort 保证稳定）
-        newReady = lib.sort lib.lessThan
-          (builtins.filter (s: degrees'.${s} or 1 == 0) succs);
-
-        order'   = order ++ [nodeId];
-        ready'   = rest ++ newReady;
-      in
-      _kahnStep g degrees' ready' order' (remaining - 1);
-
-  # 找环（从未完成的节点中 DFS 找环）
-  _findCycle = g: processed:
+  markError = graph: nodeId: cause:
     let
-      processedSet = builtins.listToAttrs (map (id: { name = id; value = true; }) processed);
-      unprocessed  = builtins.filter (id: !(processedSet ? ${id})) (builtins.attrNames g.nodes);
+      node = graph.nodes.${nodeId} or null;
+      errorMeta = { inherit cause; originNode = nodeId; timestamp = 0; };
     in
-    if unprocessed == [] then []
-    else [builtins.head unprocessed];  # 简化：返回一个环成员
+    if node == null then graph
+    else
+      graph // {
+        nodes = graph.nodes // {
+          ${nodeId} = node // { state = STATE_ERROR; errorMeta = errorMeta; };
+        };
+      };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 查询工具
-  # ══════════════════════════════════════════════════════════════════════════════
+  # Phase 4.1 INV-G2: clean-stale transition
+  markStale = graph: nodeId:
+    let node = graph.nodes.${nodeId} or null; in
+    if node == null then graph
+    else if node.state == STATE_CLEAN_VALID then
+      graph // {
+        nodes = graph.nodes // {
+          ${nodeId} = node // { state = STATE_CLEAN_STALE; };
+        };
+      }
+    else graph;  # 已经是 dirty/stale/computing/error，不需要 stale 标记
 
-  dirtyNodes = g:
-    builtins.filter (id: (g.nodes.${id}.state or "") == stateDirty)
-      (builtins.attrNames g.nodes);
-
-  cleanNodes = g:
-    builtins.filter (id: (g.nodes.${id}.state or "") == stateClean)
-      (builtins.attrNames g.nodes);
-
-  errorNodes = g:
-    builtins.filter (id: (g.nodes.${id}.state or "") == stateError)
-      (builtins.attrNames g.nodes);
-
-  # 验证 edges ↔ revEdges 对称性（INV-G2）
-  verifySymmetry = g:
+  # ── BFS invalidation 传播（INV-G1 修复：正确 in-degree 方向）────────────
+  # 当 nodeId 的数据变化时，依赖它的节点（revEdges）需要被标记为 dirty
+  # INV-G1: 使用 revEdges（反向依赖）而不是 edges
+  propagateDirty = graph: nodeId:
     let
-      violations = builtins.concatMap
-        (fromId:
-          builtins.concatMap
-            (toId:
-              if builtins.elem fromId (g.revEdges.${toId} or [])
-              then []
-              else ["edge ${fromId}→${toId} missing revEdge"]
-            )
-            (g.edges.${fromId} or [])
-        )
-        (builtins.attrNames g.nodes);
+      go = visited: worklist: g:
+        if worklist == [] then g
+        else
+          let
+            cur      = builtins.head worklist;
+            restWork = builtins.tail worklist;
+          in
+          if visited ? ${cur} then go visited restWork g
+          else
+            let
+              visited' = visited // { ${cur} = true; };
+              g'       = markDirty g cur;
+              # revEdges[cur] = 依赖 cur 的节点（它们需要重算）
+              rdeps    = g'.revEdges.${cur} or [];
+              # dedup queue（INV-G1 修复：避免重复 BFS expansion）
+              newWork  = lib.filter (id: !(visited' ? ${id})) rdeps;
+            in
+            go visited' (restWork ++ newWork) g';
     in
-    { ok = violations == []; inherit violations; };
+    go {} [ nodeId ] graph;
 
-  graphStats = g:
+  # ── batchUpdate（INV-G3：coalesced invalidation）─────────────────────────
+  # 批量更新多个 nodes，单次 BFS 传播
+  batchUpdate = graph: updates:
     let
-      nodeCount = builtins.length (builtins.attrNames g.nodes);
-      edgeCount = lib.foldl' (acc: id: acc + builtins.length (g.edges.${id} or []))
-                    0 (builtins.attrNames g.nodes);
-    in
-    { inherit nodeCount edgeCount;
-      dirtyCount = builtins.length (dirtyNodes g);
-      errorCount = builtins.length (errorNodes g);
-    };
+      # Step 1: 更新所有 nodes 的数据
+      g1 = lib.foldl'
+        (acc: upd: updateNode acc upd.nodeId upd.data)
+        graph updates;
 
+      # Step 2: 收集所有 root dirty nodes
+      roots = map (upd: upd.nodeId) updates;
+
+      # Step 3: 单次 BFS propagation（从所有 roots 出发）
+      # 注意：先 dedup roots
+      uniqueRoots = lib.foldl'
+        (acc: r: if builtins.elem r acc then acc else acc ++ [ r ])
+        [] roots;
+
+      go = visited: worklist: g:
+        if worklist == [] then g
+        else
+          let
+            cur      = builtins.head worklist;
+            restWork = builtins.tail worklist;
+          in
+          if visited ? ${cur} then go visited restWork g
+          else
+            let
+              visited' = visited // { ${cur} = true; };
+              g'       = markDirty g cur;
+              rdeps    = g'.revEdges.${cur} or [];
+              newWork  = lib.filter (id: !(visited' ? ${id})) rdeps;
+            in go visited' (restWork ++ newWork) g';
+    in
+    go {} uniqueRoots g1;
+
+  # ── 拓扑排序（Kahn 算法，INV-G1 正确语义）────────────────────────────────
+  # edges[A]=[B] 语义：A 依赖 B（B 先处理）
+  # in-degree(A) = len(edges[A])：A 等待多少依赖完成
+  topologicalSort = graph:
+    let
+      nodeIds = builtins.attrNames graph.nodes;
+
+      # in-degree = 该节点依赖的节点数量（edges 正向，A→B 表示 A 依赖 B）
+      # edges[A]=[B] → in-degree(A)=1，A 等待 B 先完成
+      # 起始：in-degree=0（无依赖）的节点先出队
+      inDegrees = builtins.listToAttrs (map (id: {
+        name  = id;
+        value = builtins.length (graph.edges.${id} or []);
+      }) nodeIds);
+
+      go = order: remaining: degrees:
+        if remaining == [] then { ok = true; order = order; }
+        else
+          let
+            # 找所有 in-degree = 0 的节点
+            zeros = lib.filter (id: degrees.${id} or 0 == 0) remaining;
+          in
+          if zeros == [] then
+            { ok = false; order = order; error = "Cycle detected in dependency graph"; }
+          else
+            let
+              # 选择第一个（稳定排序）
+              next       = builtins.head (lib.sort (a: b: a < b) zeros);
+              remaining' = lib.filter (id: id != next) remaining;
+              # 处理 next 后，所有依赖 next 的节点（revEdges[next]）等待少了一个
+              # 即: 对 revEdges[next] 中每个节点，其 in-degree 减 1
+              dependents = graph.revEdges.${next} or [];
+              degrees'   = lib.foldl'
+                (acc: dep: acc // { ${dep} = (acc.${dep} or 1) - 1; })
+                degrees dependents;
+            in go (order ++ [ next ]) remaining' degrees';
+    in go [] nodeIds inDegrees;
+
+  # ── dirtyNodes（需要重算的节点列表）─────────────────────────────────────
+  dirtyNodes = graph:
+    lib.filter
+      (id:
+        let s = (graph.nodes.${id} or {}).state or ""; in
+        s == STATE_DIRTY || s == STATE_CLEAN_STALE)
+      (builtins.attrNames graph.nodes);
 }

@@ -1,264 +1,167 @@
-# repr/all.nix — Phase 3.1
-# TypeRepr 全变体构造器（21 变体完整实现）
-#
-# Phase 3.1 新增/修复：
-#   1. Lambda: paramKind 字段（kindInferRepr 依赖，INV-K1）
-#   2. Pi/Sigma: domain 字段（dependent type）
-#   3. Constructor: params 携带 kind 信息（INV-K1 修复）
-#   4. freeVarsRepr: 全 21 变体覆盖
-#   5. ADT extendADT: ordinal 稳定追加
-#   6. RowExtend: 显式 label/fieldType/rest
-#   7. Effect: effectRow 结构化
-#
-# 不变量：
-#   INV-1: 所有结构 ∈ TypeIR（repr 必须有 __variant）
-#   INV-K1: Constructor/Lambda repr 携带 param.kind
-{ lib }:
+# repr/all.nix — Phase 4.1
+# TypeRepr 全变体构造器（25+ 变体）
+# INV-1: 所有变体都是合法 TypeRepr
+# INV-6: Constrained ∈ TypeRepr（不是外部函数）
+{ lib, kindLib }:
 
 let
-  mkRepr = variant: fields:
-    fields // { __variant = variant; };
+  mkRepr = variant: fields: { __variant = variant; } // fields;
 
 in rec {
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 基础变体
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ 基础变体 ══════════════════════════════════════════════════════════════
 
-  # Primitive { name: String }
-  rPrimitive = name:
-    mkRepr "Primitive" { inherit name; };
+  # ① Primitive — 原子类型（Int, Bool, String, Float, ...）
+  rPrimitive = name: mkRepr "Primitive" { inherit name; };
 
-  # Var { name: String; scope: Int }（scope = de Bruijn 辅助，0 = 自由）
-  rVar = name:
-    mkRepr "Var" { inherit name; scope = 0; };
+  # ② Var — 类型变量（带作用域，防止不同 scope 的同名变量混淆）
+  rVar = name: scope: mkRepr "Var" {
+    inherit name scope;
+    kind = kindLib.KStar;  # 默认 Kind * unless overridden
+  };
 
-  # Var with explicit scope（bidirectional 推断用）
-  rVarDB = name: scope:
-    mkRepr "Var" { inherit name scope; };
+  # Var with explicit kind annotation
+  rVarK = name: scope: kind: mkRepr "Var" { inherit name scope kind; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 函数/抽象变体
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ③ Lambda — 类型级 λ 抽象（表达力闭合必须有）
+  rLambda = param: body: mkRepr "Lambda" {
+    inherit param body;
+    paramKind = kindLib.KStar;  # 默认参数 Kind
+  };
 
-  # Lambda { param: String; paramKind: Kind; body: Type }
-  # Phase 3.1：paramKind 为 kindInferRepr 所必需（INV-K1）
-  rLambda = param: paramKind: body:
-    mkRepr "Lambda" { inherit param paramKind body; };
+  # Lambda with explicit parameter kind
+  rLambdaK = param: paramKind: body: mkRepr "Lambda" {
+    inherit param paramKind body;
+  };
 
-  # Lambda（KUnbound 参数 kind，兼容旧 API）
-  rLambdaSimple = param: body:
-    let kindLib = { KUnbound = { __kindVariant = "KUnbound"; }; }; in
-    mkRepr "Lambda" { inherit param body; paramKind = kindLib.KUnbound; };
+  # ④ Apply — 类型级应用（计算核心）
+  rApply = fn: args: mkRepr "Apply" { inherit fn args; };
 
-  # Apply { fn: Type; args: [Type] }（多参数 apply）
-  rApply = fn: args:
-    mkRepr "Apply" { inherit fn args; };
+  # ⑤ Constructor — 泛型 ADT 构造器
+  rConstructor = name: kind: params: body: mkRepr "Constructor" {
+    inherit name kind params body;
+  };
 
-  # Fn { from: Type; to: Type }（函数类型语法糖）
-  rFn = from: to:
-    mkRepr "Fn" { inherit from to; };
+  # ⑥ Fn — 函数类型（INV: 不强制展开，normalize 可配置）
+  rFn = from: to: mkRepr "Fn" { inherit from to; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Dependent Types（Phase 3）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ⑦ ADT — 代数数据类型
+  rADT = variants: closed: mkRepr "ADT" { inherit variants closed; };
 
-  # Pi { param: String; domain: Type; body: Type }（Π(x:A).B）
-  rPi = param: domain: body:
-    mkRepr "Pi" { inherit param domain body; };
+  # ⑧ Constrained — 约束内嵌（INV-6：Constraint ∈ TypeRepr）
+  rConstrained = base: constraints: mkRepr "Constrained" {
+    inherit base constraints;
+  };
 
-  # Sigma { param: String; domain: Type; body: Type }（Σ(x:A).B）
-  rSigma = param: domain: body:
-    mkRepr "Sigma" { inherit param domain body; };
+  # ══ 递归与行变体 ══════════════════════════════════════════════════════════
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # ADT / Constructor
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ⑨ Mu — 等递归类型（equi-recursive）
+  # μX. T  ≅  T[X ↦ μX.T]
+  rMu = var: body: mkRepr "Mu" { inherit var body; };
 
-  # Constructor { name: String; kind: Kind; params: [Param]; body: Type }
-  # Param = { name: String; kind: Kind }（INV-K1：携带 kind）
-  rConstructor = name: kind: params: body:
-    mkRepr "Constructor" { inherit name kind params body; };
+  # ⑩ Record — 记录类型（字段名 → 类型）
+  rRecord = fields: mkRepr "Record" { inherit fields; };
 
-  # Param 构造器（显式 kind）
-  mkParam = name: kind: { inherit name kind; };
-  # Param（KUnbound kind，兼容）
-  mkParamSimple = name: { inherit name; kind = { __kindVariant = "KUnbound"; }; };
+  # ⑪ RowExtend — 行扩展（{ label: fieldType | rest }）
+  rRowExtend = label: fieldType: rest: mkRepr "RowExtend" {
+    inherit label fieldType rest;
+  };
 
-  # ADT { variants: [Variant]; closed: Bool }
-  rADT = variants: closed:
-    mkRepr "ADT" { inherit variants closed; };
+  # ⑫ RowEmpty — 空行（行结束符）
+  rRowEmpty = mkRepr "RowEmpty" {};
 
-  # Variant = { name: String; fields: [Type]; ordinal: Int }
-  mkVariant = name: fields: ordinal:
-    { inherit name fields ordinal; };
+  # ⑬ RowVar — 行变量（用于行多态）
+  rRowVar = name: mkRepr "RowVar" { inherit name; };
 
-  # Open ADT 扩展（ordinal 稳定追加，INV-ADT1）
-  extendADT = repr: newVariants:
-    let
-      existing = repr.variants or [];
-      baseOrdinal = builtins.length existing;
-      added = lib.imap0
-        (i: v: mkVariant (v.name or "V${builtins.toString i}")
-                          (v.fields or [])
-                          (baseOrdinal + i))
-        newVariants;
-    in
-    repr // { variants = existing ++ added; };
+  # ⑭ VariantRow — 变体行（Effect handler 基础）
+  rVariantRow = variants: extension: mkRepr "VariantRow" {
+    inherit variants extension;
+  };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Constrained（INV-6 核心）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ 依赖类型变体 ══════════════════════════════════════════════════════════
 
-  # Constrained { base: Type; constraints: [Constraint] }
-  rConstrained = base: constraints:
-    mkRepr "Constrained" { inherit base constraints; };
+  # ⑮ Pi — 依赖函数类型（Π(x:A).B）
+  rPi = param: domain: body: mkRepr "Pi" { inherit param domain body; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Recursive Types
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ⑯ Sigma — 依赖积类型（Σ(x:A).B）
+  rSigma = param: domain: body: mkRepr "Sigma" { inherit param domain body; };
 
-  # Mu { var: String; body: Type }（equi-recursive, μ(α).T）
-  rMu = var: body:
-    mkRepr "Mu" { inherit var body; };
+  # ══ 效果类型变体 ══════════════════════════════════════════════════════════
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Record / Row
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ⑰ Effect — 效果类型（Eff(E, A)）
+  rEffect = effectRow: mkRepr "Effect" { inherit effectRow; };
 
-  # Record { fields: AttrSet String Type }（{f1:T1, f2:T2, ...}）
-  rRecord = fields:
-    mkRepr "Record" { inherit fields; };
+  # ⑱ EffectMerge — 效果合并（E1 ++ E2）
+  # Phase 4.0 INV-EFF-6: open effect row support
+  rEffectMerge = left: right: mkRepr "EffectMerge" { inherit left right; };
 
-  # VariantRow { variants: AttrSet String Type; tail: Type? }（open variant rows）
-  rVariantRow = variants: tail:
-    mkRepr "VariantRow" (
-      { inherit variants; }
-      // (if tail != null then { inherit tail; } else {})
-    );
+  # ══ 辅助/封装变体 ══════════════════════════════════════════════════════════
 
-  # RowExtend { label: String; fieldType: Type; rest: Type }（ρ-extend）
-  rRowExtend = label: fieldType: rest:
-    mkRepr "RowExtend" { inherit label fieldType rest; };
+  # ⑲ Opaque — 不透明类型（sealing，用于模块系统）
+  rOpaque = inner: tag: mkRepr "Opaque" { inherit inner tag; };
 
-  # RowEmpty（∅ — empty row）
-  rRowEmpty =
-    mkRepr "RowEmpty" {};
+  # ⑳ Ascribe — 类型标注（bidir 辅助）
+  rAscribe = expr: type: mkRepr "Ascribe" { inherit expr type; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Effect System（Phase 3）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ Phase 4.0 新增变体 ════════════════════════════════════════════════════
 
-  # Effect { effectRow: Type }（algebraic effect type，row-encoded）
-  rEffect = effectRow:
-    mkRepr "Effect" { inherit effectRow; };
+  # ㉑ Refined — 精化类型 { n : T | φ(n) }
+  # INV-SMT-1: predExpr ∈ PredExpr IR（不是 Nix 函数）
+  rRefined = base: predVar: predExpr: mkRepr "Refined" {
+    inherit base predVar predExpr;
+  };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Bidirectional Ascription（Phase 3）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ㉒ Sig — Module 接口签名（字段名 → Type）
+  # INV-MOD-4: fields 字母序规范化
+  rSig = fields: mkRepr "Sig" { inherit fields; };
 
-  # Ascribe { inner: Type; ty: Type }（type ascription — check/switch point）
-  rAscribe = inner: ty:
-    mkRepr "Ascribe" { inherit inner ty; };
+  # ㉓ Struct — Module 实现（Sig + impl）
+  rStruct = sig: impl: mkRepr "Struct" { inherit sig impl; };
 
-  # Opaque { name: String }（phantom/newtype — referential equality）
-  rOpaque = name:
-    mkRepr "Opaque" { inherit name; };
+  # ㉔ ModFunctor — Module Functor（Π(M : Sig). Body）
+  rModFunctor = param: paramTy: body: mkRepr "ModFunctor" {
+    inherit param paramTy body;
+  };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 自由变量（全 21 变体覆盖，Phase 3.1 完整化）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ㉕ Handler — Effect Handler
+  # INV-EFF-4: Handler ∈ TypeRepr
+  rHandler = effectTag: branches: returnType: mkRepr "Handler" {
+    inherit effectTag branches returnType;
+  };
 
-  # Type: TypeRepr -> [String]
-  freeVarsRepr = repr:
-    let
-      v    = repr.__variant or null;
-      goT  = t: freeVarsRepr (t.repr or { __variant = "?"; });
-      goTl = ts: builtins.concatMap goT ts;
-      # 从 binder 中删除绑定的变量
-      rmBinder = name: vars: builtins.filter (x: x != name) vars;
-    in
+  # ══ Variant 构造器（用于 ADT）═════════════════════════════════════════════
 
-    if v == "Primitive" then []
+  # Type: String -> [Type] -> Int -> Variant
+  mkVariant = name: fields: ordinal: {
+    __type  = "Variant";
+    inherit name fields ordinal;
+  };
 
-    else if v == "Var"    then [repr.name or "_"]
-
-    else if v == "Lambda" then
-      rmBinder (repr.param or "_") (goT (repr.body or {}))
-
-    else if v == "Pi" then
-      goT (repr.domain or {})
-      ++ rmBinder (repr.param or "_") (goT (repr.body or {}))
-
-    else if v == "Sigma" then
-      goT (repr.domain or {})
-      ++ rmBinder (repr.param or "_") (goT (repr.body or {}))
-
-    else if v == "Apply" then
-      goT (repr.fn or {}) ++ goTl (repr.args or [])
-
-    else if v == "Fn" then
-      goT (repr.from or {}) ++ goT (repr.to or {})
-
-    else if v == "Constructor" then
-      let
-        paramNames = map (p: p.name or "_") (repr.params or []);
-        bodyVars   = if repr ? body then goT repr.body else [];
-        filtered   = builtins.filter (x: !builtins.elem x paramNames) bodyVars;
-      in
-      filtered
-
-    else if v == "ADT" then
-      builtins.concatMap (var: goTl (var.fields or [])) (repr.variants or [])
-
-    else if v == "Constrained" then
-      goT (repr.base or {})
-      ++ builtins.concatMap
-           (c: if c ? a then goT c.a ++ goT c.b else [])
-           (repr.constraints or [])
-
-    else if v == "Mu" then
-      rmBinder (repr.var or "_") (goT (repr.body or {}))
-
-    else if v == "Record" then
-      builtins.concatMap (k: goT (repr.fields or {}).${k})
-        (builtins.attrNames (repr.fields or {}))
-
-    else if v == "VariantRow" then
-      builtins.concatMap (k: goT (repr.variants or {}).${k})
-        (builtins.attrNames (repr.variants or {}))
-      ++ (if repr ? tail then goT repr.tail else [])
-
-    else if v == "RowExtend" then
-      goT (repr.fieldType or {}) ++ goT (repr.rest or {})
-
-    else if v == "RowEmpty" then []
-
-    else if v == "Effect" then
-      goT (repr.effectRow or {})
-
-    else if v == "Opaque" then []
-
-    else if v == "Ascribe" then
-      goT (repr.inner or {}) ++ goT (repr.ty or {})
-
-    else [];
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # repr 判断工具
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  isRepr    = r: builtins.isAttrs r && r ? __variant;
-  reprIs    = variant: r: isRepr r && r.__variant == variant;
-  isPrimRepr = reprIs "Primitive";
-  isVarRepr  = reprIs "Var";
-  isLamRepr  = reprIs "Lambda";
-  isAppRepr  = reprIs "Apply";
-  isFnRepr   = reprIs "Fn";
-  isPiRepr   = reprIs "Pi";
-  isMuRepr   = reprIs "Mu";
-  isADTRepr  = reprIs "ADT";
-  isRecordRepr = reprIs "Record";
-  isRowExtRepr = reprIs "RowExtend";
-
+  # ══ TypeRepr 谓词 ══════════════════════════════════════════════════════════
+  isRepr        = r: builtins.isAttrs r && r ? __variant;
+  isPrimitive   = r: isRepr r && r.__variant == "Primitive";
+  isVar         = r: isRepr r && r.__variant == "Var";
+  isLambda      = r: isRepr r && r.__variant == "Lambda";
+  isApply       = r: isRepr r && r.__variant == "Apply";
+  isConstructor = r: isRepr r && r.__variant == "Constructor";
+  isFn          = r: isRepr r && r.__variant == "Fn";
+  isADT         = r: isRepr r && r.__variant == "ADT";
+  isConstrained = r: isRepr r && r.__variant == "Constrained";
+  isMu          = r: isRepr r && r.__variant == "Mu";
+  isRecord      = r: isRepr r && r.__variant == "Record";
+  isRowExtend   = r: isRepr r && r.__variant == "RowExtend";
+  isRowEmpty    = r: isRepr r && r.__variant == "RowEmpty";
+  isRowVar      = r: isRepr r && r.__variant == "RowVar";
+  isVariantRow  = r: isRepr r && r.__variant == "VariantRow";
+  isPi          = r: isRepr r && r.__variant == "Pi";
+  isSigma       = r: isRepr r && r.__variant == "Sigma";
+  isEffect      = r: isRepr r && r.__variant == "Effect";
+  isEffectMerge = r: isRepr r && r.__variant == "EffectMerge";
+  isOpaque      = r: isRepr r && r.__variant == "Opaque";
+  isAscribe     = r: isRepr r && r.__variant == "Ascribe";
+  isRefined     = r: isRepr r && r.__variant == "Refined";
+  isSig         = r: isRepr r && r.__variant == "Sig";
+  isStruct      = r: isRepr r && r.__variant == "Struct";
+  isModFunctor  = r: isRepr r && r.__variant == "ModFunctor";
+  isHandler     = r: isRepr r && r.__variant == "Handler";
 }

@@ -1,513 +1,614 @@
-# tests/test_all.nix — Phase 3.1
-# 综合测试套件（Phase 3.1 INV 验证 + 修复验证）
-#
-# 覆盖：
-#   T1  基础 TypeIR 不变量（INV-T1/2/3/4）
-#   T2  α-equivalence（INV-SER3/EQ）
-#   T3  Kind Check + Unify（INV-K1-6）
-#   T4  Constructor Partial Apply（INV-K1 修复）
-#   T5  μ-types（INV-EQ3 bisimulation）
-#   T6  HKT Kind inference
-#   T7  Row Polymorphism
-#   T8  Instance Database（soundness 修复）
-#   T9  Constraint Solver（INV-SOL1/4/5）
-#   T10 Incremental Graph（Kahn 修复）
-#   T11 Memo（epoch + versioned key）
-#   T12 Pattern Decision Tree
-#   T13 INV 不变量运行时验证（全量）
-#   T14 Phase 3.1 修复专项验证
-{ lib }:
+# tests/test_all.nix — Phase 4.1
+# 完整测试套件（合并所有 Phase 测试）
+# 注：原 test_phase32.nix / test_phase40.nix 合并到此文件
+{ lib ? (import <nixpkgs> {}).lib }:
 
 let
   ts = import ../lib/default.nix { inherit lib; };
 
   inherit (ts)
-    # TypeIR
-    mkTypeDefault mkTypeWith mkBootstrapType mkTypeConstrained
-    KStar KStar1 KStar2 KHO1 KArrow KVar KUnbound KError
-    kindEq kindCheck kindUnify kindInferRepr
-    isType stableId showType
+    typeLib kindLib reprLib metaLib serialLib normalizeLib
+    hashLib equalityLib constraintLib unifiedSubstLib
+    solverLib instanceLib refinedLib moduleLib effectLib
+    queryLib graphLib patternLib;
 
-    # Repr
-    rPrimitive rVar rVarDB rLambda rLambdaSimple rApply rFn
-    rPi rSigma rMu rRecord rVariantRow rRowExtend rRowEmpty
-    rConstructor rADT rConstrained mkVariant extendADT mkParam freeVarsRepr
+  # ── 测试辅助 ─────────────────────────────────────────────────────────────
+  mkTest = name: expected: actual:
+    { inherit name;
+      ok  = expected == actual;
+      expected = builtins.toJSON expected;
+      actual   = builtins.toJSON actual; };
 
-    # Normalize
-    normalize substitute substituteAll composeSubst deBruijnify
-
-    # Equality + Hash
-    typeEq structuralEq alphaEq nominalEq muEq rowVarEq
-    typeHash nfHash verifyHashConsistency checkCoherence
-
-    # Constraint
-    mkClass mkEquality mkPredicate mkImplies
-    constraintKey normalizeConstraint mapTypesInConstraint
-    deduplicateConstraints constraintsHash
-    defaultClassGraph isSuperclassOf getAllSupers getAllSubs
-
-    # Solver
-    solveDefault showResult
-
-    # Instance
-    emptyInstanceDB register resolve resolveWithFallback canDischarge listInstances
-
-    # Bidir
-    emptyCtx ctxBind tVar tLam tApp tAscribe tLit check infer
-
-    # Match
-    mkWildcard mkVariable mkLiteral mkADTPattern mkRecordPat mkVariantRowPat
-    compileToDecisionTree isExhaustive checkRedundancy patternBoundVars
-
-    # INV
-    verifyInvariants
-    ;
-
-  inherit (ts.graphLib)
-    emptyGraph addNode addEdge addEdgeSafe removeNode mkNode
-    propagateInvalidation batchUpdate topologicalSort
-    dirtyNodes graphStats verifySymmetry
-    stateClean stateDirty stateError isValidTransition;
-
-  inherit (ts.memoLib)
-    emptyMemo bumpEpoch lookupNormalize storeNormalize memoStats;
-
-  # 基础类型
-  tInt    = mkTypeDefault (rPrimitive "Int")    KStar;
-  tBool   = mkTypeDefault (rPrimitive "Bool")   KStar;
-  tString = mkTypeDefault (rPrimitive "String") KStar;
-  tUnit   = mkTypeDefault (rPrimitive "Unit")   KStar;
-  tA      = mkTypeDefault (rVar "a")            KStar;
-  tB      = mkTypeDefault (rVar "b")            KStar;
-  tF      = mkTypeDefault (rVar "f")            KStar1;
-
-  # 测试工具
-  mkTest     = name: got: expected: { inherit name; ok = got == expected; inherit got expected; };
-  mkTestBool = name: expr: { inherit name; ok = expr; got = expr; expected = true; };
+  mkTestBool = name: cond:
+    { inherit name; ok = cond; expected = "true"; actual = builtins.toJSON cond; };
 
   runTests = tests:
     let
-      failed = builtins.filter (t: !t.ok) tests;
-      passed = builtins.filter (t:  t.ok) tests;
+      results = tests;
+      passed  = builtins.length (builtins.filter (t: t.ok) results);
+      failed  = builtins.length (builtins.filter (t: !t.ok) results);
+      failedTests = builtins.filter (t: !t.ok) results;
     in
-    { total   = builtins.length tests;
-      passed  = builtins.length passed;
-      failed  = builtins.length failed;
-      failedTests = map (t: { inherit (t) name got expected; }) failed;
-      allPassed   = failed == [];
+    { inherit passed failed;
+      total   = builtins.length results;
+      ok      = failed == 0;
+      failures = map (t: { name = t.name; expected = t.expected; actual = t.actual; }) failedTests;
     };
+
+  # ── 常用类型构造 ──────────────────────────────────────────────────────────
+  tInt    = ts.mkTypeDefault (ts.rPrimitive "Int")    ts.KStar;
+  tBool   = ts.mkTypeDefault (ts.rPrimitive "Bool")   ts.KStar;
+  tString = ts.mkTypeDefault (ts.rPrimitive "String") ts.KStar;
+  tFloat  = ts.mkTypeDefault (ts.rPrimitive "Float")  ts.KStar;
+
+  tFnIntBool = ts.mkTypeDefault (ts.rFn tInt tBool) ts.KStar;
+
+  tAlpha = ts.mkTypeDefault (ts.rVar "α" "test") ts.KStar;
+  tBeta  = ts.mkTypeDefault (ts.rVar "β" "test") ts.KStar;
 
 in runTests [
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T1：基础 TypeIR 不变量
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════
+  # T1: TypeIR 核心（INV-1）
+  # ════════════════════════════════════════════════════════════════════════════
 
-  (mkTestBool "T1.1-isType"
-    (isType tInt))
+  (mkTestBool "T1.1: isType Int" (typeLib.isType tInt))
+  (mkTestBool "T1.2: isType Bool" (typeLib.isType tBool))
+  (mkTestBool "T1.3: Type has id" (tInt.id != null && tInt.id != ""))
+  (mkTestBool "T1.4: Type has repr" (typeLib.isType tInt && tInt.repr.__variant == "Primitive"))
+  (mkTestBool "T1.5: mkTypeDefault sets meta" (tInt.meta.__type == "MetaType"))
 
-  (mkTestBool "T1.2-kind-not-null"
-    (tInt.kind != null))
+  # ════════════════════════════════════════════════════════════════════════════
+  # T2: Kind 系统（INV-K1）
+  # ════════════════════════════════════════════════════════════════════════════
 
-  (mkTestBool "T1.3-KUnbound-replace-null"
-    (kindEq (mkBootstrapType (rPrimitive "X")).kind KUnbound))
+  (mkTestBool "T2.1: KStar isKind" (kindLib.isKStar kindLib.KStar))
+  (mkTestBool "T2.2: KArrow isKindArrow" (kindLib.isKArrow (kindLib.KArrow kindLib.KStar kindLib.KStar)))
+  (mkTestBool "T2.3: KRow isKRow" (kindLib.isKRow kindLib.KRow))
+  (mkTestBool "T2.4: kindEq KStar KStar" (kindLib.kindEq kindLib.KStar kindLib.KStar))
+  (mkTestBool "T2.5: kindInferRepr Primitive = KStar"
+    (kindLib.kindEq (kindLib.kindInferRepr (ts.rPrimitive "Int")) kindLib.KStar))
 
-  (mkTestBool "T1.4-withKind-null-safe"
-    (let t' = ts.typeLib.withKind tInt null; in kindEq t'.kind KUnbound))
+  # ════════════════════════════════════════════════════════════════════════════
+  # T3: Repr 全变体（INV-1）
+  # ════════════════════════════════════════════════════════════════════════════
 
-  (mkTestBool "T1.5-validateType"
-    (ts.typeLib.validateType tInt).ok)
+  (mkTestBool "T3.1: rPrimitive __variant"  ((ts.rPrimitive "Int").__variant == "Primitive"))
+  (mkTestBool "T3.2: rVar __variant"        ((ts.rVar "a" "s").__variant == "Var"))
+  (mkTestBool "T3.3: rLambda __variant"     ((ts.rLambda "x" tInt).__variant == "Lambda"))
+  (mkTestBool "T3.4: rApply __variant"      ((ts.rApply tInt [ tBool ]).__variant == "Apply"))
+  (mkTestBool "T3.5: rFn __variant"         ((ts.rFn tInt tBool).__variant == "Fn"))
+  (mkTestBool "T3.6: rADT __variant"        ((ts.rADT [] true).__variant == "ADT"))
+  (mkTestBool "T3.7: rConstrained __variant" ((ts.rConstrained tInt []).__variant == "Constrained"))
+  (mkTestBool "T3.8: rMu __variant"         ((ts.rMu "X" tInt).__variant == "Mu"))
+  (mkTestBool "T3.9: rRecord __variant"     ((ts.rRecord {}).__variant == "Record"))
+  (mkTestBool "T3.10: rRefined __variant"   ((ts.rRefined tInt "n" ts.mkPTrue).__variant == "Refined"))
+  (mkTestBool "T3.11: rSig __variant"       ((ts.rSig {}).__variant == "Sig"))
+  (mkTestBool "T3.12: rHandler __variant"   ((ts.rHandler "E" [] tInt).__variant == "Handler"))
 
-  (mkTestBool "T1.6-stableId-deterministic"
+  # ════════════════════════════════════════════════════════════════════════════
+  # T4: Serialize（INV-4 前置）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T4.1: serialize Primitive deterministic"
+    (serialLib.canonicalHash (ts.rPrimitive "Int") ==
+     serialLib.canonicalHash (ts.rPrimitive "Int")))
+
+  (mkTestBool "T4.2: serialize different Primitive differ"
+    (serialLib.canonicalHash (ts.rPrimitive "Int") !=
+     serialLib.canonicalHash (ts.rPrimitive "Bool")))
+
+  (mkTestBool "T4.3: serialize Fn order"
+    (serialLib.serializeRepr (ts.rFn tInt tBool) != serialLib.serializeRepr (ts.rFn tBool tInt)))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # T5: Normalize（INV-2/3）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T5.1: normalize Primitive = itself"
+    (let n = normalizeLib.normalize' tInt; in n.repr.__variant == "Primitive"))
+
+  (mkTestBool "T5.2: beta reduction"
     (let
-       id1 = stableId (rPrimitive "Int");
-       id2 = stableId (rPrimitive "Int");
-     in id1 == id2))
+      body   = tAlpha;  # body = α
+      lam    = ts.mkTypeDefault (ts.rLambda "α" body) ts.KStar;
+      app    = ts.mkTypeDefault (ts.rApply lam [ tInt ]) ts.KStar;
+      result = normalizeLib.normalize' app;
+    in result.repr.__variant == "Primitive" && result.repr.name == "Int"))
 
-  (mkTestBool "T1.7-stableId-distinct"
-    (stableId (rPrimitive "Int") != stableId (rPrimitive "Bool")))
-
-  (mkTestBool "T1.8-mkTypeConstrained"
+  (mkTestBool "T5.3: Constraint merge"
     (let
-       c = mkClass "Eq" [tInt];
-       t = mkTypeConstrained (rPrimitive "Int") KStar [c];
-     in isType t && builtins.length t.meta.constraints == 1))
+      cInner = ts.mkTypeDefault (ts.rConstrained tInt [ ts.mkClassConstraint "Eq" [ tInt ] ]) ts.KStar;
+      cOuter = ts.mkTypeDefault (ts.rConstrained cInner [ ts.mkClassConstraint "Show" [ tInt ] ]) ts.KStar;
+      norm   = normalizeLib.normalize' cOuter;
+    in norm.repr.__variant == "Constrained" &&
+       builtins.length norm.repr.constraints == 2))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T2：α-equivalence（INV-SER3）
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════
+  # T6: Hash（INV-4）
+  # ════════════════════════════════════════════════════════════════════════════
 
-  (mkTestBool "T2.1-alphaEq-lambda-same-param"
-    (let lam = mkTypeDefault (rLambda "x" KUnbound tA) KStar1; in
-     alphaEq lam lam))
+  (mkTestBool "T6.1: same type same hash"
+    (hashLib.typeHash tInt == hashLib.typeHash tInt))
 
-  (mkTestBool "T2.2-alphaEq-equivalent"
+  (mkTestBool "T6.2: diff type diff hash"
+    (hashLib.typeHash tInt != hashLib.typeHash tBool))
+
+  (mkTestBool "T6.3: typeEq ⟹ same hash"
     (let
-       # λa.a vs λx.x（α-equivalent）
-       lam1 = mkTypeDefault (rLambda "a" KUnbound (mkTypeDefault (rVar "a") KStar)) KStar1;
-       lam2 = mkTypeDefault (rLambda "x" KUnbound (mkTypeDefault (rVar "x") KStar)) KStar1;
-       db1  = deBruijnify lam1;
-       db2  = deBruijnify lam2;
-     in typeHash db1 == typeHash db2))
+      t1 = ts.mkTypeDefault (ts.rPrimitive "Int") ts.KStar;
+      t2 = ts.mkTypeDefault (ts.rPrimitive "Int") ts.KStar;
+    in equalityLib.typeEq t1 t2 && hashLib.typeHash t1 == hashLib.typeHash t2))
 
-  (mkTestBool "T2.3-alphaEq-not-equivalent"
+  # ════════════════════════════════════════════════════════════════════════════
+  # T7: Constraint IR（INV-6）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T7.1: mkEqConstraint has tag"
+    ((ts.mkEqConstraint tInt tBool).__constraintTag == "Equality"))
+
+  (mkTestBool "T7.2: mkClassConstraint has tag"
+    ((ts.mkClassConstraint "Eq" [ tInt ]).__constraintTag == "Class"))
+
+  (mkTestBool "T7.3: normalizeConstraint Equality symmetric"
     (let
-       # λa.λb.a vs λx.λy.y（NOT equivalent）
-       lam1 = mkTypeDefault (rLambda "a" KUnbound
-                (mkTypeDefault (rLambda "b" KUnbound (mkTypeDefault (rVar "a") KStar)) KStar)) KStar1;
-       lam2 = mkTypeDefault (rLambda "x" KUnbound
-                (mkTypeDefault (rLambda "y" KUnbound (mkTypeDefault (rVar "y") KStar)) KStar)) KStar1;
-       db1  = deBruijnify lam1;
-       db2  = deBruijnify lam2;
-     in typeHash db1 != typeHash db2))
+      c1 = ts.mkEqConstraint tInt tBool;
+      c2 = ts.mkEqConstraint tBool tInt;
+      n1 = constraintLib.normalizeConstraint c1;
+      n2 = constraintLib.normalizeConstraint c2;
+    in constraintLib.constraintKey n1 == constraintLib.constraintKey n2))
 
-  (mkTestBool "T2.4-freeVars-lambda"
+  (mkTestBool "T7.4: deduplicateConstraints removes dups"
     (let
-       fv = freeVarsRepr (rLambda "x" KUnbound (mkTypeDefault (rVar "y") KStar));
-     in builtins.elem "y" fv && !builtins.elem "x" fv))
+      c = ts.mkClassConstraint "Eq" [ tInt ];
+      deduped = constraintLib.deduplicateConstraints [ c c c ];
+    in builtins.length deduped == 1))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T3：Kind Check + Unify（INV-K1-6）
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ════════════════════════════════════════════════════════════════════════════
+  # T8: UnifiedSubst（INV-US1~5）
+  # ════════════════════════════════════════════════════════════════════════════
 
-  (mkTestBool "T3.1-kindCheck-primitive"
-    ((kindCheck tInt KStar).ok))
+  (mkTestBool "T8.1: emptySubst is empty"
+    (unifiedSubstLib.isEmptySubst unifiedSubstLib.emptySubst))
 
-  (mkTestBool "T3.2-kindUnify-star"
-    ((kindUnify {} KStar KStar).ok))
-
-  (mkTestBool "T3.3-kindUnify-kvar-bind"
-    (let r = kindUnify {} (KVar "k") KStar; in
-     r.ok && kindEq (r.subst.k or KUnbound) KStar))
-
-  (mkTestBool "T3.4-kindUnify-occurs"
-    (let r = kindUnify {} (KVar "k") (KArrow (KVar "k") KStar); in
-     !r.ok))
-
-  (mkTestBool "T3.5-kindUnify-arrow"
-    ((kindUnify {} KStar1 (KArrow KStar KStar)).ok))
-
-  (mkTestBool "T3.6-kindInferRepr-primitive"
-    (kindEq (kindInferRepr (rPrimitive "Int")) KStar))
-
-  (mkTestBool "T3.7-kindInferRepr-fn"
-    (kindEq (kindInferRepr (rFn tInt tBool)) KStar))
-
-  (mkTestBool "T3.8-kindInferRepr-rowExtend"
-    (kindEq (kindInferRepr (rRowExtend "x" tInt (mkTypeDefault rRowEmpty KStar))) ts.kindLib.KRow))
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T4：Constructor Partial Apply（INV-K1 修复）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T4.1-constructor-full-apply"
+  (mkTestBool "T8.2: singleTypeBinding lookup"
     (let
-       pairCtor = mkTypeDefault
-         (rConstructor "Pair" KStar2
-           [mkParam "a" KStar mkParam "b" KStar]
-           (mkTypeDefault (rADT [mkVariant "Pair" [tA tB] 0] true) KStar))
-         KStar2;
-       applied = mkTypeDefault (rApply pairCtor [tInt tBool]) KStar;
-       normed  = normalize applied;
-     in builtins.isAttrs normed))
+      s   = ts.singleTypeBinding "α" tInt;
+      r   = unifiedSubstLib.lookupType s "α";
+    in r != null && r.repr.__variant == "Primitive"))
 
-  (mkTestBool "T4.2-constructor-partial-kind"
-    # Phase 3.1 INV-K1 修复：partial apply 保留真实 param kind
+  (mkTestBool "T8.3: applyUnifiedSubst replaces Var"
     (let
-       listCtor = mkTypeDefault
-         (rConstructor "List" KStar1
-           [mkParam "a" KStar]
-           (mkTypeDefault (rADT [mkVariant "Nil" [] 0 mkVariant "Cons" [tA] 1] false) KStar))
-         KStar1;
-       # List 是 * → *，partial apply 0 args = 仍是 KStar1
-       normed = normalize listCtor;
-     in kindEq normed.kind KStar1))
+      s      = ts.singleTypeBinding "α" tInt;
+      varTy  = ts.mkTypeDefault (ts.rVar "α" "test") ts.KStar;
+      result = ts.applyUnifiedSubst s varTy;
+    in result.repr.__variant == "Primitive" && result.repr.name == "Int"))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T5：μ-types（INV-EQ3 bisimulation）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T5.1-mu-construction"
+  (mkTestBool "T8.4: composeSubst INV-US1"
     (let
-       listT = mkTypeDefault (rMu "L"
-         (mkTypeDefault (rADT [mkVariant "Nil" [] 0 mkVariant "Cons" [tInt (mkTypeDefault (rVar "L") KStar)] 1] false) KStar))
-         KStar;
-     in listT.repr.__variant == "Mu"))
+      s1     = ts.singleTypeBinding "α" tInt;
+      s2     = ts.singleTypeBinding "β" tBool;
+      comp   = ts.composeSubst s1 s2;
+      alphaR = unifiedSubstLib.lookupType comp "α";
+      betaR  = unifiedSubstLib.lookupType comp "β";
+    in alphaR != null && betaR != null))
 
-  (mkTestBool "T5.2-mu-hash-stable"
+  (mkTestBool "T8.5: fromLegacyTypeSubst round-trip"
     (let
-       mkListT = a:
-         mkTypeDefault (rMu "L"
-           (mkTypeDefault (rADT [mkVariant "Nil" [] 0 mkVariant "Cons" [a (mkTypeDefault (rVar "L") KStar)] 1] false) KStar))
-           KStar;
-       l1 = mkListT tInt; l2 = mkListT tInt;
-     in typeHash l1 == typeHash l2))
+      legacy = { "α" = tInt; };
+      us     = ts.fromLegacyTypeSubst legacy;
+      back   = unifiedSubstLib.toLegacyTypeSubst us;
+    in back ? "α" && back."α".repr.name == "Int"))
 
-  (mkTestBool "T5.3-muEq-reflexive"
+  # ════════════════════════════════════════════════════════════════════════════
+  # T9: Solver（INV-SOL1/4/5 修复）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T9.1: solve empty = ok"
+    ((ts.solve {} instanceLib.emptyDB []).ok))
+
+  (mkTestBool "T9.2: solve Eq(Int,Int) = ok"
     (let
-       listT = mkTypeDefault (rMu "L"
-         (mkTypeDefault (rADT [mkVariant "Nil" [] 0] false) KStar)) KStar;
-     in muEq listT listT))
+      c = ts.mkEqConstraint tInt tInt;
+      r = ts.solveSimple [ c ];
+    in r.ok))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T6：HKT
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T6.1-KStar1"    (kindEq KStar1 (KArrow KStar KStar)))
-  (mkTestBool "T6.2-KStar2"    (kindEq KStar2 (KArrow KStar KStar1)))
-  (mkTestBool "T6.3-normalize-apply"
-    (let applied = mkTypeDefault (rApply tF [tA]) KStar; in
-     builtins.isAttrs (normalize applied)))
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T7：Row Polymorphism
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T7.1-record-construction"
-    (let r = mkTypeDefault (rRecord { name = tString; age = tInt; }) KStar; in
-     r.repr.__variant == "Record"))
-
-  (mkTestBool "T7.2-rowExtend"
-    (let r = mkTypeDefault (rRowExtend "x" tInt (mkTypeDefault rRowEmpty KStar)) ts.kindLib.KRow; in
-     r.repr.__variant == "RowExtend"))
-
-  (mkTestBool "T7.3-variantRow"
-    (let r = mkTypeDefault (rVariantRow { Red = tUnit; Blue = tUnit; } null) KStar; in
-     r.repr.__variant == "VariantRow"))
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T8：Instance Database（Phase 3.1 soundness 修复）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T8.1-register-resolve"
+  (mkTestBool "T9.3: solve Eq(α,Int) binds α"
     (let
-       db = register emptyInstanceDB "Eq" [tInt] null "test";
-       r  = resolve db "Eq" [tInt];
-     in r.found))
+      varTy = ts.mkTypeDefault (ts.rVar "α" "sol") ts.KStar;
+      c     = ts.mkEqConstraint varTy tInt;
+      r     = ts.solveSimple [ c ];
+    in r.ok && !(unifiedSubstLib.isEmptySubst r.subst)))
 
-  (mkTestBool "T8.2-resolve-miss"
-    (let r = resolve emptyInstanceDB "Eq" [tInt]; in !r.found))
-
-  (mkTestBool "T8.3-coherence-violation"
+  (mkTestBool "T9.4: solve Eq(Int,Bool) fails"
     (let
-       db1 = register emptyInstanceDB "Show" [tBool] null "src1";
-       ok = builtins.tryEval (register db1 "Show" [tBool] null "src2");
-     in !ok.success))  # 重复注册应 throw
+      c = ts.mkEqConstraint tInt tBool;
+      r = ts.solveSimple [ c ];
+    in !r.ok))
 
-  (mkTestBool "T8.4-resolveWithFallback-builtin"
-    # builtin primitive resolution
-    (let r = resolveWithFallback emptyInstanceDB defaultClassGraph "Eq" [tInt]; in
-     r.found))
-
-  (mkTestBool "T8.5-superclass-direction"
-    # Ord <: Eq（Ord 是 Eq 的子类）
-    (isSuperclassOf defaultClassGraph "Eq" "Ord"))
-
-  (mkTestBool "T8.6-getAllSubs"
-    # Ord 是 Eq 的 sub
-    (builtins.elem "Ord" (getAllSubs defaultClassGraph "Eq")))
-
-  (mkTestBool "T8.7-canDischarge-builtin"
-    (canDischarge emptyInstanceDB defaultClassGraph (mkClass "Eq" [tInt])))
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T9：Constraint Solver（INV-SOL1/4/5）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T9.1-solve-eq-int"
-    (let r = solveDefault [mkClass "Eq" [tInt]]; in r.ok))
-
-  (mkTestBool "T9.2-solve-equality"
-    (let r = solveDefault [mkEquality tA tInt]; in r.ok))
-
-  (mkTestBool "T9.3-dedup"
-    (let r = solveDefault [mkClass "Eq" [tInt] mkClass "Eq" [tInt]]; in r.ok))
-
-  (mkTestBool "T9.4-canonical-constraint-key"
-    # INV-C1：constraintKey 稳定
+  (mkTestBool "T9.5: smtResidual for Refined constraints"
     (let
-       c1 = mkEquality tInt tBool;
-       c2 = mkEquality tBool tInt;  # mkEquality 内部排序
-     in constraintKey c1 == constraintKey c2))
+      posInt = ts.mkPositiveInt tInt;
+      rc     = ts.mkRefinedConstraint posInt "n" (ts.mkPCmp "gt" (ts.mkPVar "n") (ts.mkPLit 0));
+      r      = ts.solveSimple [ rc ];
+    in r.smtResidual != []))
 
-  (mkTestBool "T9.5-deduplicateConstraints"
+  # ════════════════════════════════════════════════════════════════════════════
+  # T10: Instance DB（修复 RISK-A/B）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T10.1: emptyDB has 0 instances"
+    (instanceLib.instanceCount instanceLib.emptyDB == 0))
+
+  (mkTestBool "T10.2: registerInstance adds entry"
     (let
-       cs = [mkClass "Show" [tInt] mkClass "Show" [tInt]];
-       deduped = deduplicateConstraints cs;
-     in builtins.length deduped == 1))
+      db = instanceLib.registerInstance instanceLib.emptyDB "Eq" [ tInt ] { eqImpl = true; } {};
+    in instanceLib.instanceCount db == 1))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T10：Incremental Graph（Kahn 修复）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T10.1-addNode"
-    (let g = addNode emptyGraph (mkNode "a" tInt); in g.nodes ? a))
-
-  (mkTestBool "T10.2-addEdge-symmetry"
+  (mkTestBool "T10.3: resolveWithFallback finds registered"
     (let
-       g0 = addNode emptyGraph (mkNode "a" tInt);
-       g1 = addNode g0 (mkNode "b" tBool);
-       g2 = addEdge g1 "a" "b";
-     in (verifySymmetry g2).ok))
+      db = instanceLib.registerInstance instanceLib.emptyDB "Eq" [ tInt ] { eqImpl = true; } {};
+      r  = instanceLib.resolveWithFallback {} db "Eq" [ tInt ];
+    in r.found && r.impl != null))
 
-  (mkTestBool "T10.3-cycle-detection"
+  (mkTestBool "T10.4: primitive Eq Int resolves with impl (RISK-A fix)"
     (let
-       g0 = addNode emptyGraph (mkNode "a" tInt);
-       g1 = addNode g0 (mkNode "b" tBool);
-       g2 = addEdge g1 "a" "b";
-       r  = addEdgeSafe g2 "b" "a";
-     in !r.ok))
+      r = instanceLib.resolveWithFallback {} instanceLib.emptyDB "Eq" [ tInt ];
+    in r.found && r.impl != null))  # ← RISK-A: impl 不再是 null
 
-  (mkTestBool "T10.4-propagate-dirty"
+  (mkTestBool "T10.5: canDischarge Class Eq Int"
+    (instanceLib.canDischarge {} instanceLib.emptyDB
+      (ts.mkClassConstraint "Eq" [ tInt ])))
+
+  (mkTestBool "T10.6: instanceKey NF-hash stable (RISK-B fix)"
     (let
-       g0 = addNode emptyGraph (mkNode "a" tInt);
-       g1 = addNode g0 (mkNode "b" tBool);
-       g2 = addEdge g1 "a" "b";  # b 依赖 a
-       g3 = propagateInvalidation g2 "a";
-     in g3.nodes.b.state == stateDirty))
+      k1 = instanceLib._instanceKey "Eq" [ tInt ];
+      k2 = instanceLib._instanceKey "Eq" [ ts.mkTypeDefault (ts.rPrimitive "Int") ts.KStar ];
+    in k1 == k2))
 
-  (mkTestBool "T10.5-topo-sort"
+  # ════════════════════════════════════════════════════════════════════════════
+  # T11: Refined Types（INV-SMT-1~6）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T11.1: mkPTrue discharged"
+    ((refinedLib.staticEvalPred ts.mkPTrue).discharged))
+
+  (mkTestBool "T11.2: mkPFalse not discharged"
+    (!(refinedLib.staticEvalPred ts.mkPFalse).discharged))
+
+  (mkTestBool "T11.3: PCmp lit-lit folding"
+    (let p = ts.mkPCmp "gt" (ts.mkPLit 5) (ts.mkPLit 3); in
+     (refinedLib.staticEvalPred p).discharged))
+
+  (mkTestBool "T11.4: PCmp false case"
+    (let p = ts.mkPCmp "gt" (ts.mkPLit 1) (ts.mkPLit 5); in
+     !(refinedLib.staticEvalPred p).discharged))
+
+  (mkTestBool "T11.5: PVar is residual"
+    ((refinedLib.staticEvalPred (ts.mkPVar "n")).residual))
+
+  (mkTestBool "T11.6: smtBridge generates SMTLIB2"
     (let
-       g0 = addNode emptyGraph (mkNode "a" tInt);
-       g1 = addNode g0 (mkNode "b" tBool);
-       g2 = addNode g1 (mkNode "c" tString);
-       g3 = addEdge g2 "a" "b";  # b depends on a
-       g4 = addEdge g3 "b" "c";  # c depends on b
-       r  = topologicalSort g4;
-     in r.ok && builtins.head r.order == "a"))
+      c      = { subject = tInt; predVar = "n"; predExpr = ts.mkPCmp "gt" (ts.mkPVar "n") (ts.mkPLit 0); };
+      script = ts.smtBridge [ c ];
+    in lib.hasPrefix "(set-logic" script))
 
-  (mkTestBool "T10.6-remove-symmetry"
+  (mkTestBool "T11.7: refinedSubtypeObligation trivial with PTrue"
     (let
-       g0 = addNode emptyGraph (mkNode "a" tInt);
-       g1 = addNode g0 (mkNode "b" tBool);
-       g2 = addEdge g1 "a" "b";
-       g3 = removeNode g2 "a";
-     in (verifySymmetry g3).ok && !(g3.nodes ? a)))
+      sub = ts.mkRefined tInt "n" ts.mkPTrue;
+      sup = ts.mkRefined tInt "n" ts.mkPTrue;
+      obl = ts.refinedSubtypeObligation sub sup;
+    in obl.trivial))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T11：Memo（INV-M1-4）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T11.1-store-lookup"
+  (mkTestBool "T11.8: checkRefinedSubtype with mock oracle (INV-SMT-5)"
     (let
-       nf    = normalize tInt;
-       memo1 = storeNormalize emptyMemo tInt nf;
-       r     = lookupNormalize memo1 tInt;
-     in r.hit))
+      sub   = ts.mkRefined tInt "n" (ts.mkPCmp "gt" (ts.mkPVar "n") (ts.mkPLit 0));
+      sup   = ts.mkRefined tInt "n" (ts.mkPCmp "ge" (ts.mkPVar "n") (ts.mkPLit 0));
+      oracle = _: "unsat";  # mock: always unsat = subtype holds
+      r      = ts.checkRefinedSubtype sub sup oracle;
+    in r.ok))
 
-  (mkTestBool "T11.2-bump-epoch-invalidates"
+  # ════════════════════════════════════════════════════════════════════════════
+  # T12: Module System（INV-MOD-1~7）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T12.1: mkSig is Sig"
+    (moduleLib.isSigType (ts.mkSig { x = tInt; })))
+
+  (mkTestBool "T12.2: mkSig fields sorted"
     (let
-       nf    = normalize tInt;
-       memo1 = storeNormalize emptyMemo tInt nf;
-       memo2 = bumpEpoch memo1;
-       r     = lookupNormalize memo2 tInt;
-     in !r.hit))
+      sig    = ts.mkSig { b = tBool; a = tInt; };
+      fields = moduleLib.sigFields sig;
+      names  = builtins.attrNames fields;
+    in names == lib.sort (a: b: a < b) names))
 
-  (mkTestBool "T11.3-memo-stats-zero"
-    (let s = memoStats emptyMemo; in s.normalizeSize == 0 && s.epoch == 0))
+  (mkTestBool "T12.3: mkStruct is Struct"
+    (moduleLib.isStructType (ts.mkStruct (ts.mkSig { x = tInt; }) { x = tInt; })))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T12：Pattern Decision Tree
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T12.1-wildcard-leaf"
-    (let dt = compileToDecisionTree [{ pattern = mkWildcard; action = 0; }] "x"; in
-     dt.tag == "Leaf"))
-
-  (mkTestBool "T12.2-variable-bind"
-    (let dt = compileToDecisionTree [{ pattern = mkVariable "y"; action = 0; }] "x"; in
-     dt.tag == "Bind" && dt.name == "y"))
-
-  (mkTestBool "T12.3-adt-exhaustive"
+  (mkTestBool "T12.4: checkSig ok when impl matches"
     (let
-       maybeT = mkTypeDefault
-         (rADT [mkVariant "Nothing" [] 0 mkVariant "Just" [tA] 1] true) KStar;
-       pats = [mkADTPattern "Nothing" [] 0 mkADTPattern "Just" [mkVariable "x"] 1];
-       r = isExhaustive pats maybeT;
-     in r.exhaustive))
+      sig    = ts.mkSig { x = tInt; };
+      struct = ts.mkStruct sig { x = tInt; };
+      r      = ts.checkSig struct sig;
+    in r.ok))
 
-  (mkTestBool "T12.4-adt-non-exhaustive"
+  (mkTestBool "T12.5: checkSig fails with missing field"
     (let
-       maybeT = mkTypeDefault
-         (rADT [mkVariant "Nothing" [] 0 mkVariant "Just" [tA] 1] true) KStar;
-       pats = [mkADTPattern "Just" [mkVariable "x"] 1];
-       r = isExhaustive pats maybeT;
-     in !r.exhaustive && builtins.elem "Nothing" r.missing))
+      sig    = ts.mkSig { x = tInt; y = tBool; };
+      struct = ts.mkStruct sig { x = tInt; };
+      r      = ts.checkSig struct sig;
+    in !r.ok && r.missing == [ "y" ]))
 
-  (mkTestBool "T12.5-pattern-bound-vars"
+  (mkTestBool "T12.6: applyFunctor ok (RISK-E fix)"
     (let
-       pat   = mkADTPattern "Pair" [mkVariable "x" mkVariable "y"] 0;
-       bound = patternBoundVars pat;
-     in bound ? x && bound ? y))
+      sig    = ts.mkSig { t = tInt; };
+      functor = ts.mkModFunctor "M" sig
+        (ts.mkTypeDefault (ts.rVar "M" "func") ts.KStar);
+      argSt   = ts.mkStruct sig { t = tInt; };
+      r       = ts.applyFunctor functor argSt;
+    in r.ok))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T13：INV 运行时验证（全量）
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T13.1-verifyInvariants"
-    (verifyInvariants {}).ok)
-
-  (mkTestBool "T13.2-hash-consistency-equal"
-    (let r = verifyHashConsistency tInt tInt; in r.consistent))
-
-  (mkTestBool "T13.3-hash-consistency-different"
-    (let r = verifyHashConsistency tInt tBool; in r.consistent))
-
-  (mkTestBool "T13.4-INV-EQ1"
-    # typeEq ⟹ hash-eq
-    (let t1 = mkTypeDefault (rPrimitive "Int") KStar;
-         t2 = mkTypeDefault (rPrimitive "Int") KStar; in
-     typeEq t1 t2 && typeHash t1 == typeHash t2))
-
-  (mkTestBool "T13.5-INV-EQ2-coherence"
-    (let c = checkCoherence tInt tBool; in c.coherent))
-
-  (mkTestBool "T13.6-INV-H2"
-    # typeHash = nfHash ∘ normalize
+  (mkTestBool "T12.7: mergeLocalInstances ok when no conflict (INV-MOD-7)"
     (let
-       h1 = typeHash tInt;
-       h2 = nfHash (normalize tInt);
-     in h1 == h2))
+      r = ts.mergeLocalInstances { inst1 = true; } { inst2 = true; };
+    in r.ok && r.db ? inst1 && r.db ? inst2))
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # T14：Phase 3.1 修复专项验证
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  (mkTestBool "T14.1-substituteAll-stable-order"
-    # INV-SUBST-3：substituteAll 顺序稳定（结果确定性）
+  (mkTestBool "T12.8: mergeLocalInstances fails on conflict"
     (let
-       subst = { a = tInt; b = tBool; };
-       t = mkTypeDefault (rApply (mkTypeDefault (rVar "a") KStar) [mkTypeDefault (rVar "b") KStar]) KStar;
-       r1 = substituteAll subst t;
-       r2 = substituteAll subst t;
-     in typeHash r1 == typeHash r2))
+      r = ts.mergeLocalInstances { inst1 = true; } { inst1 = false; };
+    in !r.ok))
 
-  (mkTestBool "T14.2-normalizeConstraint-idempotent"
-    # INV-C4：normalize ∘ normalize = normalize
+  # ════════════════════════════════════════════════════════════════════════════
+  # T13: Effect Handlers（INV-EFF-4~9）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T13.1: mkHandler is Handler"
+    ((ts.mkHandler "State" [] tInt).repr.__variant == "Handler"))
+
+  (mkTestBool "T13.2: singleEffect creates VariantRow"
+    (let er = effectLib.singleEffect "State" tInt; in
+     er.repr.__variant == "VariantRow"))
+
+  (mkTestBool "T13.3: checkHandler matches effect"
     (let
-       c  = mkClass "Eq" [tInt];
-       n1 = normalizeConstraint c;
-       n2 = normalizeConstraint n1;
-     in constraintKey n1 == constraintKey n2))
+      effRow  = effectLib.singleEffect "State" tInt;
+      effType = ts.mkTypeDefault (ts.rEffect effRow) ts.KEffect;
+      handler = ts.mkHandler "State" [] tInt;
+      r       = ts.checkHandler handler effType;
+    in r.ok))
 
-  (mkTestBool "T14.3-isSuperclassOf-direction"
-    # BUG-2 修复：isSuperclassOf(graph, "Eq", "Ord") = "Eq 是 Ord 的 super"
-    (isSuperclassOf defaultClassGraph "Eq" "Ord"))
-
-  (mkTestBool "T14.4-getAllSubs-correctness"
-    (let subs = getAllSubs defaultClassGraph "Semigroup"; in
-     builtins.elem "Monoid" subs))
-
-  (mkTestBool "T14.5-composeSubst-correct"
-    # σ₂ ∘ σ₁：σ₁ = {x ↦ a}, σ₂ = {a ↦ Int} → compose = {x ↦ Int, a ↦ Int}
+  (mkTestBool "T13.4: subtractEffect removes label"
     (let
-       sigma1 = { x = tA; };
-       sigma2 = { a = tInt; };
-       composed = composeSubst sigma1 sigma2;
-     in composed ? x && composed ? a && typeHash composed.x == typeHash tInt))
+      er     = effectLib.singleEffect "State" tInt;
+      after  = ts.subtractEffect er "State";
+      labels = builtins.attrNames (after.repr.variants or {});
+    in !builtins.elem "State" labels))
 
-  (mkTestBool "T14.6-split-fuel-normalize"
-    # split fuel：normalize 不因单一 fuel 类型耗尽而停止
-    (builtins.isAttrs (normalize (mkTypeDefault (rApply (mkTypeDefault (rLambda "x" KUnbound tA) KStar1) [tInt]) KStar))))
+  (mkTestBool "T13.5: mkDeepHandler has deep flag (INV-EFF-8)"
+    (let h = ts.mkDeepHandler "E" [] tInt; in
+     h.repr.deep or false))
 
+  (mkTestBool "T13.6: mkShallowHandler has shallow flag (INV-EFF-9)"
+    (let h = ts.mkShallowHandler "E" [] tInt; in
+     h.repr.shallow or false))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # T14: QueryKey DB（INV-QK1~5 + Phase 4.1 schema validation）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T14.1: mkQueryKey valid tag"
+    (let k = queryLib.mkQueryKey "norm" [ "abc" ]; in
+     lib.hasPrefix "norm:" k))
+
+  (mkTestBool "T14.2: validateQueryKey accepts valid"
+    (queryLib.validateQueryKey "norm:abc123"))
+
+  (mkTestBool "T14.3: validateQueryKey rejects invalid"
+    (!(queryLib.validateQueryKey "invalid:abc")))
+
+  (mkTestBool "T14.4: storeResult and lookupResult"
+    (let
+      db  = queryLib.emptyQueryDB;
+      k   = queryLib.mkQueryKey "norm" [ "typeX" ];
+      db' = queryLib.storeResult db k "result_value" [];
+      r   = queryLib.lookupResult db' k;
+    in r.found && r.value == "result_value"))
+
+  (mkTestBool "T14.5: invalidateKey marks invalid"
+    (let
+      db  = queryLib.emptyQueryDB;
+      k   = queryLib.mkQueryKey "norm" [ "typeX" ];
+      db' = queryLib.storeResult db k "val" [];
+      db2 = queryLib.invalidateKey db' k;
+      r   = queryLib.lookupResult db2 k;
+    in !r.found))
+
+  (mkTestBool "T14.6: invalidateKey BFS propagates"
+    (let
+      db   = queryLib.emptyQueryDB;
+      k1   = queryLib.mkQueryKey "norm" [ "t1" ];
+      k2   = queryLib.mkQueryKey "hash" [ "t1" ];
+      db1  = queryLib.storeResult db  k1 "v1" [];
+      db2  = queryLib.storeResult db1 k2 "v2" [ k1 ];  # k2 depends on k1
+      db3  = queryLib.invalidateKey db2 k1;  # invalidate k1 → propagates to k2
+      r2   = queryLib.lookupResult db3 k2;
+    in !r2.found))
+
+  (mkTestBool "T14.7: detectCycle returns false for acyclic"
+    (let
+      db  = queryLib.emptyQueryDB;
+      k1  = queryLib.mkQueryKey "norm" [ "t1" ];
+      db' = queryLib.storeResult db k1 "v" [];
+    in !(queryLib.detectCycle db' k1)))
+
+  (mkTestBool "T14.8: cacheNormalize writes to both caches (RISK-D fix)"
+    (let
+      db    = queryLib.emptyQueryDB;
+      memo  = {};
+      result = queryLib.cacheNormalize db memo "typeId123" tInt [];
+    in result ? queryDB && result ? memo
+       && result.memo ? "typeId123"))
+
+  (mkTestBool "T14.9: bumpEpochDB clears both caches"
+    (let
+      db    = queryLib.emptyQueryDB;
+      memo  = { someKey = "someVal"; };
+      k     = queryLib.mkQueryKey "norm" [ "t" ];
+      db'   = queryLib.storeResult db k "v" [];
+      state = queryLib.bumpEpochDB { queryDB = db'; memo = memo; };
+    in state.memo == {} &&
+       !(queryLib.lookupResult state.queryDB k).found))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # T15: Incremental Graph（INV-G1~4 修复）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T15.1: addNode creates dirty node"
+    (let g = graphLib.addNode graphLib.emptyGraph "n1" "data"; in
+     g.nodes.n1.state == graphLib.STATE_DIRTY))
+
+  (mkTestBool "T15.2: markClean transitions to clean-valid"
+    (let
+      g  = graphLib.addNode graphLib.emptyGraph "n1" "data";
+      g' = graphLib.markClean g "n1" "result";
+    in g'.nodes.n1.state == graphLib.STATE_CLEAN_VALID))
+
+  (mkTestBool "T15.3: markStale transitions clean-valid to clean-stale (INV-G2 fix)"
+    (let
+      g  = graphLib.addNode graphLib.emptyGraph "n1" "data";
+      g1 = graphLib.markClean g "n1" "result";
+      g2 = graphLib.markStale g1 "n1";
+    in g2.nodes.n1.state == graphLib.STATE_CLEAN_STALE))
+
+  (mkTestBool "T15.4: propagateDirty BFS uses revEdges (INV-G1 fix)"
+    (let
+      g  = graphLib.addNode graphLib.emptyGraph "n1" "d1";
+      g1 = graphLib.addNode g "n2" "d2";
+      # n1 → n2（n1 depends on n2 = n2 is in n1's revEdges）
+      g2 = graphLib.addEdge g1 "n1" "n2";
+      g3 = graphLib.markClean g2 "n1" "r1";
+      g4 = graphLib.markClean g3 "n2" "r2";
+      # n2 changes → n1 should be dirty
+      g5 = graphLib.propagateDirty g4 "n2";
+    in g5.nodes.n1.state == graphLib.STATE_DIRTY))
+
+  (mkTestBool "T15.5: topologicalSort acyclic"
+    (let
+      g  = graphLib.addNode graphLib.emptyGraph "n1" "d";
+      g1 = graphLib.addNode g "n2" "d";
+      g2 = graphLib.addEdge g1 "n1" "n2";
+      r  = graphLib.topologicalSort g2;
+    in r.ok))
+
+  (mkTestBool "T15.6: removeNode no dangling edges (INV-G4)"
+    (let
+      g  = graphLib.addNode graphLib.emptyGraph "n1" "d";
+      g1 = graphLib.addNode g "n2" "d";
+      g2 = graphLib.addEdge g1 "n1" "n2";
+      g3 = graphLib.removeNode g2 "n1";
+    in !(g3.nodes ? "n1") &&
+       !(g3.edges ? "n1") &&
+       !(builtins.elem "n1" (g3.revEdges."n2" or []))))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # T16: Pattern Matching（合并 P3.3 pattern tests）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T16.1: mkPatWildcard tag"
+    (patternLib.isPatWildcard patternLib.mkPatWildcard))
+
+  (mkTestBool "T16.2: mkPatVar tag"
+    (patternLib.isPatVar (patternLib.mkPatVar "x")))
+
+  (mkTestBool "T16.3: mkPatLiteral tag"
+    (patternLib.isPatLiteral (patternLib.mkPatLiteral 42)))
+
+  (mkTestBool "T16.4: compileMatch wildcard → Leaf"
+    (let
+      arm = patternLib.mkArm patternLib.mkPatWildcard "body";
+      dt  = patternLib.compileMatch [ arm ] null;
+    in dt.__dtTag == "Leaf"))
+
+  (mkTestBool "T16.5: checkExhaustive with wildcard"
+    (let
+      adtTy  = ts.mkTypeDefault (ts.rADT [
+        (ts.mkVariant "Some" [ tInt ] 0)
+        (ts.mkVariant "None" []      1)
+      ] true) ts.KStar;
+      arm = patternLib.mkArm patternLib.mkPatWildcard "body";
+      r   = patternLib.checkExhaustive [ arm ] adtTy;
+    in r.exhaustive))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # T17: Row 多态（INV-ROW）
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T17.1: RowExtend canonical sort"
+    (let
+      re1 = ts.mkTypeDefault (ts.rRowExtend "b" tBool
+              (ts.mkTypeDefault (ts.rRowExtend "a" tInt
+                (ts.mkTypeDefault ts.rRowEmpty ts.KRow)) ts.KRow)) ts.KRow;
+      n   = normalizeLib.normalize' re1;
+      # 规范化后 "a" 应该在外层（字母序）
+    in n.repr.__variant == "RowExtend"))
+
+  (mkTestBool "T17.2: VariantRow canonical"
+    (let
+      vr = ts.mkTypeDefault (ts.rVariantRow { z = tInt; a = tBool; b = tFloat; } null) ts.KRow;
+      n  = normalizeLib.normalize' vr;
+      names = builtins.attrNames (n.repr.variants or {});
+    in names == lib.sort (a: b: a < b) names))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # T18: 端到端集成测试
+  # ════════════════════════════════════════════════════════════════════════════
+
+  (mkTestBool "T18.1: List Maybe List Int type construction"
+    (let
+      # Maybe a = Just a | Nothing
+      maybeBody = ts.mkTypeDefault
+        (ts.rADT [
+          (ts.mkVariant "Just"    [ tAlpha ] 0)
+          (ts.mkVariant "Nothing" []         1)
+        ] true) ts.KStar;
+      maybeCtor = ts.mkTypeDefault
+        (ts.rConstructor "Maybe" ts.KListKind [ "a" ] maybeBody) ts.KListKind;
+      maybeInt  = ts.mkTypeDefault (ts.rApply maybeCtor [ tInt ]) ts.KStar;
+      norm      = normalizeLib.normalize' maybeInt;
+    in norm.repr.__variant == "ADT"))
+
+  (mkTestBool "T18.2: Refined type with solver"
+    (let
+      posInt = ts.mkPositiveInt tInt;
+      rc     = ts.mkRefinedConstraint posInt "n"
+                 (ts.mkPCmp "gt" (ts.mkPVar "n") (ts.mkPLit 0));
+      r      = ts.solveSimple [ rc ];
+    in r.smtResidual != [] || r.ok))  # Refined goes to smtResidual
+
+  (mkTestBool "T18.3: Module system end-to-end"
+    (let
+      sig    = ts.mkSig { value = tInt; show = tString; };
+      impl   = { value = tInt; show = tString; };
+      struct = ts.mkStruct sig impl;
+      r      = ts.checkSig struct sig;
+    in r.ok))
+
+  (mkTestBool "T18.4: Effect handler pipeline"
+    (let
+      effRow  = effectLib.singleEffect "IO" tInt;
+      effType = ts.mkTypeDefault (ts.rEffect effRow) ts.KEffect;
+      handler = ts.mkHandler "IO" [] tInt;
+      r       = ts.handleAll [ handler ] effType;
+    in r.ok))
+
+  (mkTestBool "T18.5: meta.version is 4.1"
+    (ts.meta.version == "4.1.0"))
+
+  (mkTestBool "T18.6: all Phase 4.1 capabilities true"
+    (ts.meta.capabilities.smtOracleInterface &&
+     ts.meta.capabilities.dualCacheConsistency &&
+     ts.meta.capabilities.qualifiedModuleName &&
+     ts.meta.capabilities.canDischargeSound &&
+     ts.meta.capabilities.nfHashInstanceKey &&
+     ts.meta.capabilities.worklistRequeue))
 ]

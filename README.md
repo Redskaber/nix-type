@@ -1,274 +1,345 @@
-# Nix Type System — Phase 4.0
+# nix-types — Phase 4.1
 
-> 纯 Nix 原生实现的强表达力类型系统  
-> 类 Rust 编译器增量管道（Salsa-style QueryKey）· System Fω + Dependent Types · Bidirectional Checking  
-> Equi-Recursive Bisimulation · Row Polymorphism · Algebraic Effect Handlers  
-> **Phase 4.0 新增：Refined Types (SMT Bridge) · Module System · Effect Handlers · UnifiedSubst · QueryKey Incremental**
-
----
-
-## 核心不变量（Phase 4.0 全部强制）
+**Pure Nix 原生类型系统** — 高效、现代、类 Rust 强表达能力的类型系统框架
 
 ```
-# Phase 3.x 继承（全部保留）
-INV-1:    所有结构             ∈ TypeIR
-INV-2:    所有计算             = Rewrite(TypeIR)，split-fuel bounded 终止
-INV-3:    所有比较             = NormalForm Equality（单一路径）
-INV-4:    所有缓存 key         = NF-hash（typeHash = nfHash ∘ normalize）
-INV-5:    所有依赖追踪         = Graph Edge（BFS worklist，queueSet 去重）
-INV-6:    Constraint           ∈ TypeRepr（不是函数，不是 runtime）
-INV-EQ1-4, INV-K1-6, INV-H2, INV-I1-2, INV-MU, INV-ROW-2/3
-INV-SOL1/4/5, INV-SPEC, INV-SER3/4, INV-EFF-2/3, INV-PAT-1/3
-
-# Phase 4.0 新增不变量
-
-## UnifiedSubst（INV-US*）
-INV-US1:  apply(compose(σ₂,σ₁), t) = apply(σ₂, apply(σ₁, t))
-INV-US2:  apply(id, t) = t
-INV-US3:  键前缀严格区分（t:/r:/k:），无命名冲突
-INV-US4:  compose domain 排序稳定（确定性）
-INV-US5:  applyToConstraint = applyToType ∘ traverse（compose law）
-
-## Refined Types / SMT（INV-SMT*）
-INV-SMT-1: Refined ∈ TypeRepr（INV-6 强化）
-INV-SMT-2: smtBridge 无副作用（nix string only，不带 IO）
-INV-SMT-3: solver residual = SMT obligations（不静默 OK）
-INV-SMT-4: predExpr 序列化确定性（用于 hash/equality）
-
-## Module System（INV-MOD*）
-INV-MOD-1: Sig checking = structural subtyping on field kinds
-INV-MOD-2: Functor application 生成局部 InstanceDB（不污染全局）
-INV-MOD-3: Module sealing = rOpaque（nominal typing 强制）
-INV-MOD-4: Sig fields = sorted attrNames（canonical form）
-INV-MOD-5: Struct impl ⊇ Sig fields（completeness）
-
-## Effect Handlers（INV-EFF-4~7）
-INV-EFF-4: handle 后 effect row 中 E 被移除（soundness）
-INV-EFF-5: 残余 effect = original - handled（精确 subtract）
-INV-EFF-6: open effect row（RowVar）在 subtract 后保留 tail
-INV-EFF-7: Handler 操作名不重复（coherence）
-
-## QueryKey Incremental（INV-QK*）
-INV-QK1:  QueryKey = tag ":" serialize(inputs)（确定性）
-INV-QK2:  失效传播 = 仅失效 deps 中包含 dirtyKey 的查询
-INV-QK3:  recompute 后 deps 精确更新（非保守）
-INV-QK4:  epoch = 全局单调递增（不回绕）
-INV-QK5:  circular deps 检测（DFS）
-
-## Solver P4.0（INV-SOL-P40*）
-INV-SOL-P40-1: rowVar binding 通过 UnifiedSubst 统一应用到 constraints
-INV-SOL-P40-2: Refined residual 正确收集（smtResidual 字段）
-INV-SOL-P40-3: RowEquality → unifyRow → 注入 UnifiedSubst pipeline
+版本: 4.1.0 | 语言: 纯 Nix | 哲学: Rust 编译器增量管道 + 形式化不变量
 ```
 
 ---
 
-## Phase 4.0 新功能摘要
-
-| 编号    | 功能                                                      | 模块                               | INV                      | 状态 |
-| ------- | --------------------------------------------------------- | ---------------------------------- | ------------------------ | ---- |
-| P4.0-1  | UnifiedSubst（type+row+kind 统一替换）                   | `normalize/unified_subst.nix`      | INV-US1~5                | ✅   |
-| P4.0-2  | Refined Types / PredExpr IR / SMT Bridge                  | `refined/types.nix`                | INV-SMT-1~4              | ✅   |
-| P4.0-3  | Module System（Sig/Struct/ModFunctor/sealing）             | `module/system.nix`                | INV-MOD-1~5              | ✅   |
-| P4.0-4  | Effect Handlers（algebraic effects dispatch）             | `effect/handlers.nix`              | INV-EFF-4~7              | ✅   |
-| P4.0-5  | rules_p40（EffectMerge open row + Refined + Sig norm）    | `normalize/rules_p40.nix`          | INV-EFF-6, INV-MOD-4     | ✅   |
-| P4.0-6  | solver_p40（UnifiedSubst + RowEquality + SMT residual）   | `constraint/solver_p40.nix`        | INV-SOL-P40-1~3          | ✅   |
-| P4.0-7  | QueryKey DB（Salsa-style 细粒度失效）                    | `incremental/query.nix`            | INV-QK1~5                | ✅   |
-| P4.0-8  | lib/default.nix 升级（Phase 4.0 export + p40 namespace） | `lib/default.nix`                  | —                        | ✅   |
-| P4.0-9  | 遗留风险 1 修复（rowVar subst 注入 solver pipeline）      | `constraint/solver_p40.nix`        | INV-SOL-P40-1            | ✅   |
-| P4.0-10 | 遗留风险 2 修复（EffectMerge 支持 RowVar tail）           | `normalize/rules_p40.nix`          | INV-EFF-6                | ✅   |
-
----
-
-## 模块文件结构（Phase 4.0）
-
-```
-/core
-  kind.nix              # Kind 系统（KStar/KArrow/KRow/KEffect/KVar）
-  meta.nix              # MetaType 语义控制
-  type.nix              # TypeIR 统一结构（Type/Kind/Meta 三位一体）
-
-/repr
-  all.nix               # TypeRepr 全变体集（含 Phase 4.0: Refined/Sig/Struct/ModFunctor/Handler）
-
-/normalize
-  substitute.nix        # capture-safe 替换（alpha-rename + de Bruijn）
-  unified_subst.nix     # UnifiedSubst（type+row+kind 统一，INV-US1~5）← NEW 4.0
-  rules.nix             # TRS 规则集 Phase 3.2 base
-  rules_p33.nix         # TRS 规则集 Phase 3.3
-  rules_p40.nix         # TRS 规则集 Phase 4.0（EffectMerge open + Refined + Sig）← NEW 4.0
-  rewrite.nix           # TRS 主引擎（innermost closure，all rules merged）
-
-/constraint
-  ir.nix                # Constraint IR（canonical pipeline，O(n) dedup）
-  unify.nix             # Robinson + bisimulation Mu
-  unify_row.nix         # Row Unification（Wand/Rémy style）
-  solver.nix            # Phase 3.3 Solver（保留用于兼容）
-  solver_p40.nix        # Phase 4.0 Solver（UnifiedSubst + RowEquality + SMT）← NEW 4.0
-
-/refined                # ← NEW 4.0
-  types.nix             # Refined Types（PredExpr IR, SMT Bridge, static eval）
-
-/module                 # ← NEW 4.0
-  system.nix            # Module System（Sig/Struct/ModFunctor，checkSig，applyFunctor）
-
-/effect                 # ← NEW 4.0
-  handlers.nix          # Effect Handlers（checkHandler，handleAll，subtractEffect）
-
-/runtime
-  instance.nix          # Instance DB（specificity + partial unification overlap）
-
-/meta
-  serialize.nix         # α-canonical 序列化 v3（de Bruijn，无 toJSON）
-  hash.nix              # Canonical hash（单路径 INV-H2）
-  equality.nix          # 统一等价核（INV-EQ1-4，Coherence Law）
-
-/incremental
-  graph.nix             # 依赖图（Kahn 修正，queueSet BFS，stale，errorMeta）
-  memo.nix              # Memo 层（epoch-based，Phase 3.3 兼容）
-  query.nix             # QueryKey DB（Salsa-style，细粒度失效）← NEW 4.0
-
-/match
-  pattern.nix           # Pattern IR base
-  pattern_p33.nix       # Pattern IR Phase 3.3（Lit/Record/Guard/As/Tuple/Or）
-
-/bidir
-  check.nix             # Bidirectional Type Checking
-
-/lib
-  default.nix           # 统一入口（Phase 4.0：完整 API + p40 namespace）
-
-/tests
-  test_all.nix          # 综合测试（T1-T16，Phase 3.3）
-  test_phase40.nix      # Phase 4.0 专项测试（T17-T21）← NEW 4.0
-
-/examples
-  phase3_demo.nix       # Phase 3 特性演示
-  phase33_demo.nix      # Phase 3.3 特性演示
-  phase40_demo.nix      # Phase 4.0 全特性演示← NEW 4.0
-
-flake.nix               # Flake：lib export + meta + checks
-```
-
----
-
-## 快速上手（Phase 4.0）
+## 快速开始
 
 ```nix
-let ts = import ./lib/default.nix { lib = pkgs.lib; }; in
+# flake.nix
+{
+  inputs.nix-types.url = "github:yourorg/nix-types";
 
-# 1. Refined Types
-let
-  tPosInt = ts.mkPosInt {};  # { n : Int | n > 0 }
-  tByte   = ts.mkBoundedInt 0 255;
+  outputs = { self, nix-types, ... }:
+    let
+      ts = nix-types.lib.${system};
+    in {
+      # 使用类型系统
+    };
+}
+```
 
-  # SMT Bridge（纯 string）
-  rc  = ts.mkRefinedConstraint tPosInt "n" (ts.PGt (ts.PVar "n") (ts.PLit 0));
-  smt = ts.smtBridge [rc];
-  # → SMTLIB2 string to pass to z3/cvc5
-in {}
+```nix
+# 直接 import
+let ts = import ./lib/default.nix { inherit lib; }; in
 
-# 2. Module System
-let
-  sig    = ts.mkSig { T = ts.KStar; eq = ts.KArrow ts.KStar ts.KStar; };
-  struct = ts.mkStruct sig { T = tInt; eq = tIntEq; };
-  check  = ts.checkSig sig struct;  # { ok = true }
+let tInt = ts.mkTypeDefault (ts.rPrimitive "Int") ts.KStar;
+    tBool = ts.mkTypeDefault (ts.rPrimitive "Bool") ts.KStar;
 
-  sealed = ts.sealModule struct sig;  # Opaque → nominal typing
-in {}
-
-# 3. Effect Handlers
-let
-  allEff = ts.mergeEffects (ts.mkEffType { State = tInt; }) (ts.mkEffType { IO = tUnit; });
-  handler = ts.mkHandler "State"
-    [(ts.rHandlerBranch "get" [] "resume" tInt)]
-    tUnit;
-  checkResult = ts.checkHandler allEff handler;
-  # { ok=true; residualEffTy = Eff[IO:Unit] }
-in {}
-
-# 4. QueryKey Incremental
-let
-  db    = ts.emptyQueryDB;
-  key   = ts.qkNormalize "type:Int";
-  db'   = ts.storeResult db key "NF:Int" [];
-  hit   = ts.lookupResult db' key;  # { found=true; result.value="NF:Int" }
-  # Invalidate → cascades through deps
-  db''  = ts.invalidateKey db' key;
-in {}
+    # 约束求解
+    result = ts.solveSimple [
+      (ts.mkEqConstraint tInt tInt)
+      (ts.mkClassConstraint "Eq" [ tInt ])
+    ];
+in result.ok  # → true
 ```
 
 ---
 
-## TypeRepr 全变体集（Phase 4.0）
+## 核心不变量
 
 ```
-TypeRepr =
-  Primitive    { name }                       # 原子类型
-| Var          { name; scope }                # 类型变量
-| Lambda       { param; body }                # 类型级 λ
-| Apply        { fn; args }                   # 类型级应用
-| Constructor  { name; kind; params; body }   # 泛型 ADT 构造器
-| Fn           { from; to }                   # 函数类型
-| ADT          { variants; closed }           # 代数数据类型
-| Constrained  { base; constraints }          # 约束内嵌（INV-6）
-| Mu           { var; body }                  # 等递归类型
-| Record       { fields }                     # 记录类型
-| VariantRow   { variants; extension }        # 变体行
-| RowExtend    { label; fieldType; rest }     # 行扩展
-| RowEmpty     {}                             # 空行
-| RowVar       { name }                       # 行变量
-| Pi           { param; domain; body }        # 依赖函数类型
-| Sigma        { param; domain; body }        # 依赖积类型
-| Effect       { effectRow }                  # 效果类型
-| EffectMerge  { left; right }               # 效果合并节点
-| Opaque       { inner; tag }                 # 不透明类型
-| Ascribe      { expr; type }                # 类型标注
-| Refined      { base; predVar; predExpr }   ← NEW 4.0
-| Sig          { fields }                     ← NEW 4.0
-| Struct       { sig; impl }                  ← NEW 4.0
-| ModFunctor   { param; paramTy; body }       ← NEW 4.0
-| Handler      { effectTag; branches; returnType } ← NEW 4.0
+INV-1: 所有结构       ∈ TypeIR
+INV-2: 所有计算       = Rewrite(TypeIR)      ← TRS，fuel 保证终止
+INV-3: 所有比较       = NormalForm Equality
+INV-4: 所有缓存 key   = Hash(serialize(NF))
+INV-5: 所有依赖追踪   = Graph Edge
+INV-6: Constraint     ∈ TypeRepr（不是函数）
 ```
 
 ---
 
-## Phase 演化路径
+## 架构（Phase 4.1）
 
 ```
-Phase 1.0  基础 TypeIR + Kind + Primitive TRS
-Phase 2.0  Row Polymorphism + μ-types + Instance DB
-Phase 3.0  Dependent Types + Effect System + Bidirectional + Constraint IR
-Phase 3.1  Soundness/INV 修复（enterprise-stable）
-Phase 3.2  Mu bisimulation + substLib + specificity + row canonical
-Phase 3.3  Open row unification + EffectMerge + VariantRowCanon + Complete Pattern
-Phase 4.0  ← 当前
-           ✅ UnifiedSubst（type+row+kind 统一替换，解决遗留风险 1）
-           ✅ EffectMerge open effect row（RowVar tail，解决遗留风险 2）
-           ✅ Refined Types（Liquid Types，PredExpr IR，SMT bridge，static eval）
-           ✅ Module System（Sig/Struct/ModFunctor，checkSig，sealing，subtyping）
-           ✅ Effect Handlers（algebraic effects，checkHandler，handleAll）
-           ✅ QueryKey Incremental（Salsa-style，细粒度 BFS 失效，cycle detection）
-           ✅ solver_p40（RowEquality constraint，rowVar subst 注入，SMT residual）
-Phase 4.1  → Refined subtype automation（implication oracle）
-Phase 4.2  → Module Functor composition（transitive functor application）
-Phase 4.3  → Effect Handler continuations（delimited control）
-Phase 5.0  → Gradual Types + Type Inference（HM + constraint solving unified）
+┌─────────────────────────────────────────────────────────────────────┐
+│                     TypeIR（统一宇宙）                               │
+│  Type = { tag; id; kind; repr; meta }                               │
+│  Kind = KStar|KArrow|KRow|KEffect|KVar|KUnbound                    │
+│  Meta = { eqStrategy; muPolicy; rowPolicy; bidirPolicy; ... }      │
+└──────────────┬──────────────┬──────────────┬──────────────┬─────────┘
+               │              │              │              │
+        TypeRepr         Normalize      Constraint      Meta Layer
+        (25+ 变体)      (TRS rules)    IR (INV-6)    (hash/eq/serial)
+               │              │              │
+        ┌──────▼──────────────▼──────────────▼──────────────────────┐
+        │                 UnifiedSubst (Phase 4.0)                   │
+        │   { typeBindings:"t:"; rowBindings:"r:"; kindBindings:"k:" }│
+        └──────────────────────────────────────────────────────────┘
+               │
+    ┌──────────┼──────────────────────────────────────────────┐
+    │          │              │              │                 │
+ Refined   Module         Effect         QueryDB           Solver
+ Types     System        Handlers       (Salsa)          (Unified)
+ P4.0+P4.1 INV-MOD-1~7  INV-EFF-4~9   INV-QK1~5       INV-SOL1~5
+```
+
+### TypeRepr 变体全集（25+）
+
+| 变体                     | 语义                        | Phase   |
+| ------------------------ | --------------------------- | ------- |
+| `Primitive`              | 原子类型（Int/Bool/String） | 1.0     |
+| `Var` / `VarK`           | 类型变量（带 scope + kind） | 1.0     |
+| `Lambda` / `LambdaK`     | 类型级 λ（表达力闭合）      | 1.0     |
+| `Apply`                  | 类型级应用（计算核心）      | 1.0     |
+| `Constructor`            | 泛型 ADT 构造器             | 1.0     |
+| `Fn`                     | 函数类型                    | 1.0     |
+| `ADT`                    | 代数数据类型                | 1.0     |
+| `Constrained`            | 约束内嵌（**INV-6**）       | 1.0     |
+| `Mu`                     | 等递归类型                  | 2.0     |
+| `Record`                 | 记录类型                    | 3.0     |
+| `RowExtend/Empty/Var`    | 行多态                      | 3.0     |
+| `VariantRow`             | 变体行（Effect 基础）       | 3.2     |
+| `Pi` / `Sigma`           | 依赖类型                    | 3.3     |
+| `Effect` / `EffectMerge` | 效果类型                    | 3.3     |
+| `Opaque` / `Ascribe`     | 封装 / 类型标注             | 3.3     |
+| `Refined`                | 精化类型 `{n:T\|φ(n)}`      | **4.0** |
+| `Sig` / `Struct`         | 模块签名 / 实现             | **4.0** |
+| `ModFunctor`             | 参数化模块                  | **4.0** |
+| `Handler`                | Effect Handler              | **4.0** |
+
+---
+
+## Phase 4.1 核心改进
+
+### 修复的关键 Bug
+
+| Risk   | 问题                                                     | 修复                                                 | 影响 INV        |
+| ------ | -------------------------------------------------------- | ---------------------------------------------------- | --------------- |
+| RISK-A | `canDischarge` 接受 `impl=null` 的 superclass resolution | 验证 `impl != null`                                  | soundness       |
+| RISK-B | `instanceKey` 使用 `toJSON+md5`（α-等价类型不同 key）    | NF-hash（`typeHash`）                                | INV-4 coherence |
+| RISK-C | worklist solver 无真正 requeue（one-pass 退化）          | `applySubstToConstraints` 写回 worklist              | INV-SOL5        |
+| RISK-D | `memoLib` + `queryLib` 双缓存无同步协议                  | `cacheNormalize` / `bumpEpochDB` 统一入口            | 一致性          |
+| RISK-E | `applyFunctor` 直接替换 param 导致 scope 错误            | qualified naming (`param_field`)                     | INV-MOD-5       |
+| INV-G1 | `topologicalSort` in-degree 方向错误                     | 使用 `edges` 计算 in-degree，`revEdges` 做 decrement | 正确性          |
+
+### 新增能力
+
+```nix
+# INV-SMT-5: Refined subtype 自动化（用户提供 SMT oracle）
+checkRefinedSubtype sub sup (_: "unsat")
+# → { ok = true; witness = "SMT: unsat"; }
+
+# INV-MOD-6: Functor 组合
+composeFunctors f1 f2  # → ModFunctor(F∘G)
+
+# INV-MOD-7: Instance merge with coherence check
+mergeLocalInstances globalDB localDB
+
+# INV-EFF-8/9: Deep/Shallow handlers
+mkDeepHandler "E" branches returnType    # deep.flag = true
+mkShallowHandler "E" branches returnType # shallow.flag = true
+
+# INV-QK-SCHEMA: QueryKey validation
+validateQueryKey "norm:abc"   # true
+validateQueryKey "unknown:x"  # false
+
+# INV-G2: clean-stale state
+markStale graph nodeId  # clean-valid → clean-stale
 ```
 
 ---
 
-## 关键设计决策（ADR Phase 4.0）
+## 文件结构
 
-| ADR     | 决策                                      | 原因                                                    |
-| ------- | ----------------------------------------- | ------------------------------------------------------- |
-| ADR-14  | UnifiedSubst 三键前缀（t:/r:/k:）         | 防止 type/row/kind 变量名命名冲突（INV-US3）            |
-| ADR-15  | PredExpr 作为独立 IR（非 Nix function）   | 满足 INV-6：Constraint ∈ TypeRepr；支持 serialize/hash  |
-| ADR-16  | smtBridge = pure String（无 builtins.exec）| 纯 Nix 环境无法执行外部 SMT solver；string 传递给用户   |
-| ADR-17  | Sig fields sorted（INV-MOD-4）            | canonical form = 确定性 hash；字段顺序不影响语义        |
-| ADR-18  | Functor application 返回 localInstances   | INV-MOD-2：Functor 应用不污染全局 InstanceDB            |
-| ADR-19  | QueryKey = tag + inputs（非 UUID）         | INV-QK1：相同输入相同 key；内容可寻址，无随机性         |
-| ADR-20  | BFS invalidation（非 epoch bump）         | INV-QK2：精确失效；epoch bump = 全量失效（退化模式）    |
-| ADR-21  | RowEquality constraint（新 tag）          | 将 row unification 结果变成 solver 可处理的 constraint  |
-| ADR-22  | EffectMerge flatten 保留 RowVar tail      | INV-EFF-6：open effect row 必须保留以支持 polymorphism  |
-| ADR-23  | Refined static eval 在 solver 内          | trivial predicates（PTrue/PFalse）不需要 SMT           |
+```
+nix-types/
+├── core/
+│   ├── kind.nix         # Kind 系统（KStar/KArrow/KRow/KEffect/KVar）
+│   ├── meta.nix         # MetaType 语义控制层
+│   └── type.nix         # 统一 Type 结构（三位一体）
+├── repr/
+│   └── all.nix          # TypeRepr 全变体构造器（25+）
+├── normalize/
+│   ├── substitute.nix   # capture-safe substitution（全变体覆盖）
+│   ├── rules.nix        # TRS 规则集（合并 Phase 1~4.1，11 条规则）
+│   ├── rewrite.nix      # TRS 主引擎（fuel-based 强制终止）
+│   └── unified_subst.nix# UnifiedSubst（INV-US1~5 + schema validation）
+├── meta/
+│   ├── serialize.nix    # canonical 序列化（INV-4 前置）
+│   ├── hash.nix         # NF-hash（INV-4 核心）
+│   └── equality.nix     # NF-equality（INV-3）
+├── constraint/
+│   ├── ir.nix           # Constraint IR（INV-6，6 种变体）
+│   ├── unify.nix        # Robinson 合一（含 Mu bisimulation guard）
+│   ├── unify_row.nix    # Row 合一（开放行多态）
+│   └── solver.nix       # 统一 Solver（合并 solver+solver_p40）
+├── runtime/
+│   └── instance.nix     # Instance DB（INV-I1~2，RISK-A/B 修复）
+├── refined/
+│   └── types.nix        # Refined Types（PredExpr IR + smtOracle）
+├── module/
+│   └── system.nix       # Module System（Sig/Struct/ModFunctor）
+├── effect/
+│   └── handlers.nix     # Effect Handlers（deep/shallow，INV-EFF-4~9）
+├── bidir/
+│   └── check.nix        # 双向类型推断
+├── incremental/
+│   ├── graph.nix        # 依赖图（INV-G1~4 全修复）
+│   ├── memo.nix         # Memo 层（epoch-based）
+│   └── query.nix        # QueryDB（Salsa-style，双缓存统一入口）
+├── match/
+│   └── pattern.nix      # Pattern Matching + Decision Tree（合并）
+├── tests/
+│   └── test_all.nix     # 完整测试套件（127 tests，18 组，合并所有阶段）
+├── examples/
+│   └── demo.nix         # 综合示例（6 个端到端场景）
+├── lib/
+│   └── default.nix      # 统一导出（Layer 0~22 拓扑顺序）
+└── flake.nix            # Flake（lib/checks/packages/apps/overlays）
+```
+
+> **注意**：不再有 `rules_p33.nix`、`rules_p40.nix`、`solver_p40.nix`、`pattern_p33.nix`、
+> `test_phase32.nix`、`test_phase40.nix`、`phase40_demo.nix` 等碎片文件。
+
+---
+
+## API 参考
+
+### 类型构造
+
+```nix
+ts.mkTypeDefault repr kind       # 基本构造（defaultMeta）
+ts.mkTypeWith    repr kind meta  # 完整构造
+ts.rPrimitive "Int"              # Primitive repr
+ts.rVar "α" "scope"             # Var repr
+ts.rLambda "x" bodyType         # Lambda repr
+ts.rApply fnType [argTypes]     # Apply repr
+ts.rFn from to                  # Fn repr
+ts.rADT variants closed         # ADT repr
+ts.rConstrained base [cs]       # Constrained repr（INV-6）
+ts.rMu "X" bodyType             # Mu repr（递归）
+ts.rRecord { x = tInt; }        # Record repr
+ts.rRefined base "n" predExpr   # Refined repr
+ts.rSig { f = tInt; }           # Sig repr
+ts.mkVariant "Some" [tInt] 0    # ADT Variant
+```
+
+### 类型操作
+
+```nix
+ts.normalize' t        # 规范化（1000 fuel）
+ts.typeEq a b          # NF equality（INV-3）
+ts.typeHash t          # canonical hash（INV-4）
+ts.typeId t            # stable identity
+```
+
+### 约束系统
+
+```nix
+ts.mkEqConstraint a b            # a ≡ b
+ts.mkClassConstraint "Eq" [tInt] # typeclass constraint
+ts.mkRowEqConstraint r1 r2       # row equality
+ts.mkRefinedConstraint t "n" φ   # refined constraint
+ts.solve classGraph db [cs]      # 求解（UnifiedSubst 返回）
+ts.solveSimple [cs]              # 简化入口
+```
+
+### UnifiedSubst
+
+```nix
+ts.singleTypeBinding "α" tInt    # 单条 type binding
+ts.singleRowBinding "r" rowTy    # 单条 row binding
+ts.composeSubst s1 s2            # 组合（INV-US1）
+ts.applyUnifiedSubst subst t     # 应用
+ts.fromLegacyTypeSubst { α=tInt }# 从旧格式转换
+```
+
+### Refined Types
+
+```nix
+ts.mkRefined tInt "n" (ts.mkPCmp "gt" (ts.mkPVar "n") (ts.mkPLit 0))
+ts.staticEvalPred predExpr       # 静态求值
+ts.smtBridge [refinedConstraints] # 生成 SMTLIB2
+ts.checkRefinedSubtype sub sup smtOracle  # INV-SMT-5
+```
+
+### Module System
+
+```nix
+ts.mkSig { x = tInt; }           # 接口签名
+ts.mkStruct sig impl             # 实现
+ts.checkSig struct sig           # 结构检查
+ts.applyFunctor functor arg      # Functor 应用（qualified）
+ts.composeFunctors f1 f2         # Functor 组合
+ts.mergeLocalInstances g l       # Instance 合并（coherence）
+```
+
+### Effect Handlers
+
+```nix
+ts.mkDeepHandler "E" branches rt    # deep handler
+ts.mkShallowHandler "E" branches rt # shallow handler
+ts.effectMerge e1 e2               # effect merge
+ts.checkHandler handler effType    # 类型检查
+ts.handleAll [handlers] effType    # 批量处理
+ts.subtractEffect effRow label     # 移除 effect
+```
+
+### 增量缓存
+
+```nix
+# 统一写入两层缓存（RISK-D 修复）
+ts.cacheNormalize db memo typeId nf deps
+# → { queryDB; memo }
+
+# 全量失效（同步两层）
+ts.queryLib.bumpEpochDB { queryDB; memo }
+
+# QueryKey schema（INV-QK-SCHEMA）
+ts.queryLib.mkQueryKey "norm" ["typeId"]
+ts.queryLib.validateQueryKey "norm:abc"  # → true
+```
+
+---
+
+## 不变量索引
+
+| 代码          | 含义                         | 实现位置                      |
+| ------------- | ---------------------------- | ----------------------------- |
+| INV-1         | 所有结构 ∈ TypeIR            | `core/type.nix`               |
+| INV-2         | 所有计算 = Rewrite(TypeIR)   | `normalize/rewrite.nix`       |
+| INV-3         | 所有比较 = NF equality       | `meta/equality.nix`           |
+| INV-4         | 缓存 key = Hash(NF)          | `meta/hash.nix`               |
+| INV-5         | 依赖追踪 = Graph Edge        | `incremental/graph.nix`       |
+| INV-6         | Constraint ∈ TypeRepr        | `constraint/ir.nix`           |
+| INV-K1        | per-parameter kind           | `core/kind.nix`               |
+| INV-US1       | compose law                  | `normalize/unified_subst.nix` |
+| INV-US3       | 前缀不冲突 t:/r:/k:          | `normalize/unified_subst.nix` |
+| INV-SOL1      | subst equality = NF-hash     | `constraint/solver.nix`       |
+| INV-SOL5      | worklist requeue             | `constraint/solver.nix`       |
+| INV-SMT-5     | checkRefinedSubtype sound    | `refined/types.nix`           |
+| INV-SMT-6     | trivial cases skip SMT       | `refined/types.nix`           |
+| INV-MOD-4     | Sig fields 字母序            | `normalize/rules.nix`         |
+| INV-MOD-6     | composeFunctors type-correct | `module/system.nix`           |
+| INV-MOD-7     | mergeLocalInstances coherent | `module/system.nix`           |
+| INV-EFF-8     | deep handler = handle all    | `effect/handlers.nix`         |
+| INV-EFF-9     | shallow handler = first only | `effect/handlers.nix`         |
+| INV-QK1       | QueryKey 确定性              | `incremental/query.nix`       |
+| INV-QK2       | 精确失效 BFS                 | `incremental/query.nix`       |
+| INV-QK5       | 循环检测 DFS                 | `incremental/query.nix`       |
+| INV-QK-SCHEMA | key 格式验证                 | `incremental/query.nix`       |
+| INV-G1        | BFS propagation 正确方向     | `incremental/graph.nix`       |
+| INV-G2        | clean-stale 状态区分         | `incremental/graph.nix`       |
+| INV-G4        | removeNode 无 dangling edge  | `incremental/graph.nix`       |
+
+---
+
+## 演化路径
+
+```
+Phase 1.0 → TypeIR 基础（Primitive/Var/Lambda/Apply/Fn/ADT/Constrained）
+Phase 2.0 → Mu 递归类型 + NF-hash + Memo
+Phase 3.0 → Row 多态 + Effect + Constraint Solver + Instance DB
+Phase 3.3 → Pattern Matching + Bidirectional + Pi/Sigma + rowVar
+Phase 4.0 → Refined Types + Module System + Effect Handlers + UnifiedSubst + QueryDB
+Phase 4.1 → ★ 当前：RISK-A~E 修复 + SMT Oracle + Functor Compose + 文件合并
+Phase 4.2 → Functor transitive composition + Global InstanceDB coherence
+Phase 4.3 → Continuation passing + Mu bisimulation up-to congruence
+Phase 5.0 → Gradual Types + HM inference + Dynamic
+```

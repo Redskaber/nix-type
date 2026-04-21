@@ -1,335 +1,280 @@
-# refined/types.nix — Phase 4.0
-#
-# Refined Types（Liquid Types / SMT Bridge）
-#
-# 设计原则：
-#   - Predicate ∈ TypeRepr（INV-6 强化，INV-SMT-1）
-#   - smtBridge 无副作用（nix string only，INV-SMT-2）
-#   - solver residual = SMT obligations（INV-SMT-3）
-#   - Refined = { n : T | φ(n) }，其中 φ 是谓词 IR
-#
-# TypeRepr 新增变体：
-#   Refined { base; predVar; predExpr }  # { n : base | predExpr[predVar ↦ n] }
-#
-# 谓词 IR（PredExpr）：
-#   PredExpr = PTrue | PFalse
-#             | PAnd { left; right }
-#             | POr  { left; right }
-#             | PNot { body }
-#             | PCmp { op; lhs; rhs }  # op ∈ {gt, lt, ge, le, eq, neq}
-#             | PVar { name }           # 自由变量（指向约束 context）
-#             | PLit { value }          # 字面量
-#             | PApp { fn; args }       # 外部谓词名 + 参数
-#
-# SMT 输出格式：SMTLIB2（字符串，可传给 z3 / cvc5）
-#
-# 不变量（Phase 4.0 SMT）：
-#   INV-SMT-1: Refined ∈ TypeRepr（不是外部系统）
-#   INV-SMT-2: smtBridge 返回纯 string（无 builtins.exec）
-#   INV-SMT-3: 无法 discharge 的谓词 → residual list（不静默 OK）
-#   INV-SMT-4: predExpr 序列化确定性（用于 hash / equality）
-
-{ lib, typeLib, kindLib, reprLib, hashLib }:
+# refined/types.nix — Phase 4.1
+# Refined Types（精化类型）
+# 新增：smtOracle 接口（修复 RISK 风险 2：Refined subtype 自动化）
+# INV-SMT-1: PredExpr ∈ IR（不是 Nix 函数）
+# INV-SMT-2: staticEval 健全（PTrue/PFalse/常量折叠）
+# INV-SMT-3: smtBridge 生成标准 SMTLIB2
+# INV-SMT-4: Refined constraint ∈ TypeRepr（INV-6 保持）
+# INV-SMT-5: checkRefinedSubtype sound（Phase 4.1 新增）
+# INV-SMT-6: trivial cases never sent to SMT
+{ lib, typeLib, reprLib, kindLib, hashLib, normalizeLib }:
 
 let
-  inherit (typeLib) mkTypeDefault mkTypeWith;
+  inherit (typeLib) isType mkTypeDefault mkTypeWith;
+  inherit (reprLib) rRefined rConstrained;
   inherit (kindLib) KStar;
-  inherit (reprLib) rPrimitive rConstrained;
 
 in rec {
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # PredExpr IR
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ PredExpr IR（谓词语言，INV-SMT-1）════════════════════════════════════
 
-  PTrue  = { __pred = "PTrue"; };
-  PFalse = { __pred = "PFalse"; };
+  mkPTrue  = { __predTag = "PTrue"; };
+  mkPFalse = { __predTag = "PFalse"; };
 
-  PAnd = left: right: { __pred = "PAnd"; inherit left right; };
-  POr  = left: right: { __pred = "POr";  inherit left right; };
-  PNot = body:        { __pred = "PNot"; inherit body; };
+  mkPAnd   = left: right:
+    # 短路优化
+    if left.__predTag or null == "PFalse" || right.__predTag or null == "PFalse"
+    then mkPFalse
+    else if left.__predTag or null == "PTrue" then right
+    else if right.__predTag or null == "PTrue" then left
+    else { __predTag = "PAnd"; inherit left right; };
 
-  PCmp = op: lhs: rhs: { __pred = "PCmp"; inherit op lhs rhs; };
-  # 便捷比较器
-  PGt  = PCmp "gt";
-  PLt  = PCmp "lt";
-  PGe  = PCmp "ge";
-  PLe  = PCmp "le";
-  PEq  = PCmp "eq";
-  PNeq = PCmp "neq";
+  mkPOr    = left: right:
+    if left.__predTag or null == "PTrue" || right.__predTag or null == "PTrue"
+    then mkPTrue
+    else if left.__predTag or null == "PFalse" then right
+    else if right.__predTag or null == "PFalse" then left
+    else { __predTag = "POr"; inherit left right; };
 
-  PVar = name: { __pred = "PVar"; inherit name; };
-  PLit = value: { __pred = "PLit"; inherit value; };
-  PApp = fn: args: { __pred = "PApp"; inherit fn args; };
+  mkPNot   = body:
+    if body.__predTag or null == "PTrue"  then mkPFalse
+    else if body.__predTag or null == "PFalse" then mkPTrue
+    else { __predTag = "PNot"; inherit body; };
 
-  # ── 谓词变量替换（predVar → 具体 name）──────────────────────────────────────
+  mkPCmp   = op: lhs: rhs: { __predTag = "PCmp"; inherit op lhs rhs; };
 
-  substPredVar = oldName: newName: pred:
-    let v = pred.__pred or null; in
-    if v == "PVar" && pred.name == oldName
-    then PVar newName
-    else if v == "PAnd" then PAnd (substPredVar oldName newName pred.left)
-                                  (substPredVar oldName newName pred.right)
-    else if v == "POr"  then POr  (substPredVar oldName newName pred.left)
-                                  (substPredVar oldName newName pred.right)
-    else if v == "PNot" then PNot (substPredVar oldName newName pred.body)
-    else if v == "PCmp" then PCmp pred.op
-                                  (substPredVar oldName newName pred.lhs)
-                                  (substPredVar oldName newName pred.rhs)
-    else if v == "PApp" then PApp pred.fn (map (substPredVar oldName newName) pred.args)
-    else pred;
+  mkPVar   = name: { __predTag = "PVar"; inherit name; };
+  mkPLit   = value: { __predTag = "PLit"; inherit value; };
+  mkPApp   = fn: args: { __predTag = "PApp"; inherit fn args; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Refined TypeRepr 构造器
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ── 谓词谓词 ─────────────────────────────────────────────────────────────
+  isPred    = p: builtins.isAttrs p && p ? __predTag;
+  isPTrue   = p: isPred p && p.__predTag == "PTrue";
+  isPFalse  = p: isPred p && p.__predTag == "PFalse";
+  isPVar    = p: isPred p && p.__predTag == "PVar";
+  isPLit    = p: isPred p && p.__predTag == "PLit";
 
-  rRefined = base: predVar: predExpr: {
-    __variant = "Refined";
-    inherit base predVar predExpr;
-  };
+  # ══ Refined Type 构造器 ════════════════════════════════════════════════════
 
-  # 便捷构造：{ n : T | φ }
-  mkRefined = baseType: predVar: predExpr:
-    mkTypeDefault (rRefined baseType predVar predExpr) KStar;
+  # { n : T | φ(n) }
+  mkRefined = base: predVar: predExpr:
+    mkTypeDefault (rRefined base predVar predExpr) KStar;
 
-  # 常用 Refined 类型
-  mkPosInt = _:
-    let
-      tInt = mkTypeDefault (rPrimitive "Int") KStar;
-    in
-    mkRefined tInt "n" (PGt (PVar "n") (PLit 0));
+  # 快捷构造：正整数类型
+  mkPositiveInt = intType:
+    mkRefined intType "n" (mkPCmp "gt" (mkPVar "n") (mkPLit 0));
 
-  mkNonNegInt = _:
-    let tInt = mkTypeDefault (rPrimitive "Int") KStar; in
-    mkRefined tInt "n" (PGe (PVar "n") (PLit 0));
+  # 快捷构造：非负整数类型
+  mkNonNegInt = intType:
+    mkRefined intType "n" (mkPCmp "ge" (mkPVar "n") (mkPLit 0));
 
-  mkBoundedInt = lo: hi:
-    let tInt = mkTypeDefault (rPrimitive "Int") KStar; in
-    mkRefined tInt "n" (PAnd
-      (PGe (PVar "n") (PLit lo))
-      (PLe (PVar "n") (PLit hi)));
-
-  mkNonEmpty = baseListType:
-    mkRefined baseListType "xs" (PGt (PApp "length" [PVar "xs"]) (PLit 0));
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # PredExpr 序列化（确定性，用于 hash，INV-SMT-4）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  serializePred = pred:
-    let v = pred.__pred or null; in
-    if v == null    then "?pred"
-    else if v == "PTrue"  then "T"
-    else if v == "PFalse" then "F"
-    else if v == "PVar"   then "v:${pred.name}"
-    else if v == "PLit"   then "l:${builtins.toString pred.value}"
-    else if v == "PNot"   then "~(${serializePred pred.body})"
-    else if v == "PAnd"   then "(&(${serializePred pred.left},${serializePred pred.right}))"
-    else if v == "POr"    then "(|(${serializePred pred.left},${serializePred pred.right}))"
-    else if v == "PCmp"   then "(${pred.op}:${serializePred pred.lhs}:${serializePred pred.rhs})"
-    else if v == "PApp"   then "${pred.fn}(${lib.concatStringsSep "," (map serializePred pred.args)})"
-    else "?p";
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # SMT 生成（SMTLIB2 格式，INV-SMT-2：纯 string）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # 谓词 → SMTLIB2 表达式
-  predToSMT = pred:
-    let v = pred.__pred or null; in
-    if v == "PTrue"  then "true"
-    else if v == "PFalse" then "false"
-    else if v == "PVar"   then pred.name
-    else if v == "PLit"   then builtins.toString pred.value
-    else if v == "PNot"   then "(not ${predToSMT pred.body})"
-    else if v == "PAnd"   then "(and ${predToSMT pred.left} ${predToSMT pred.right})"
-    else if v == "POr"    then "(or ${predToSMT pred.left} ${predToSMT pred.right})"
-    else if v == "PCmp"   then
+  # ══ Static Evaluation（INV-SMT-2）═════════════════════════════════════════
+  # Type: PredExpr -> { discharged: Bool; residual: Bool; simplExpr: PredExpr }
+  staticEvalPred = p:
+    let tag = p.__predTag or null; in
+    if tag == "PTrue"  then { discharged = true;  residual = false; simplExpr = p; }
+    else if tag == "PFalse" then { discharged = false; residual = false; simplExpr = p; }
+    else if tag == "PAnd" then
       let
-        smtOp = if pred.op == "gt"  then ">"
-           else if pred.op == "lt"  then "<"
-           else if pred.op == "ge"  then ">="
-           else if pred.op == "le"  then "<="
-           else if pred.op == "eq"  then "="
-           else if pred.op == "neq" then "distinct"
-           else "?op";
+        l = staticEvalPred p.left;
+        r = staticEvalPred p.right;
       in
-      "(${smtOp} ${predToSMT pred.lhs} ${predToSMT pred.rhs})"
-    else if v == "PApp" then
-      "(${pred.fn} ${lib.concatStringsSep " " (map predToSMT pred.args)})"
-    else "?pred";
-
-  # Refined 约束 → SMT declare + assert + check-sat
-  refinedConstraintToSMT = varDecl: predVar: predExpr: baseSort:
-    let
-      smtSort = if baseSort == "Int" then "Int"
-           else if baseSort == "Bool" then "Bool"
-           else if baseSort == "String" then "String"
-           else "Int";  # fallback
-      body = substPredVar predVar varDecl predExpr;
-    in
-    lib.concatStringsSep "\n" [
-      "(declare-const ${varDecl} ${smtSort})"
-      "(assert (not ${predToSMT body}))"
-      "(check-sat)"
-    ];
-
-  # smtBridge：将 residual refined constraints 转成 SMT 脚本（INV-SMT-3）
-  smtBridge = residuals:
-    let
-      header = [
-        "; nix-types SMT residuals"
-        "(set-logic LIA)"
-      ];
-      bodies = lib.imap0 (i: c:
-        let
-          r       = (c.subject or { repr = {}; }).repr or {};
-          base    = r.base or {};
-          baseR   = base.repr or {};
-          baseSort = baseR.name or "Int";
-          predVar  = r.predVar  or "x";
-          predExpr = r.predExpr or PTrue;
-        in
-        refinedConstraintToSMT "x${builtins.toString i}" predVar predExpr baseSort
-      ) residuals;
-      footer = [ "(exit)" ];
-    in
-    lib.concatStringsSep "\n" (header ++ bodies ++ footer);
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # Refined 约束 IR（INV-SMT-1：ConstraintTag = "Refined"）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  mkRefinedConstraint = subject: predVar: predExpr: {
-    __constraintTag = "Refined";
-    inherit subject predVar predExpr;
-  };
-
-  # ── Refined 约束 solver step ─────────────────────────────────────────────────
-
-  # 简单静态求值（常量折叠）：可 discharge 的 trivial predicates
-  staticEvalPred = pred:
-    let v = pred.__pred or null; in
-    if v == "PTrue"  then { known = true;  value = true; }
-    else if v == "PFalse" then { known = true;  value = false; }
-    else if v == "PNot" then
-      let inner = staticEvalPred pred.body; in
-      if inner.known then { known = true; value = !inner.value; }
-      else { known = false; value = null; }
-    else if v == "PAnd" then
-      let
-        l = staticEvalPred pred.left;
-        r = staticEvalPred pred.right;
-      in
-      if l.known && !l.value then { known = true; value = false; }    # short-circuit
-      else if r.known && !r.value then { known = true; value = false; }
-      else if l.known && r.known  then { known = true; value = l.value && r.value; }
-      else { known = false; value = null; }
-    else if v == "POr" then
-      let
-        l = staticEvalPred pred.left;
-        r = staticEvalPred pred.right;
-      in
-      if l.known && l.value then { known = true; value = true; }
-      else if r.known && r.value then { known = true; value = true; }
-      else if l.known && r.known then { known = true; value = l.value || r.value; }
-      else { known = false; value = null; }
-    else if v == "PCmp" then
-      let
-        lEval = staticEvalPred pred.lhs;
-        rEval = staticEvalPred pred.rhs;
-      in
-      if lEval.known && rEval.known then
-        let
-          lv = lEval.value;
-          rv = rEval.value;
-          result = if pred.op == "gt"  then lv > rv
-              else if pred.op == "lt"  then lv < rv
-              else if pred.op == "ge"  then lv >= rv
-              else if pred.op == "le"  then lv <= rv
-              else if pred.op == "eq"  then lv == rv
-              else if pred.op == "neq" then lv != rv
-              else false;
-        in
-        { known = true; value = result; }
-      else { known = false; value = null; }
-    else { known = false; value = null; };
-
-  # 尝试 discharge Refined constraint
-  # Result: { discharged: Bool; residual: Constraint? }
-  tryDischargeRefined = c:
-    if c.__constraintTag or null != "Refined" then
-      { discharged = false; residual = c; }
-    else
-      let result = staticEvalPred c.predExpr; in
-      if result.known && result.value then
-        { discharged = true; residual = null; }
-      else if result.known && !result.value then
-        { discharged = false; residual = c; error = "predicate statically false"; }
+      if !l.discharged && !l.residual then  # l is statically false
+        { discharged = false; residual = false; simplExpr = mkPFalse; }
+      else if !r.discharged && !r.residual then  # r is statically false
+        { discharged = false; residual = false; simplExpr = mkPFalse; }
+      else if l.discharged && !l.residual && r.discharged && !r.residual then
+        { discharged = true; residual = false; simplExpr = mkPTrue; }
       else
-        { discharged = false; residual = c; };  # → SMT bridge
+        { discharged = false; residual = true;
+          simplExpr = mkPAnd l.simplExpr r.simplExpr; }
+    else if tag == "POr" then
+      let
+        l = staticEvalPred p.left;
+        r = staticEvalPred p.right;
+      in
+      if l.discharged && !l.residual then
+        { discharged = true; residual = false; simplExpr = mkPTrue; }
+      else if r.discharged && !r.residual then
+        { discharged = true; residual = false; simplExpr = mkPTrue; }
+      else
+        { discharged = false; residual = true;
+          simplExpr = mkPOr l.simplExpr r.simplExpr; }
+    else if tag == "PNot" then
+      let b = staticEvalPred p.body; in
+      if b.discharged && !b.residual then
+        { discharged = false; residual = false; simplExpr = mkPFalse; }
+      else if !b.discharged && !b.residual then
+        { discharged = true; residual = false; simplExpr = mkPTrue; }
+      else
+        { discharged = false; residual = true; simplExpr = mkPNot b.simplExpr; }
+    else if tag == "PCmp" then
+      let
+        lTag = p.lhs.__predTag or null;
+        rTag = p.rhs.__predTag or null;
+      in
+      if lTag == "PLit" && rTag == "PLit" then
+        let
+          lv = p.lhs.value;
+          rv = p.rhs.value;
+          op = p.op;
+          res = if op == "eq"  then lv == rv
+                else if op == "neq" then lv != rv
+                else if op == "lt"  then lv < rv
+                else if op == "le"  then lv <= rv
+                else if op == "gt"  then lv > rv
+                else if op == "ge"  then lv >= rv
+                else false;
+        in { discharged = res; residual = false; simplExpr = p; }
+      else
+        { discharged = false; residual = true; simplExpr = p; }
+    else
+      # PVar, PApp → SMT residual（INV-SMT-2: 无法静态求值）
+      { discharged = false; residual = true; simplExpr = p; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 子类型检查：Refined subtyping
-  # { n : T | φ } <: { n : T | ψ } ↔ ∀n:T. φ(n) → ψ(n)（SMT 残差）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ══ SMTLIB2 Bridge（INV-SMT-3: 标准格式输出）═════════════════════════════
 
+  # Type: PredExpr -> String
+  predToSMT = p:
+    let tag = p.__predTag or null; in
+    if tag == "PTrue"  then "true"
+    else if tag == "PFalse" then "false"
+    else if tag == "PAnd"  then "(and ${predToSMT p.left} ${predToSMT p.right})"
+    else if tag == "POr"   then "(or ${predToSMT p.left} ${predToSMT p.right})"
+    else if tag == "PNot"  then "(not ${predToSMT p.body})"
+    else if tag == "PVar"  then p.name
+    else if tag == "PLit"  then builtins.toString p.value
+    else if tag == "PCmp"  then
+      let
+        op = if p.op == "eq"  then "="
+             else if p.op == "neq" then "(not (= ${predToSMT p.lhs} ${predToSMT p.rhs}))"
+             else if p.op == "lt"  then "<"
+             else if p.op == "le"  then "<="
+             else if p.op == "gt"  then ">"
+             else if p.op == "ge"  then ">="
+             else "?";
+      in
+      if p.op == "neq" then op  # 已经是完整的 SMT 表达式
+      else "(${op} ${predToSMT p.lhs} ${predToSMT p.rhs})"
+    else if tag == "PApp"  then
+      "(${p.fn} ${lib.concatStringsSep " " (map predToSMT (p.args or []))})"
+    else "?";
+
+  # Type: String -> Type -> PredExpr -> String  (声明 predVar 的 SMTLIB2 类型)
+  _smtDeclare = predVar: baseType: predExpr:
+    let
+      smtSort = let n = baseType.repr.name or "?"; in
+        if n == "Int" || n == "Nat" then "Int"
+        else if n == "Bool" then "Bool"
+        else "Int";  # 默认 Int
+    in
+    "(declare-const ${predVar} ${smtSort})\n";
+
+  # Type: [{ subject; predVar; predExpr }] -> String
+  smtBridge = refinedConstraints:
+    let
+      decls = lib.concatMapStrings (c:
+        _smtDeclare c.predVar (c.subject or { repr = { name = "Int"; }; }) c.predExpr
+      ) refinedConstraints;
+      asserts = lib.concatMapStrings (c:
+        "(assert ${predToSMT c.predExpr})\n"
+      ) refinedConstraints;
+    in
+    "(set-logic LIA)\n" + decls + asserts + "(check-sat)\n";
+
+  # ══ Phase 4.1: Refined Subtype 自动化（INV-SMT-5）════════════════════════
+
+  # Refined subtype obligation：
+  # { n : T | φ(n) } <: { n : T | ψ(n) }
+  # ⟺ ∀n. φ(n) → ψ(n)（i.e., φ ∧ ¬ψ 不可满足）
+  # Type: Type -> Type -> RefinedSubtypeObligation
   refinedSubtypeObligation = sub: sup:
     let
-      subR = sub.repr or {};
-      supR = sup.repr or {};
+      subRepr = sub.repr;
+      supRepr = sup.repr;
+      sameBase = builtins.toJSON subRepr.base.repr ==
+                 builtins.toJSON supRepr.base.repr;
     in
-    if subR.__variant != "Refined" || supR.__variant != "Refined" then
-      { trivial = true; }
+    if !sameBase then
+      { ok = false; trivial = false; smtScript = "";
+        error = "Refined subtype: base types differ"; }
     else
       let
-        # rename supPredVar to match subPredVar for implication
-        phi  = subR.predExpr;
-        psi  = substPredVar supR.predVar subR.predVar supR.predExpr;
-        # obligation: ¬(φ → ψ) = φ ∧ ¬ψ should be UNSAT
-        obligation = PAnd phi (PNot psi);
-      in {
-        trivial    = false;
-        predVar    = subR.predVar;
-        obligation = obligation;
-        smtScript  = refinedConstraintToSMT subR.predVar subR.predVar obligation
-                       (subR.base.repr.name or "Int");
-      };
+        # 统一 predVar
+        predVar  = subRepr.predVar;
+        phiExpr  = subRepr.predExpr;
+        # ψ 可能使用不同 predVar，需替换
+        psiVar   = supRepr.predVar;
+        psiExpr  = if psiVar == predVar then supRepr.predExpr
+                   else _substPredVar psiVar predVar supRepr.predExpr;
+        # INV-SMT-6: 平凡情况不发送给 SMT
+        trivial  = isPTrue psiExpr
+                || (builtins.toJSON phiExpr == builtins.toJSON psiExpr);
+      in
+      if trivial then
+        { ok = true; trivial = true; smtScript = "";
+          obligation = { predVar = predVar; phi = phiExpr; psi = psiExpr; }; }
+      else
+        # 生成 SMTLIB2：验证 ∀n. φ(n) → ψ(n)
+        # 等价于：∃n. φ(n) ∧ ¬ψ(n) 不可满足
+        let
+          script =
+            "(set-logic LIA)\n" +
+            "(declare-const ${predVar} Int)\n" +
+            "(assert (and ${predToSMT phiExpr} (not ${predToSMT psiExpr})))\n" +
+            "(check-sat)\n";
+        in
+        { ok        = false;  # 需要 SMT oracle 才能确定
+          trivial   = false;
+          smtScript = script;
+          obligation = { predVar = predVar; phi = phiExpr; psi = psiExpr; };
+        };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 不变量验证
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  verifyRefinedInvariants = _:
+  # ── Phase 4.1: smtOracle 接口（INV-SMT-5 修复 RISK-风险2）───────────────
+  # smtOracle: String -> String（"sat" | "unsat" | "unknown"）
+  # 用户提供 oracle 函数（可调用 z3/cvc5 等）
+  # Type: Type -> Type -> (String -> String) -> CheckResult
+  checkRefinedSubtype = sub: sup: smtOracle:
     let
-      tInt     = mkTypeDefault (rPrimitive "Int") KStar;
-      posInt   = mkPosInt {};
-      # INV-SMT-1: Refined ∈ TypeRepr
-      invSMT1  = posInt.repr.__variant == "Refined";
+      subV = sub.repr.__variant or null;
+      supV = sup.repr.__variant or null;
+    in
+    if subV != "Refined" || supV != "Refined" then
+      { ok = false; error = "checkRefinedSubtype: both types must be Refined"; }
+    else
+      let obl = refinedSubtypeObligation sub sup; in
+      if obl.ok or false then
+        { ok = true; trivial = true; }  # 平凡成立
+      else if obl.error or null != null then
+        { ok = false; error = obl.error; }
+      else
+        let
+          smtResult = smtOracle obl.smtScript;
+        in
+        if smtResult == "unsat" then
+          { ok = true; trivial = false; witness = "SMT: unsat"; }
+        else if smtResult == "sat" then
+          { ok = false; trivial = false;
+            error = "Refined subtype failed (SMT: sat — counterexample exists)"; }
+        else
+          { ok = false; trivial = false;
+            error = "Refined subtype unknown (SMT: ${smtResult})"; };
 
-      # INV-SMT-4: serialize deterministic
-      s1 = serializePred (PGt (PVar "n") (PLit 0));
-      s2 = serializePred (PGt (PVar "n") (PLit 0));
-      invSMT4  = s1 == s2;
-
-      # INV-SMT-2: smtBridge = pure string
-      rc = mkRefinedConstraint posInt "n" (PGt (PVar "n") (PLit 0));
-      smt = smtBridge [ rc ];
-      invSMT2  = builtins.isString smt;
-
-      # staticEval trivial cases
-      trueDischarge  = tryDischargeRefined (mkRefinedConstraint tInt "n" PTrue);
-      invSMT3a = trueDischarge.discharged == true;
-
-      falseDischarge = tryDischargeRefined (mkRefinedConstraint tInt "n" PFalse);
-      invSMT3b = falseDischarge.discharged == false;
-
-    in {
-      allPass   = invSMT1 && invSMT2 && invSMT3a && invSMT3b && invSMT4;
-      "INV-SMT-1" = invSMT1;
-      "INV-SMT-2" = invSMT2;
-      "INV-SMT-3a" = invSMT3a;
-      "INV-SMT-3b" = invSMT3b;
-      "INV-SMT-4" = invSMT4;
-    };
+  # ── 谓词变量替换（用于 predVar 统一）────────────────────────────────────
+  _substPredVar = oldVar: newVar: p:
+    let tag = p.__predTag or null; in
+    if tag == "PVar" && p.name == oldVar then mkPVar newVar
+    else if tag == "PAnd" then
+      mkPAnd (_substPredVar oldVar newVar p.left)
+             (_substPredVar oldVar newVar p.right)
+    else if tag == "POr" then
+      mkPOr (_substPredVar oldVar newVar p.left)
+            (_substPredVar oldVar newVar p.right)
+    else if tag == "PNot" then
+      mkPNot (_substPredVar oldVar newVar p.body)
+    else if tag == "PCmp" then
+      mkPCmp p.op (_substPredVar oldVar newVar p.lhs) (_substPredVar oldVar newVar p.rhs)
+    else if tag == "PApp" then
+      mkPApp p.fn (map (_substPredVar oldVar newVar) (p.args or []))
+    else p;
 }

@@ -1,419 +1,346 @@
-# normalize/rules.nix — Phase 3.2
-# TRS 规则集（完整 Row canonical + Effect normalize 委托）
-#
-# Phase 3.2 新增：
-#   P3.2-5: ruleRowCanonical 完整 RowExtend spine sort（label 字母序）
-#   P3.2-6: ruleEffectNormalize 委托 row form（Effect = VariantRow）
-#   ruleRecordCanonical：Record 字段键排序（序列化层已保证，此处 repr 层同步）
-#
-# Phase 3.1 继承：
-#   三路 fuel：betaFuel / depthFuel / muFuel（INV-NF）
-#   Constructor-partial kind：真实 param.kind（INV-K1）
-#   Pi-reduction 完整
-#
-# 规则应用策略：innermost-leftmost（INV-NF2 幂等性依赖）
-{ lib, typeLib, reprLib, substLib, kindLib }:
+# normalize/rules.nix — Phase 4.1
+# TRS 规则集（合并 Phase 1.0 ~ 4.1 所有规则）
+# INV-2: 所有计算 = Rewrite(TypeIR)，可证明终止（fuel 保证）
+# 注：原 rules.nix / rules_p33.nix / rules_p40.nix 已合并到此文件
+{ lib, typeLib, reprLib, kindLib, substLib }:
 
 let
-  inherit (typeLib) isType mkTypeDefault mkTypeWith withRepr;
-  inherit (kindLib) KStar KUnbound KArrow kindInferRepr;
-  inherit (reprLib) rPrimitive rVar rLambda rApply rFn rADT rConstrained
-                   rRowEmpty rRowExtend;
+  inherit (typeLib) isType mkTypeWith mkTypeDefault;
+  inherit (kindLib) KStar KArrow KRow KEffect kindInferRepr kindEq;
+  inherit (reprLib)
+    rLambdaK rApply rFn rConstrained rRowExtend rRecord rVariantRow
+    rEffectMerge rEffect rRefined rSig
+    isApply isLambda isFn isConstrained isVariantRow isRowExtend
+    isRowEmpty isRecord isEffect isEffectMerge isRefined isSig;
   inherit (substLib) substitute substituteAll;
 
-in rec {
+  # ── 辅助：Row spine flatten ────────────────────────────────────────────────
+  # 将 RowExtend 链展开为 [(label, fieldType)] + tail
+  flattenRowSpine = t:
+    let v = t.repr.__variant or null; in
+    if v == "RowExtend" then
+      let rest = flattenRowSpine t.repr.rest; in
+      { entries = [ { l = t.repr.label; ft = t.repr.fieldType; } ] ++ rest.entries;
+        tail    = rest.tail; }
+    else
+      { entries = []; tail = t; };
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 三路 fuel 结构（INV-NF）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # 从排序后的 entries + tail 重建 RowExtend 链
+  rebuildRowSpine = entries: tail: mkKind:
+    lib.foldr
+      (e: acc:
+        let r = rRowExtend e.l e.ft acc; in
+        mkTypeWith r mkKind typeLib.mkTypeDefault null)  # kind/meta from tail
+      tail
+      entries;
 
-  mkFuel = beta: depth: mu:
-    { inherit beta depth mu; };
+  # ── VariantRow flatten ────────────────────────────────────────────────────
+  # 展开嵌套 VariantRow，收集所有 variant + 最终 tail
+  flattenVariantRow = t:
+    let v = t.repr.__variant or null; in
+    if v == "VariantRow" then
+      let
+        ext = t.repr.extension;
+        inner = if ext == null then { variants = {}; tail = null; }
+                else flattenVariantRow ext;
+      in
+      { variants = t.repr.variants // inner.variants;
+        tail     = inner.tail; }
+    else
+      { variants = {}; tail = t; };
 
-  defaultFuel = mkFuel 128 256 32;
-  minimalFuel = mkFuel 8   16  4;
-  deepFuel    = mkFuel 256 512 64;
+  # ── EffectMerge flatten ───────────────────────────────────────────────────
+  flattenEffectMerge = t:
+    let v = t.repr.__variant or null; in
+    if v == "EffectMerge" then
+      let
+        leftParts  = flattenEffectMerge t.repr.left;
+        rightParts = flattenEffectMerge t.repr.right;
+      in
+      { labels = leftParts.labels ++ rightParts.labels;
+        tail   = if leftParts.tail != null then leftParts.tail
+                 else rightParts.tail; }
+    else if v == "VariantRow" then
+      let
+        vnames = lib.sort (a: b: a < b) (builtins.attrNames (t.repr.variants or {}));
+      in
+      { labels = vnames;
+        tail   = t.repr.extension; }
+    else
+      { labels = []; tail = t; };
 
-  hasBeta  = fuel: (fuel.beta  or 0) > 0;
-  hasDepth = fuel: (fuel.depth or 0) > 0;
-  hasMu    = fuel: (fuel.mu    or 0) > 0;
+  # ── Rule 1: β-reduction ──────────────────────────────────────────────────
+  # Apply(Lambda(x, body), arg, ...) → substitute(x → arg, body) [Apply(...)]
+  # INV-2: TRS 核心规则
+  ruleBetaReduce = t:
+    if !(isApply t.repr) then null
+    else
+      let fn = t.repr.fn; in
+      if !(isLambda fn.repr) then null
+      else
+        let
+          args  = t.repr.args or [];
+          param = fn.repr.param;
+          body  = fn.repr.body;
+        in
+        if args == [] then null
+        else
+          let
+            body'    = substitute param (builtins.head args) body;
+            restArgs = builtins.tail args;
+          in
+          if restArgs == []
+          then body'
+          else mkTypeWith (rApply body' restArgs) t.kind t.meta;
 
-  consumeBeta  = fuel: fuel // { beta  = (fuel.beta  or 0) - 1; };
-  consumeDepth = fuel: fuel // { depth = (fuel.depth or 0) - 1; };
-  consumeMu    = fuel: fuel // { mu    = (fuel.mu    or 0) - 1; };
+  # ── Rule 2: Constructor partial apply ────────────────────────────────────
+  # Apply(Constructor(params, body), args) with arity check
+  # INV-K1: 部分应用时 kind 不使用 KStar 兜底
+  ruleConstructorPartial = t:
+    if !(isApply t.repr) then null
+    else
+      let fn = t.repr.fn; in
+      if (fn.repr.__variant or null) != "Constructor" then null
+      else
+        let
+          params   = fn.repr.params or [];
+          body     = fn.repr.body;
+          args     = t.repr.args or [];
+          nParams  = builtins.length params;
+          nArgs    = builtins.length args;
+        in
+        if nArgs == 0 then null
+        else if nArgs == nParams then
+          # 完全应用：展开 Constructor body
+          substituteAll params args body
+        else if nArgs < nParams then
+          # 部分应用：消耗前 nArgs 个参数，更新 params 和 kind
+          let
+            appliedParams  = lib.take nArgs params;
+            remainParams   = lib.drop nArgs params;
+            body'          = substituteAll appliedParams args body;
+            resultKind     = kindInferRepr body'.repr;
+            newKind = lib.foldr
+              (p: acc: KArrow (p.kind or KStar) acc)
+              resultKind
+              (map (pname: { kind = KStar; }) remainParams);  # INV-K1 简化
+            newCtor = fn.repr // { params = remainParams; body = body'; kind = newKind; };
+            newCtorType = mkTypeWith newCtor newKind fn.meta;
+          in mkTypeWith (rApply newCtorType []) t.kind t.meta
+        else null;  # nArgs > nParams — arity error，留给 kindCheck
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # 规则链（innermost-leftmost 顺序应用）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ── Rule 3: Constraint-merge ─────────────────────────────────────────────
+  # Constrained(Constrained(t, c1), c2) → Constrained(t, c1 ∪ c2)
+  ruleConstraintMerge = t:
+    if !(isConstrained t.repr) then null
+    else
+      let base = t.repr.base; in
+      if !(isConstrained base.repr) then null
+      else
+        let
+          innerBase = base.repr.base;
+          innerCs   = base.repr.constraints or [];
+          outerCs   = t.repr.constraints or [];
+        in
+        mkTypeWith (rConstrained innerBase (innerCs ++ outerCs)) t.kind t.meta;
 
-  # 所有规则按优先级排列：
-  # β/Pi/Constrained-float 优先（语义等价规则）
-  # Row canonical 次之（规范化规则）
-  # Mu unfold 最后（展开规则，需 muFuel）
+  # ── Rule 4: Constraint-float ─────────────────────────────────────────────
+  # Apply(Constrained(f, cs), args) → Constrained(Apply(f, args), cs)
+  ruleConstraintFloat = t:
+    if !(isApply t.repr) then null
+    else
+      let fn = t.repr.fn; in
+      if !(isConstrained fn.repr) then null
+      else
+        let
+          innerFn = fn.repr.base;
+          cs      = fn.repr.constraints or [];
+          applied = mkTypeWith (rApply innerFn (t.repr.args or [])) t.kind t.meta;
+        in
+        mkTypeWith (rConstrained applied cs) t.kind t.meta;
+
+  # ── Rule 5: RowExtend canonical（INV-ROW）────────────────────────────────
+  # 将 RowExtend spine 按 label 字母序排序 → canonical NF
+  ruleRowCanonical = t:
+    if !(isRowExtend t.repr) then null
+    else
+      let
+        spine   = flattenRowSpine t;
+        entries = spine.entries;
+        tail    = spine.tail;
+        sorted  = lib.sort (a: b: a.l < b.l) entries;
+        # 检查是否已排序
+        isSorted = sorted == entries;
+      in
+      if isSorted then null  # 已是 canonical，无需重写
+      else
+        # 重建：foldr 保证 inner-most label 在最后
+        let
+          rebuilt = lib.foldr
+            (e: acc:
+              let r = rRowExtend e.l e.ft acc; in
+              mkTypeWith r KRow typeLib.defaultMeta)
+            tail
+            sorted;
+        in rebuilt;
+
+  # ── Rule 6: Record canonical（去 null 字段）──────────────────────────────
+  ruleRecordCanonical = t:
+    if !(isRecord t.repr) then null
+    else
+      let
+        fields = t.repr.fields or {};
+        fnames = builtins.attrNames fields;
+        # 过滤掉值为 null 的字段
+        nonNull = builtins.filter (n: fields.${n} != null) fnames;
+        cleaned = builtins.listToAttrs (map (n: { name = n; value = fields.${n}; }) nonNull);
+        unchanged = builtins.length nonNull == builtins.length fnames;
+      in
+      if unchanged then null
+      else mkTypeWith (rRecord cleaned) t.kind t.meta;
+
+  # ── Rule 7: Effect canonical（VariantRow 字母序）─────────────────────────
+  # INV-EFF: VariantRow variants 按 label 字母序
+  ruleEffectNormalize = t:
+    if !(isEffect t.repr) then null
+    else
+      let
+        er = t.repr.effectRow;
+        erv = er.repr.__variant or null;
+      in
+      if erv != "VariantRow" then null
+      else
+        let
+          variants = er.repr.variants or {};
+          vnames   = builtins.attrNames variants;
+          sorted   = lib.sort (a: b: a < b) vnames;
+          isSorted = sorted == vnames;
+        in
+        if isSorted then null
+        else
+          let
+            sortedVars = builtins.listToAttrs (map (n: { name = n; value = variants.${n}; }) sorted);
+            newEr = mkTypeWith (rVariantRow sortedVars er.repr.extension) er.kind er.meta;
+          in mkTypeWith (rEffect newEr) t.kind t.meta;
+
+  # ── Rule 8: VariantRow canonical（Phase 4.0）─────────────────────────────
+  # INV-ROW-2: flatten nested VariantRow + sort + preserve open tail
+  ruleVariantRowCanonical = t:
+    if !(isVariantRow t.repr) then null
+    else
+      let
+        flat     = flattenVariantRow t;
+        allVars  = flat.variants;
+        tail     = flat.tail;
+        vnames   = builtins.attrNames allVars;
+        sorted   = lib.sort (a: b: a < b) vnames;
+        # 检查：已是 flat（extension 非 VariantRow）且 sorted
+        isFlatAlready = (t.repr.extension == null)
+                         || (t.repr.extension.repr.__variant or null) != "VariantRow";
+        isSorted = sorted == (lib.sort (a: b: a < b) (builtins.attrNames (t.repr.variants or {})));
+      in
+      if isFlatAlready && isSorted then null
+      else
+        let
+          sortedVars = builtins.listToAttrs
+            (map (n: { name = n; value = allVars.${n}; }) sorted);
+        in mkTypeWith (rVariantRow sortedVars tail) t.kind t.meta;
+
+  # ── Rule 9: EffectMerge open row（Phase 4.0 INV-EFF-6）──────────────────
+  # flatten + deduplicate labels + preserve RowVar tail
+  ruleEffectMerge = t:
+    if !(isEffectMerge t.repr) then null
+    else
+      let
+        parts    = flattenEffectMerge t;
+        labels   = parts.labels;
+        tail     = parts.tail;
+        # dedup（保留首次出现顺序）
+        deduped  = lib.foldl'
+          (acc: l: if builtins.elem l acc then acc else acc ++ [ l ])
+          []
+          labels;
+        sorted   = lib.sort (a: b: a < b) deduped;
+        # 如果 left 和 right 都已经是 VariantRow 且排好序，检查是否需要重写
+        already  = (t.repr.left.repr.__variant or null) == "VariantRow"
+                && (t.repr.right.repr.__variant or null) == "RowEmpty"
+                || false;
+      in
+      if already then null
+      else
+        let
+          # 重建成单个 VariantRow + open tail（RowVar 或 null）
+          varAttrs  = builtins.listToAttrs (map (l: { name = l; value = { __variant = "EffLabel"; }; }) sorted);
+          newVR = mkTypeWith (rVariantRow varAttrs tail) KEffect typeLib.defaultMeta;
+        in newVR;
+
+  # ── Rule 10: Refined base normalize（Phase 4.0）──────────────────────────
+  # Refined(PTrue, ...) → base（恒真谓词消除）
+  ruleRefined = t:
+    if !(isRefined t.repr) then null
+    else
+      let pe = t.repr.predExpr; in
+      let tag = pe.__predTag or pe.__variant or null; in
+      if tag == "PTrue" then t.repr.base  # 恒真：精化类型退化为 base
+      else if tag == "PFalse" then null   # 恒假：保留（在 solver 中报错）
+      else null;  # 非平凡谓词：保留
+
+  # ── Rule 11: Sig fields canonical（Phase 4.0 INV-MOD-4）─────────────────
+  # Sig fields 按字母序排序
+  ruleSig = t:
+    if !(isSig t.repr) then null
+    else
+      let
+        fields  = t.repr.fields or {};
+        fnames  = builtins.attrNames fields;
+        sorted  = lib.sort (a: b: a < b) fnames;
+        isSorted = sorted == fnames;
+      in
+      if isSorted then null
+      else
+        let
+          sortedFields = builtins.listToAttrs
+            (map (n: { name = n; value = fields.${n}; }) sorted);
+        in mkTypeWith (rSig sortedFields) t.kind t.meta;
+
+  # ── 规则优先级表（决定 confluence）───────────────────────────────────────
+  # 规则按优先级顺序排列，第一个成功的规则被应用
   allRules = [
-    ruleBetaReduce        # Apply(Lambda(p,b), arg) → b[p↦arg]
-    rulePiReduce          # Apply(Pi(p,A,B), arg) → B[p↦arg]
-    ruleConstructorFull   # Apply(Constructor(n,k,ps,b), args) → b[ps↦args]
-    ruleConstructorPartial # Constructor partial application kind fix
-    ruleConstrainedFloat  # Apply(Constrained(f,cs), arg) → Constrained(Apply(f,arg), cs)
-    ruleRowCanonical      # RowExtend chain → sorted by label（Phase 3.2 完整）
-    ruleRecordCanonical   # Record field sort（冗余，序列化已保证，此处 repr 对齐）
-    ruleEffectNormalize   # Effect row canonicalization（Phase 3.2）
-    ruleMuUnfold          # μ(α).T → T[α↦μ(α).T]（muFuel）
-    ruleFnDesugar         # Fn → Lambda（默认关闭）
+    ruleBetaReduce         # P1: β-reduction（计算核心，最高优先级）
+    ruleConstructorPartial # P2: Constructor 展开/部分应用
+    ruleConstraintMerge    # P3: Constraint 嵌套合并
+    ruleConstraintFloat    # P4: Constraint 上浮
+    ruleRowCanonical       # P5: Row 字母序规范化
+    ruleVariantRowCanonical# P6: VariantRow 规范化（P4.0）
+    ruleEffectMerge        # P7: EffectMerge open row（P4.0）
+    ruleRefined            # P8: Refined PTrue 消除（P4.0）
+    ruleSig                # P9: Sig fields 排序（P4.0）
+    ruleRecordCanonical    # P10: Record null 清理
+    ruleEffectNormalize    # P11: Effect VariantRow 排序
   ];
 
-  # 依次尝试所有规则，返回第一个成功的结果
-  # Type: Fuel -> Type -> { changed: Bool; type: Type }
-  applyRules = fuel: t:
+  # Type: Type -> Maybe Type（null = 无规则可用，当前 t 是 NF）
+  applyOneRule = t:
     let
-      go = rules:
-        if rules == [] then { changed = false; type = t; }
-        else
-          let
-            rule = builtins.head rules;
-            rest = builtins.tail rules;
-            r    = rule fuel t;
-          in
-          if r.changed then r
-          else go rest;
-    in
-    go allRules;
+      results = map (rule: rule t) allRules;
+      firstSuccess = lib.findFirst (r: r != null) null results;
+    in firstSuccess;
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE β-reduction（Apply(Lambda(p,b), arg) → b[p↦arg]）
-  # ══════════════════════════════════════════════════════════════════════════════
+  # shallow NF 检查（用于 normalize 引擎）
+  isNFShallow = t:
+    let v = t.repr.__variant or null; in
+    !(v == "Apply" && (
+      (t.repr.fn.repr.__variant or null) == "Lambda" ||
+      (t.repr.fn.repr.__variant or null) == "Constructor"
+    )) &&
+    !(isConstrained t.repr &&
+      (t.repr.base.repr.__variant or null) == "Constrained");
 
-  ruleBetaReduce = fuel: t:
-    if !hasBeta fuel then { changed = false; type = t; }
-    else
-      let repr = t.repr; in
-      if repr.__variant or null != "Apply" then { changed = false; type = t; }
-      else
-        let
-          fn   = repr.fn or null;
-          args = repr.args or [];
-        in
-        if fn == null || args == [] then { changed = false; type = t; }
-        else
-          let fnRepr = fn.repr or {}; in
-          if fnRepr.__variant or null != "Lambda" then { changed = false; type = t; }
-          else
-            let
-              param = fnRepr.param or "_";
-              body  = fnRepr.body or fn;
-              arg   = builtins.head args;
-              rest  = builtins.tail args;
-              reduced = substitute param arg body;
-            in
-            # 若还有剩余 args，构造 Apply(reduced, rest)
-            if rest == []
-            then { changed = true; type = reduced; }
-            else { changed = true;
-                   type = withRepr t (repr // { fn = reduced; args = rest; }); };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Pi-reduction（Apply(Pi(p,A,B), arg) → B[p↦arg]）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  rulePiReduce = fuel: t:
-    if !hasBeta fuel then { changed = false; type = t; }
-    else
-      let repr = t.repr; in
-      if repr.__variant or null != "Apply" then { changed = false; type = t; }
-      else
-        let fn = repr.fn or null; in
-        if fn == null then { changed = false; type = t; }
-        else
-          let fnRepr = fn.repr or {}; in
-          if fnRepr.__variant or null != "Pi" then { changed = false; type = t; }
-          else
-            let
-              param = fnRepr.param or "_";
-              body  = fnRepr.body or fn;
-              arg   = builtins.head (repr.args or []);
-              rest  = builtins.tail (repr.args or []);
-              reduced = substitute param arg body;
-            in
-            if rest == []
-            then { changed = true; type = reduced; }
-            else { changed = true;
-                   type = withRepr t (repr // { fn = reduced; args = rest; }); };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Constructor-full application（INV-K1）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleConstructorFull = fuel: t:
-    if !hasBeta fuel then { changed = false; type = t; }
-    else
-      let repr = t.repr; in
-      if repr.__variant or null != "Apply" then { changed = false; type = t; }
-      else
-        let fn = repr.fn or null; in
-        if fn == null then { changed = false; type = t; }
-        else
-          let fnRepr = fn.repr or {}; in
-          if fnRepr.__variant or null != "Constructor" then { changed = false; type = t; }
-          else
-            let
-              params = fnRepr.params or [];
-              args   = repr.args or [];
-              body   = fnRepr.body or null;
-            in
-            if body == null then { changed = false; type = t; }
-            else if builtins.length args < builtins.length params
-            then { changed = false; type = t; }  # partial application: handled by ruleConstructorPartial
-            else if builtins.length args == builtins.length params
-            then
-              # full application: substitute all params
-              let
-                subst = lib.listToAttrs
-                  (lib.imap0 (i: p: { name = p.name or "_"; value = builtins.elemAt args i; })
-                   params);
-                reduced = substituteAll subst body;
-              in
-              { changed = true; type = reduced; }
-            else
-              # over-application: apply params, return Apply of result
-              let
-                appliedArgs = lib.take (builtins.length params) args;
-                extraArgs   = lib.drop (builtins.length params) args;
-                subst = lib.listToAttrs
-                  (lib.imap0 (i: p: { name = p.name or "_"; value = builtins.elemAt appliedArgs i; })
-                   params);
-                reduced = substituteAll subst body;
-              in
-              { changed = true;
-                type = withRepr t (repr // { fn = reduced; args = extraArgs; }); };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Constructor-partial（INV-K1：正确 kind 推断）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleConstructorPartial = fuel: t:
-    if !hasBeta fuel then { changed = false; type = t; }
-    else
-      let repr = t.repr; in
-      if repr.__variant or null != "Apply" then { changed = false; type = t; }
-      else
-        let fn = repr.fn or null; in
-        if fn == null then { changed = false; type = t; }
-        else
-          let fnRepr = fn.repr or {}; in
-          if fnRepr.__variant or null != "Constructor" then { changed = false; type = t; }
-          else
-            let
-              params = fnRepr.params or [];
-              args   = repr.args or [];
-              body   = fnRepr.body or null;
-            in
-            if body == null || builtins.length args >= builtins.length params
-            then { changed = false; type = t; }
-            else
-              let
-                appliedN    = builtins.length args;
-                remainParams = lib.drop appliedN params;
-                # INV-K1 修复：使用 param 的真实 kind（不假设 KStar）
-                # kind of partial application = KArrow(remaining param kinds..., resultKind)
-                resultKind = kindInferRepr (fnRepr.body or fn).repr;
-                newKind = lib.foldr
-                  (p: acc: KArrow (p.kind or KStar) acc)
-                  resultKind
-                  remainParams;
-                newFn = fn // { kind = newKind; };
-              in
-              { changed = true;
-                type = withRepr t (repr // { fn = newFn; }); };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Constrained float
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleConstrainedFloat = fuel: t:
-    let repr = t.repr; in
-    if repr.__variant or null != "Apply" then { changed = false; type = t; }
-    else
-      let fn = repr.fn or null; in
-      if fn == null then { changed = false; type = t; }
-      else
-        let fnRepr = fn.repr or {}; in
-        if fnRepr.__variant or null != "Constrained" then { changed = false; type = t; }
-        else
-          let
-            inner = fnRepr.base or fn;
-            cs    = fnRepr.constraints or [];
-            newApply = withRepr t (repr // { fn = inner; });
-            floated  = withRepr t {
-              __variant   = "Constrained";
-              base        = newApply;
-              constraints = cs;
-            };
-          in
-          { changed = true; type = floated; };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Row canonical（Phase 3.2：完整 RowExtend spine sort）
-  #
-  # 语义：RowExtend 链代表行类型 { l₁: T₁ | { l₂: T₂ | ... | tail } }
-  # 规范形式：按 label 字母序排列，使不同顺序的 row 有相同 normal form
-  #
-  # 算法：
-  #   1. 展开 RowExtend 链，收集 (label, fieldType) 对 + tail
-  #   2. 按 label 字母序排序
-  #   3. 重建 RowExtend 链（最右 = tail）
-  #   4. 若顺序已是规范 → no change
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleRowCanonical = fuel: t:
-    let repr = t.repr; in
-    if repr.__variant or null != "RowExtend" then { changed = false; type = t; }
-    else
-      let
-        # 展开 RowExtend 链
-        # 返回 { fields: [{label; fieldType}]; tail: Type | null }
-        unspine = ty:
-          let r = ty.repr; in
-          if r.__variant or null != "RowExtend"
-          then { fields = []; tail = ty; }
-          else
-            let
-              inner = unspine (r.rest or ty);
-            in
-            { fields = [ { label = r.label or ""; fieldType = r.fieldType or ty; } ]
-                       ++ inner.fields;
-              tail   = inner.tail; };
-
-        spined = unspine t;
-        fields = spined.fields;
-        tail   = spined.tail;
-
-        # 检查是否已按字母序排列
-        labels = map (f: f.label) fields;
-        sortedLabels = lib.sort lib.lessThan labels;
-        alreadySorted = labels == sortedLabels;
-      in
-      if alreadySorted
-      then { changed = false; type = t; }
-      else
-        let
-          # 按 label 排序 fields
-          sortedFields = lib.sort (a: b: a.label < b.label) fields;
-
-          # 重建 RowExtend 链（右折叠）
-          rebuilt = lib.foldr
-            (f: acc:
-              mkTypeDefault
-                { __variant  = "RowExtend";
-                  label      = f.label;
-                  fieldType  = f.fieldType;
-                  rest       = acc; }
-                t.kind)
-            (if tail != null then tail
-             else mkTypeDefault { __variant = "RowEmpty"; } t.kind)
-            sortedFields;
-        in
-        { changed = true; type = rebuilt; };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Record canonical（字段 repr 层排序，与序列化层对齐）
-  #
-  # Nix AttrSet 本身无顺序，serialize 已保证字母序；
-  # 此规则确保 repr 层的 Record 在 normalize 流水线中有明确顺序语义
-  # Phase 3.2：确保 fields 不含 null 值（defensive clean）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleRecordCanonical = fuel: t:
-    let repr = t.repr; in
-    if repr.__variant or null != "Record" then { changed = false; type = t; }
-    else
-      let
-        fields = repr.fields or {};
-        # 过滤 null field（防御性：不应存在，但保留语义健壮性）
-        cleanFields = lib.filterAttrs (_: v: v != null) fields;
-        changed = builtins.attrNames cleanFields != builtins.attrNames fields;
-      in
-      if !changed
-      then { changed = false; type = t; }
-      else { changed = true; type = withRepr t (repr // { fields = cleanFields; }); };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Effect normalize（Phase 3.2：委托 row canonical）
-  #
-  # 语义：Effect = EffectTag + EffectRow
-  # EffectRow 本质是 VariantRow（effect handler 的 variant 集合）
-  # 规范化：effectRow 内部的 VariantRow 按名字字母序排列
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleEffectNormalize = fuel: t:
-    let repr = t.repr; in
-    if repr.__variant or null != "Effect" then { changed = false; type = t; }
-    else
-      let
-        effectRow = repr.effectRow or null;
-      in
-      if effectRow == null then { changed = false; type = t; }
-      else
-        let
-          erRepr = effectRow.repr or {};
-          erVariant = erRepr.__variant or null;
-        in
-        if erVariant != "VariantRow" then { changed = false; type = t; }
-        else
-          let
-            variants = erRepr.variants or {};
-            keys     = builtins.attrNames variants;
-            sortedKeys = lib.sort lib.lessThan keys;
-            alreadySorted = keys == sortedKeys;
-          in
-          if alreadySorted
-          then { changed = false; type = t; }
-          else
-            # 重建 VariantRow 保证 key 顺序（Nix attrSet 本身无序，序列化层处理）
-            # 此规则标记 changed=true 触发 hash 重算
-            let
-              sortedVariants = lib.listToAttrs
-                (map (k: { name = k; value = variants.${k}; }) sortedKeys);
-              newEffectRow = withRepr effectRow
-                (erRepr // { variants = sortedVariants; });
-            in
-            { changed = true;
-              type = withRepr t (repr // { effectRow = newEffectRow; }); };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Fn-desugar（Phase 3.2：仍默认关闭，bidir check 依赖 Fn repr）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleFnDesugar = fuel: t:
-    { changed = false; type = t; };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # RULE Mu-unfold（equi-recursive，muFuel 独立计数）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  ruleMuUnfold = fuel: t:
-    if !hasMu fuel then { changed = false; type = t; }
-    else
-      let
-        repr = t.repr;
-        var  = repr.var or "_";
-        body = repr.body or null;
-      in
-      if repr.__variant or null != "Mu" || body == null
-      then { changed = false; type = t; }
-      else
-        let
-          fuel'    = consumeMu fuel;
-          unfolded = substitute var t body;
-        in
-        { changed = true; type = unfolded; };
-
-  # ══════════════════════════════════════════════════════════════════════════════
-  # NF 检查（参数化，INV-NF2）
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  isNF = t:
-    let r = applyRules defaultFuel t; in
-    !r.changed;
-
+in {
+  inherit applyOneRule isNFShallow allRules
+          ruleBetaReduce ruleConstructorPartial
+          ruleConstraintMerge ruleConstraintFloat
+          ruleRowCanonical ruleVariantRowCanonical
+          ruleEffectMerge ruleRefined ruleSig
+          ruleRecordCanonical ruleEffectNormalize;
 }

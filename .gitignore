@@ -1,4 +1,4 @@
-./backup
-./*.txt
+backup
+*.txt
 
 
