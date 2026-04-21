@@ -215,7 +215,7 @@ in rec {
   typId  = tIntToBool;  # 错误的类型（演示 check 失败）
   typFn  = mkTypeDefault (rFn tInt tInt) KStar;  # 正确类型
 
-  test_bidir_check = {
+  test_bidir_check = rec {
     # check：λx.x : Int → Int（正确）
     checkOk   = check emptyCtx termId typFn;
     # infer：在 ctx[x:Int] 中 infer x
@@ -230,6 +230,7 @@ in rec {
   # 9. Pattern Matching + Decision Tree
   # ══════════════════════════════════════════════════════════════════════════════
 
+  # FIXME: Expecting "]" => `[; ]` <<== ';' is error
   # ADT：Result = Ok(Int) | Err(String)
   tResult = mkTypeDefault
     (rADT [mkVariant "Ok" [tInt] 0; mkVariant "Err" [tString] 1] true)
@@ -283,7 +284,7 @@ in rec {
   # 11. Hash 不变量验证
   # ══════════════════════════════════════════════════════════════════════════════
 
-  test_hash = {
+  test_hash = rec {
     # typeHash 确定性
     h1 = typeHash tInt;
     h2 = typeHash tInt;

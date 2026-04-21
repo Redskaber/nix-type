@@ -1,8 +1,8 @@
-# TODO-Phase3.md — Phase 3.1 完成状态 + Phase 4 规划
+# TODO-Phase3.md — Phase 3.2 完成状态 + Phase 3.3/4 规划
 
 ---
 
-## Phase 3.1 修复完成状态
+## Phase 3.1 修复完成状态（全部 ✅）
 
 | 修复编号 | 问题                                                 | 修复文件                                    | INV         | 状态 |
 | -------- | ---------------------------------------------------- | ------------------------------------------- | ----------- | ---- |
@@ -32,29 +32,44 @@
 
 ---
 
-## 当前已知限制（Phase 3.1 → 3.2 修复）
+## Phase 3.2 修复完成状态（全部 ✅）
 
-| 限制                                | 位置                    | 描述                                       | Phase |
-| ----------------------------------- | ----------------------- | ------------------------------------------ | ----- |
-| `bidir/_substTypeInType` 仅顶层 Var | `bidir/check.nix`       | 完整版需 substLib 集成                     | 3.2   |
-| `_unifyMu` bisimulation-based       | `constraint/unify.nix`  | 当前保守 alpha-canonical 近似              | 3.2   |
-| `_typeMentions` 仅顶层 Var          | `constraint/solver.nix` | 完整版需 freeVarsRepr 集成                 | 3.2   |
-| `_resolveViaSuper` 选择算法         | `runtime/instance.nix`  | 当前 lexicographic，应是 specificity-based | 3.2   |
-| INV-I2 overlap detection            | `runtime/instance.nix`  | 当前 exact match，应是 partial unification | 3.2   |
-| Row canonical sort                  | `normalize/rules.nix`   | `ruleRowCanonical` 仍 TODO                 | 3.2   |
-| Effect normalize                    | `normalize/rules.nix`   | Effect body normalize 委托                 | 3.2   |
+| 修复编号 | 问题                                                    | 修复文件                | INV      | 状态 |
+| -------- | ------------------------------------------------------- | ----------------------- | -------- | ---- |
+| P3.2-1   | `bidir/_substTypeInType` 仅顶层 Var                     | `bidir/check.nix`       | INV-DEP  | ✅   |
+| P3.2-2   | `_unifyMu` 仅 alpha-canonical（保守近似）               | `constraint/unify.nix`  | INV-MU   | ✅   |
+| P3.2-3   | INV-I2 overlap 仅 exact match                           | `runtime/instance.nix`  | INV-I2   | ✅   |
+| P3.2-4   | `_typeMentions` 仅顶层 Var                              | `constraint/solver.nix` | INV-SOL5 | ✅   |
+| P3.2-5   | `ruleRowCanonical` 为 no-op                             | `normalize/rules.nix`   | INV-ROW  | ✅   |
+| P3.2-6   | instance selection 使用 lexicographic（非 specificity） | `runtime/instance.nix`  | INV-SPEC | ✅   |
+| P3.2-X1  | `ruleEffectNormalize` 为 no-op                          | `normalize/rules.nix`   | INV-EFF  | ✅   |
+| P3.2-X2  | `_applySubstType` 仅顶层 Var（solver + unify 共用）     | `constraint/unify.nix`  | INV-SOL4 | ✅   |
+| P3.2-X3  | `partialUnify` API 缺失                                 | `constraint/unify.nix`  | INV-I2   | ✅   |
 
 ---
 
-## Phase 3.2 计划（当前限制修复）
+## 当前已知限制（Phase 3.3 目标）
+
+| 限制                                       | 位置                   | 描述                                                      | Phase |
+| ------------------------------------------ | ---------------------- | --------------------------------------------------------- | ----- |
+| Open record row unification 不完整         | `constraint/unify.nix` | 不同 rowVar 的 open record 统一需要 row constraint        | 3.3   |
+| Mu bisimulation up-to congruence           | `constraint/unify.nix` | 当前 guard set 是 syntactic pair；up-to 可处理更多情况    | 3.3   |
+| Effect row merge / intersection            | `normalize/rules.nix`  | Effect ++ Effect → merged row（需要 row concatenation）   | 3.3   |
+| `ruleRowCanonical` 跨 RowExtend/VariantRow | `normalize/rules.nix`  | 目前只处理 RowExtend；VariantRow 需要独立规则             | 3.3   |
+| Instance byClass 索引的 overlap 精确性     | `runtime/instance.nix` | 当前 partial unification 是保守 conservative overlap      | 3.3   |
+| `bidir/check` Match pattern 变量绑定完整性 | `bidir/check.nix`      | 当前 pattern vars 只处理 Var / Ctor；需 Record / Lit 模式 | 3.3   |
+
+---
+
+## Phase 3.3 计划
 
 ```
-P3.2-1: substLib 集成到 bidir/_substTypeInType（完整 dependent type check）
-P3.2-2: _unifyMu bisimulation（guard set + fuel，不是 alpha-canonical 近似）
-P3.2-3: INV-I2 overlap: partial unification overlap detection
-P3.2-4: _typeMentions 完整（freeVarsRepr 传播）
-P3.2-5: ruleRowCanonical 完整 RowExtend spine sort
-P3.2-6: specificity-based instance selection（最小特化）
+P3.3-1: Row unification 完整（open record pair 对齐，rowVar binding）
+P3.3-2: Mu bisimulation up-to congruence（不只 syntactic pair guard）
+P3.3-3: Effect row merge（row concatenation ++ 运算）
+P3.3-4: ruleVariantRowCanonical（独立于 ruleRowCanonical）
+P3.3-5: Pattern matching 完整变量绑定（Record / Lit / Guard patterns）
+P3.3-6: Instance overlap 精确 partial unification（完整 Robinson）
 ```
 
 ---
@@ -72,16 +87,29 @@ mkRefined = baseType: predFn:
 tPosInt = mkRefined tInt "gt_zero";
 ```
 
+**关键设计**：
+
+- Predicate 约束严格隔离（nix string-based，不带 IO）
+- solver residual 中的 Predicate → 传递给外部 SMT bridge
+- INV-6 保证：Predicate ∈ TypeRepr（不是函数）
+
 ### P4-2：Module System
 
 ```nix
 # Sig = record of types + values
-# Struct = implementation of Sig
-# Functor = Sig → Sig
 rSig     = fields: mkRepr "Sig"     { inherit fields; };
 rStruct  = sig: impl: mkRepr "Struct"  { inherit sig impl; };
 rFunctor = param: body: mkRepr "Functor" { inherit param body; };
+
+# Module sealing（Opaque repr）
+seal = mod: sig: mkTypeDefault (rOpaque sig (typeHash mod)) KStar;
 ```
+
+**关键设计**：
+
+- Functor application 生成局部 InstanceDB（隔离实例）
+- Sig checking = structural subtyping on Record types
+- Module sealing 使用已有的 rOpaque repr
 
 ### P4-3：Effect Handlers
 
@@ -89,49 +117,55 @@ rFunctor = param: body: mkRepr "Functor" { inherit param body; };
 # handle : Eff(E ++ R, A) → Handler(E, A, B) → Eff(R, B)
 mkHandler = effectTag: branches: returnType:
   mkTypeDefault (rADT (map mkHandlerBranch branches) true) KStar;
+
+# Effect row subtraction：Eff(E ++ R) - E → Eff(R)
+subtractEffect = effTy: tag:
+  ... # Phase 3.3 row merge 基础上实现
 ```
 
 ### P4-4：First-class Modules
 
 ```nix
-# Module signature
+# 与 P4-2 共享基础；Functor = Sig → Sig
 tSig = mkTypeDefault (rSig {
-  Eq   = tInt;
-  eq   = mkTypeDefault (rFn tInt (mkTypeDefault (rFn tInt tBool) KStar)) KStar;
+  Eq  = KStar;
+  eq  = mkTypeDefault (rFn tInt (mkTypeDefault (rFn tInt tBool) KStar)) KStar;
 }) KStar;
 ```
 
 ---
 
-## 架构风险矩阵（Phase 3.1 → 4）
+## 架构风险矩阵（Phase 3.2 → 4）
 
-| 风险                                   | 等级  | 缓解策略                                   |
-| -------------------------------------- | ----- | ------------------------------------------ |
-| Dependent type + fuel 张力（循环类型） | 🔴 高 | type/term fuel 独立计数                    |
-| Mu unification soundness               | 🟠 中 | bisimulation fuel + guard set（Phase 3.2） |
-| Effect row + Constraint 交互           | 🟠 中 | Effect = VariantRow（统一 TypeRepr）       |
-| SMT bridge 副作用污染 TypeIR           | 🔴 高 | 严格隔离：nix string-based SMT，不带入 IO  |
-| Functor + Instance 交互                | 🟠 中 | Functor application 生成局部 InstanceDB    |
-| Module sealing + nominal typing        | 🟡 低 | Opaque repr（已实现）+ rSig（Phase 4）     |
+| 风险                                      | 等级  | 缓解策略                                       |
+| ----------------------------------------- | ----- | ---------------------------------------------- |
+| Mu bisimulation fuel 设置过保守           | 🟡 低 | \_defaultMuFuel = 32，可配置；guard set 兜底   |
+| Specificity 在 HKT instance 上的语义      | 🟠 中 | HKT instance 的 Var 计数需要 kind-aware 版本   |
+| Row unification 和 Constraint solver 交互 | 🟠 中 | rowVar binding → 生成 Equality constraint      |
+| Effect merge 与 TypeRepr 闭包             | 🟠 中 | Effect = VariantRow（统一 TypeRepr）已为此铺垫 |
+| SMT bridge 副作用污染 TypeIR              | 🔴 高 | 严格隔离：nix string-based SMT，不带入 IO      |
+| Functor + Instance 交互                   | 🟠 中 | Functor application 生成局部 InstanceDB        |
+| Module sealing + nominal typing           | 🟡 低 | Opaque repr（已实现）+ rSig（Phase 4）         |
 
 ---
 
-## 测试覆盖状态
+## 测试覆盖状态（Phase 3.2）
 
-| 测试组             | 测试数 | 覆盖 INV     |
-| ------------------ | ------ | ------------ |
-| T1 基础 TypeIR     | 8      | INV-T1/2/3/4 |
-| T2 α-equivalence   | 4      | INV-SER3/EQ  |
-| T3 Kind            | 8      | INV-K1-6     |
-| T4 Constructor     | 2      | INV-K1 修复  |
-| T5 μ-types         | 3      | INV-EQ3      |
-| T6 HKT             | 3      | INV-K2       |
-| T7 Row             | 3      | INV-EQ4      |
-| T8 Instance        | 7      | INV-I1/2/3   |
-| T9 Solver          | 5      | INV-SOL1/4/5 |
-| T10 Graph          | 6      | INV-G1/4/5   |
-| T11 Memo           | 3      | INV-M1-4     |
-| T12 Pattern        | 5      | -            |
-| T13 INV 全量       | 6      | 所有 INV     |
-| T14 Phase 3.1 专项 | 6      | 修复验证     |
-| **合计**           | **69** |              |
+| 测试组             | 测试数 | 覆盖 INV               |
+| ------------------ | ------ | ---------------------- |
+| T1 基础 TypeIR     | 8      | INV-T1/2/3/4           |
+| T2 α-equivalence   | 4      | INV-SER3/EQ            |
+| T3 Kind            | 8      | INV-K1-6               |
+| T4 Constructor     | 2      | INV-K1                 |
+| T5 μ-types         | 5      | INV-EQ3/MU             |
+| T6 HKT             | 3      | INV-K2                 |
+| T7 Row             | 5      | INV-EQ4/ROW            |
+| T8 Instance        | 9      | INV-I1/2/SPEC          |
+| T9 Solver          | 7      | INV-SOL1/4/5           |
+| T10 Graph          | 6      | INV-G1/4/5             |
+| T11 Memo           | 3      | INV-M1-4               |
+| T12 Pattern        | 5      | -                      |
+| T13 INV 全量       | 8      | 所有 INV（含 P3.2 新） |
+| T14 Phase 3.1 专项 | 6      | 修复验证               |
+| T15 Phase 3.2 专项 | 9      | P3.2-1~6 + X1/X2/X3    |
+| **合计**           | **87** |                        |
