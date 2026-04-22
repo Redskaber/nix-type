@@ -1,6 +1,6 @@
 # lib/default.nix — Phase 4.2
 # 统一导出（Layer 0~22 拓扑顺序）
-# 所有 duplicate 名称通过命名空间前缀消歧义
+# Fix: unifyLib/unifyRowLib moved to Layer 14 (after unifiedSubstLib at Layer 13)
 { lib }:
 
 let
@@ -51,27 +51,29 @@ let
   };
 
   # ══ Layer 11 ═══════════════════════════════════════════════════════
-  unifyRowLib = import ../constraint/unify_row.nix {
-    inherit lib typeLib reprLib kindLib substLib normalizeLib;
-  };
-
-  unifyLib = import ../constraint/unify.nix {
-    inherit lib typeLib reprLib kindLib substLib hashLib normalizeLib;
-  };
-
-  # ══ Layer 12 ═══════════════════════════════════════════════════════
   instanceLib = import ../runtime/instance.nix {
     inherit lib typeLib reprLib kindLib hashLib normalizeLib;
   };
 
+  # ══ Layer 12 ═══════════════════════════════════════════════════════
+  refinedLib = import ../refined/types.nix {
+    inherit lib typeLib reprLib kindLib hashLib normalizeLib;
+  };
+
   # ══ Layer 13 ═══════════════════════════════════════════════════════
+  # unifiedSubstLib must come before unifyLib and unifyRowLib
   unifiedSubstLib = import ../normalize/unified_subst.nix {
     inherit lib typeLib reprLib kindLib substLib;
   };
 
   # ══ Layer 14 ═══════════════════════════════════════════════════════
-  refinedLib = import ../refined/types.nix {
-    inherit lib typeLib reprLib kindLib hashLib normalizeLib;
+  # Fix: pass unifiedSubstLib (was incorrectly using substLib for emptySubst etc.)
+  unifyRowLib = import ../constraint/unify_row.nix {
+    inherit lib typeLib reprLib kindLib substLib unifiedSubstLib normalizeLib;
+  };
+
+  unifyLib = import ../constraint/unify.nix {
+    inherit lib typeLib reprLib kindLib substLib unifiedSubstLib hashLib normalizeLib;
   };
 
   # ══ Layer 15 ═══════════════════════════════════════════════════════
@@ -164,8 +166,7 @@ in {
     isConstraint isEqConstraint isClassConstraint isPredConstraint
     isRowEqConstraint isRefinedConstraint mergeConstraints constraintKey;
 
-  # PredExpr constructors (canonical — from refinedLib for Refined semantics)
-  # Also available as pred.* namespace below
+  # PredExpr constructors（canonical from refinedLib）
   mkPTrue  = refinedLib.mkPTrue;
   mkPFalse = refinedLib.mkPFalse;
   mkPLit   = refinedLib.mkPLit;
@@ -186,11 +187,9 @@ in {
   inherit (instanceLib) mkInstance mkInstanceRecord registerInstance
                         lookupInstance resolveWithFallback canDischarge
                         checkGlobalCoherence mergeLocalInstances;
-  # 'emptyDB' disambiguation: instanceLib vs queryLib
   instanceEmptyDB = instanceLib.emptyDB;
   queryEmptyDB    = queryLib.emptyDB;
-  # Default emptyDB = queryLib (most commonly used directly)
-  emptyDB = queryLib.emptyDB;
+  emptyDB         = queryLib.emptyDB;
 
   # ══ Refined Types ══════════════════════════════════════════════════
   inherit (refinedLib) mkRefined isRefined refinedBase refinedPredVar refinedPredExp
@@ -230,15 +229,14 @@ in {
 
   # ══ Pattern Matching ═══════════════════════════════════════════════
   inherit (patternLib) mkPWild mkArm compileMatch checkExhaustive patternVars;
-  # Pattern constructors — disambiguated from PredExpr ones
   mkPCtor   = patternLib.mkPCtor;
   mkPRecord = patternLib.mkPRecord;
-  mkPAnd_p  = patternLib.mkPAnd;   # pattern AND (vs pred AND)
-  mkPVar_p  = patternLib.mkPVar;   # pattern Var (vs pred Var)
-  mkPLit_p  = patternLib.mkPLit;   # pattern Lit (vs pred Lit)
+  mkPAnd_p  = patternLib.mkPAnd;
+  mkPVar_p  = patternLib.mkPVar;
+  mkPLit_p  = patternLib.mkPLit;
   mkPGuard  = patternLib.mkPGuard;
 
-  # ══ Module namespace references (for advanced users) ═══════════════
+  # ══ Module namespace references ════════════════════════════════════
   __modules = {
     inherit kindLib serialLib metaLib typeLib reprLib substLib rulesLib
             normalizeLib hashLib equalityLib constraintLib unifyRowLib

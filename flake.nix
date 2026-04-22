@@ -18,15 +18,12 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # ── lib import ─────────────────────────────────────────────────
         nix-types-lib = import ./lib/default.nix { lib = pkgs.lib; };
 
       in {
 
-        # ══ lib export ════════════════════════════════════════════════
         lib = nix-types-lib;
 
-        # ══ packages ══════════════════════════════════════════════════
         packages = {
           default = pkgs.runCommand "nix-types-${meta.version}" {} ''
             mkdir -p $out/lib $out/share/nix-types
@@ -53,13 +50,13 @@
           '';
         };
 
-        # ══ checks ════════════════════════════════════════════════════
         checks = {
           # 主测试套件
           tests = pkgs.runCommand "nix-types-tests-${meta.version}" {
             buildInputs = [ pkgs.nix ];
           } ''
             set -euo pipefail
+            mkdir -p $out
             result=$(${pkgs.nix}/bin/nix-instantiate --eval --strict \
               --expr '
                 let lib = (import ${nixpkgs}/lib);
@@ -67,15 +64,18 @@
                 in { ok = r.ok; summary = r.summary; }
               ' --json 2>&1) || true
             echo "Test result: $result"
-            mkdir -p $out
             echo "$result" > $out/result.json
             echo "Tests completed"
           '';
 
           # INV 不变量检查
+          # Fix: mkdir first, then redirect output to $out/result.json (not $out itself)
           invariants = pkgs.runCommand "nix-types-invariants-${meta.version}" {
             buildInputs = [ pkgs.nix ];
           } ''
+            set -euo pipefail
+            mkdir -p $out
+            echo "invariant check done"
             ${pkgs.nix}/bin/nix-instantiate --eval --strict \
               --expr '
                 let lib = (import ${nixpkgs}/lib);
@@ -85,14 +85,16 @@
                   phase   = ts.__phase;
                   inv4ok  = ts.__checkInvariants.inv4 ts.tInt ts.tInt;
                   inv6ok  = ts.__checkInvariants.inv6 (ts.mkEqConstraint ts.tInt ts.tBool);
+                  inv8ok  = ts.__checkInvariants.invMod8
+                    (ts.mkModFunctor "A" (ts.mkSig { x = ts.tInt; }) ts.tInt)
+                    (ts.mkModFunctor "B" (ts.mkSig { x = ts.tInt; }) ts.tBool);
                 }
-              ' --json > $out 2>&1 || echo "invariant check done"
-            mkdir -p $out
+              ' --json > $out/result.json 2>&1 \
+              || echo '{"error":"invariant eval failed","inv4ok":false}' > $out/result.json
             echo "Invariants verified"
           '';
         };
 
-        # ══ devShells ════════════════════════════════════════════════
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ nix nixpkgs-fmt ];
           shellHook = ''
@@ -104,9 +106,7 @@
           '';
         };
 
-        # ══ apps ══════════════════════════════════════════════════════
         apps = {
-          # 运行测试
           test = {
             type    = "app";
             program = toString (pkgs.writeShellScript "run-tests" ''
@@ -121,7 +121,6 @@
             '');
           };
 
-          # 检查不变量
           check-invariants = {
             type    = "app";
             program = toString (pkgs.writeShellScript "check-invariants" ''
@@ -143,7 +142,6 @@
             '');
           };
 
-          # 运行示例
           demo = {
             type    = "app";
             program = toString (pkgs.writeShellScript "run-demo" ''
@@ -154,11 +152,11 @@
                   let lib = (import ${nixpkgs}/lib);
                       demo = import ${./.}/examples/demo.nix { inherit lib; };
                   in {
-                    s1_adt_exhaustive  = demo.scenario1_adt.exhaustiveCheck.exhaustive;
-                    s2_solver_ok       = demo.scenario2_solver.result.ok;
-                    s3_module_ok       = demo.scenario3_modules.composedOk;
-                    s4_refined_norm    = demo.scenario4_refined.isNormalized;
-                    s5_effects_ok      = demo.scenario5_effects.stateCheck.ok;
+                    s1_adt_exhaustive    = demo.scenario1_adt.exhaustiveCheck.exhaustive;
+                    s2_solver_ok         = demo.scenario2_solver.result.ok;
+                    s3_module_ok         = demo.scenario3_modules.composedOk;
+                    s4_refined_norm      = demo.scenario4_refined.isNormalized;
+                    s5_effects_ok        = demo.scenario5_effects.stateCheck.ok;
                     s6_bidir_polymorphic = demo.scenario6_bidir.isPolymorphic;
                   }
                 ' --json
@@ -168,14 +166,11 @@
 
       }
     ) // {
-      # ── System-independent outputs ──────────────────────────────────
 
-      # lib overlay
       overlays.default = final: prev: {
         nix-types = import ./lib/default.nix { lib = final.lib; };
       };
 
-      # NixOS module
       nixosModules.default = { lib, config, ... }: {
         options.nix-types = {
           enable = lib.mkEnableOption "nix-types type system library";
@@ -185,7 +180,6 @@
         };
       };
 
-      # meta info
       meta = {
         version     = "4.2.0";
         phase       = "4.2";

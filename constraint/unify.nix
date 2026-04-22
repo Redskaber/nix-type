@@ -1,12 +1,13 @@
 # constraint/unify.nix — Phase 4.2
 # Robinson unification（含 Row + Mu bisimulation guardset）
-{ lib, typeLib, reprLib, kindLib, substLib, hashLib, normalizeLib }:
+{ lib, typeLib, reprLib, kindLib, substLib, unifiedSubstLib, hashLib, normalizeLib }:
 
 let
   inherit (typeLib) isType mkTypeDefault freeVars;
   inherit (reprLib) rVar;
   inherit (kindLib) KStar;
-  inherit (substLib) singleTypeBinding composeSubst emptySubst applySubst;
+  # Fix: inherit from unifiedSubstLib, not substLib
+  inherit (unifiedSubstLib) singleTypeBinding composeSubst emptySubst applySubst;
   inherit (hashLib) typeHash;
   inherit (normalizeLib) normalize';
 
@@ -55,24 +56,17 @@ in rec {
       { ok = true; subst = singleTypeBinding varName t; };
 
   # ══ Unify Mu（bisimulation 近似，使用 guard set）════════════════════
-  # Phase 4.3 将用 congruence closure 替换
   _unifyMu = a: b: guardSet:
     let
       pairKey = "${typeHash a}:${typeHash b}";
     in
     if builtins.elem pairKey guardSet then
-      # 已在 guard set → assume equal（bisimulation 假设）
       { ok = true; subst = emptySubst; }
     else
       let
         newGuard = guardSet ++ [ pairKey ];
-        # 展开 Mu：μX.T → T[X := μX.T]
         unfoldMu = mu:
-          let
-            t = mu.repr;
-            selfRef = mkTypeDefault (rVar t.var "") KStar;
-          in
-          substLib.substitute t.var mu t.body;
+          substLib.substitute mu.repr.var mu mu.repr.body;
         aUnfolded = unfoldMu a;
         bUnfolded = unfoldMu b;
       in
@@ -170,7 +164,7 @@ in rec {
     else if va == "Forall" && vb == "Forall" then
       if typeHash na == typeHash nb then { ok = true; subst = emptySubst; }
       else { ok = false; error = "Forall mismatch"; }
-    # 11. Dynamic unifies with everything（Phase 5.0 gradual）
+    # 11. Dynamic unifies with everything（gradual）
     else if va == "Dynamic" || vb == "Dynamic" then
       { ok = true; subst = emptySubst; }
     # 12. Mismatch
@@ -178,17 +172,16 @@ in rec {
       { ok = false; error = "type mismatch: ${va} vs ${vb}"; };
 
   # ══ Public API ════════════════════════════════════════════════════════
-  # Type: Type → Type → { ok: Bool; subst: UnifiedSubst; error?: String }
   unify = a: b: _unify a b [];
 
-  # ══ 批量 unify（用于 ADT variant fields）════════════════════════════
+  # ══ 批量 unify ════════════════════════════════════════════════════════
   unifyAll = pairs:
     lib.foldl' (acc: pair:
       if !acc.ok then acc
       else
         let
-          a2 = substLib.applySubst acc.subst pair.fst;
-          b2 = substLib.applySubst acc.subst pair.snd;
+          a2 = applySubst acc.subst pair.fst;
+          b2 = applySubst acc.subst pair.snd;
           r  = unify a2 b2;
         in
         if !r.ok then r
