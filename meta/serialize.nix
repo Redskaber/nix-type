@@ -1,213 +1,223 @@
-# meta/serialize.nix — Phase 4.1
-# 确定性 canonical 序列化
-# INV-4: hash(t) = H(serialize(normalize(t)))
-# 相同语义类型 → 相同序列化 → 相同 hash
-# 注意：字段顺序必须固定（JSON attr ordering 在 Nix 中按字母序）
+# meta/serialize.nix — Phase 4.2
+# 规范序列化：canonical + deterministic
+# 关键：Lambda 使用 de Bruijn index（alpha-等价 → 相同序列化）
+# INV-4 前置：serialize(NF(a)) == serialize(NF(b)) ⟺ typeEq(a, b)
 { lib, kindLib }:
 
-rec {
-  # ── PredExpr 序列化 ────────────────────────────────────────────────────────
-  serializePred = p:
-    let t = p.__predTag or p.__variant or null; in
-    if t == "PTrue"  then { t = "PT"; }
-    else if t == "PFalse" then { t = "PF"; }
-    else if t == "PAnd"   then { t = "PA"; l = serializePred p.left; r = serializePred p.right; }
-    else if t == "POr"    then { t = "PO"; l = serializePred p.left; r = serializePred p.right; }
-    else if t == "PNot"   then { t = "PN"; b = serializePred p.body; }
-    else if t == "PCmp"   then { t = "PC"; op = p.op; l = serializePred p.lhs; r = serializePred p.rhs; }
-    else if t == "PVar"   then { t = "PV"; n = p.name; }
-    else if t == "PLit"   then { t = "PL"; v = builtins.toJSON p.value; }
-    else if t == "PApp"   then { t = "PP"; f = p.fn; a = map serializePred p.args; }
-    else { t = "P?"; };
+let
+  inherit (kindLib) serializeKind isKind;
 
-  # ── Constraint 序列化 ─────────────────────────────────────────────────────
+in rec {
+
+  # ══ De Bruijn 环境（alpha-规范化）════════════════════════════════════
+  # env: attrset name → de Bruijn index (Int)
+  # depth: 当前 lambda 深度
+
+  _serializeWithEnv = env: depth: r:
+    if !builtins.isAttrs r then builtins.toJSON r
+    else
+      let v = r.__variant or null; in
+      if v == null then builtins.toJSON r
+      else if v == "Primitive" then
+        "Prim(${r.name})"
+      else if v == "Var" then
+        let
+          idx   = env.${r.name} or null;
+          scope = if r ? scope then r.scope else "?";
+        in
+        if idx != null then "DB(${builtins.toString (depth - idx - 1)})"
+        else "Free(${r.name}@${scope})"
+      else if v == "Lambda" then
+        let
+          newDepth = depth + 1;
+          newEnv   = env // { ${r.param} = depth; };
+          bodyStr  = _serializeWithEnv newEnv newDepth r.body.repr;
+        in
+        "λ.${bodyStr}"
+      else if v == "Apply" then
+        let
+          fnStr   = _serializeWithEnv env depth r.fn.repr;
+          argStrs = map (a: _serializeWithEnv env depth a.repr) (r.args or []);
+        in
+        "(${fnStr} ${lib.concatStringsSep " " argStrs})"
+      else if v == "Fn" then
+        let
+          fromStr = _serializeWithEnv env depth r.from.repr;
+          toStr   = _serializeWithEnv env depth r.to.repr;
+        in
+        "(${fromStr} → ${toStr})"
+      else if v == "ADT" then
+        let
+          varStrs = map (vr:
+            "${vr.name}(${lib.concatStringsSep "," (map (f: _serializeWithEnv env depth f.repr) vr.fields)})"
+          ) (lib.sort (a: b: a.ordinal < b.ordinal) r.variants);
+        in
+        "ADT[${lib.concatStringsSep "|" varStrs}]${if r.closed then "!" else ""}"
+      else if v == "Constrained" then
+        let
+          baseStr = _serializeWithEnv env depth r.base.repr;
+          csStrs  = map (c: serializeConstraint c) (lib.sort (a: b:
+            builtins.toJSON a < builtins.toJSON b
+          ) r.constraints);
+        in
+        "Cs(${baseStr};${lib.concatStringsSep "," csStrs})"
+      else if v == "Mu" then
+        let
+          newDepth = depth + 1;
+          newEnv   = env // { ${r.var} = depth; };
+          bodyStr  = _serializeWithEnv newEnv newDepth r.body.repr;
+        in
+        "μ.${bodyStr}"
+      else if v == "Record" then
+        let
+          sortedFields = lib.sort (a: b: a < b) (builtins.attrNames r.fields);
+          fieldStrs = map (n:
+            "${n}:${_serializeWithEnv env depth r.fields.${n}.repr}"
+          ) sortedFields;
+        in
+        "{${lib.concatStringsSep "," fieldStrs}}"
+      else if v == "RowExtend" then
+        let tailStr = _serializeWithEnv env depth r.tail.repr; in
+        "(${r.label}:${_serializeWithEnv env depth r.ty.repr}|${tailStr})"
+      else if v == "RowEmpty" then
+        "()"
+      else if v == "VariantRow" then
+        let
+          sortedVars = lib.sort (a: b: a < b) (builtins.attrNames r.variants);
+          varStrs = map (n:
+            "${n}:${_serializeWithEnv env depth r.variants.${n}.repr}"
+          ) sortedVars;
+          tailStr = if r.tail != null then "|${_serializeWithEnv env depth r.tail.repr}" else "";
+        in
+        "VRow[${lib.concatStringsSep "," varStrs}${tailStr}]"
+      else if v == "Effect" then
+        let
+          rowStr = _serializeWithEnv env depth r.effectRow.repr;
+          resStr = _serializeWithEnv env depth r.resultType.repr;
+        in
+        "Eff(${rowStr},${resStr})"
+      else if v == "EffectMerge" then
+        let
+          e1Str = _serializeWithEnv env depth r.e1.repr;
+          e2Str = _serializeWithEnv env depth r.e2.repr;
+          # canonical: sorted to ensure confluence
+          sorted = lib.sort (a: b: a < b) [e1Str e2Str];
+        in
+        "EMerge(${lib.concatStringsSep "++" sorted})"
+      else if v == "Refined" then
+        let baseStr = _serializeWithEnv env depth r.base.repr; in
+        "Ref(${baseStr},${r.predVar},${serializePredExpr r.predExpr})"
+      else if v == "Sig" then
+        let
+          sortedFields = lib.sort (a: b: a < b) (builtins.attrNames r.fields);
+          fieldStrs = map (n:
+            "${n}:${_serializeWithEnv env depth r.fields.${n}.repr}"
+          ) sortedFields;
+        in
+        "Sig{${lib.concatStringsSep "," fieldStrs}}"
+      else if v == "Struct" then
+        let
+          sortedImpls = lib.sort (a: b: a < b) (builtins.attrNames r.impls);
+          implStrs = map (n:
+            "${n}=${_serializeWithEnv env depth r.impls.${n}.repr}"
+          ) sortedImpls;
+        in
+        "Struct{${lib.concatStringsSep "," implStrs}}"
+      else if v == "ModFunctor" then
+        "Functor(${r.param},${_serializeWithEnv env depth r.paramSig.repr},${_serializeWithEnv env depth r.body.repr})"
+      else if v == "Opaque" then
+        "Opaque(${r.tag},${_serializeWithEnv env depth r.inner.repr})"
+      else if v == "Forall" then
+        let
+          sortedVars = lib.sort builtins.lessThan r.vars;
+          newDepth   = depth + builtins.length sortedVars;
+          newEnv = lib.foldl' (acc: nv:
+            let idx = acc.depth; in
+            { env = acc.env // { ${nv} = idx; }; depth = idx + 1; }
+          ) { env = env; depth = depth; } sortedVars;
+          bodyStr = _serializeWithEnv newEnv.env newDepth r.body.repr;
+        in
+        "∀[${lib.concatStringsSep "," sortedVars}].${bodyStr}"
+      else if v == "Dynamic" then "Dyn"
+      else if v == "Hole" then "Hole(${r.holeId})"
+      else if v == "Pi" then
+        let
+          newDepth = depth + 1;
+          newEnv   = env // { ${r.param} = depth; };
+          bodyStr  = _serializeWithEnv newEnv newDepth r.body.repr;
+          ptStr    = _serializeWithEnv env depth r.paramType.repr;
+        in
+        "Π(${ptStr}).${bodyStr}"
+      else if v == "Constructor" then
+        let
+          paramStr = lib.concatStringsSep "," r.params;
+          bodyStr  = _serializeWithEnv env depth r.body.repr;
+        in
+        "Con(${r.name},[${paramStr}],${bodyStr})"
+      else "Unknown(${v})";
+
+  # ══ Constraint 序列化 ══════════════════════════════════════════════════
   serializeConstraint = c:
-    let tag = c.__constraintTag or c.__tag or null; in
-    if tag == "Equality"    then
-      { t = "EQ";
-        a = serializeRepr c.lhs.repr;
-        b = serializeRepr c.rhs.repr; }
-    else if tag == "Class"  then
-      { t = "CL";
-        n = c.className;
-        a = map (x: serializeRepr x.repr) (c.args or []); }
-    else if tag == "Predicate" then
-      { t = "PR";
-        fn = c.predName or c.fn or "?";
-        a  = serializeRepr (c.subject or c.arg or { __variant = "?"; }).repr; }
-    else if tag == "Implies" then
-      { t = "IM";
-        p = map serializeConstraint (c.premises or []);
-        c = serializeConstraint (c.conclusion or { __constraintTag = "?"; }); }
-    else if tag == "RowEquality" then
-      { t = "RE";
-        l = serializeRepr (c.lhsRow or { __variant = "?"; }).repr;
-        r = serializeRepr (c.rhsRow or { __variant = "?"; }).repr; }
-    else if tag == "Refined" then
-      { t = "RF";
-        s = serializeRepr (c.subject or { __variant = "?"; }).repr;
-        v = c.predVar or "?";
-        p = serializePred (c.predExpr or { __predTag = "PTrue"; }); }
-    else { t = "C?"; raw = builtins.toJSON c; };
+    if !builtins.isAttrs c then builtins.toJSON c
+    else
+      let tag = c.__constraintTag or null; in
+      if tag == "Equality" then
+        "Eq(${serializeRepr c.lhs.repr},${serializeRepr c.rhs.repr})"
+      else if tag == "Class" then
+        let argStrs = map (a: serializeRepr a.repr) (c.args or []); in
+        "Class(${c.className},[${lib.concatStringsSep "," argStrs}])"
+      else if tag == "Predicate" then
+        "Pred(${c.predName},${serializeRepr c.subject.repr})"
+      else if tag == "Implies" then
+        let
+          premStrs = map serializeConstraint c.premises;
+          concStr  = serializeConstraint c.conclusion;
+        in
+        "Impl([${lib.concatStringsSep "," premStrs}]→${concStr})"
+      else if tag == "RowEquality" then
+        "RowEq(${serializeRepr c.lhsRow.repr},${serializeRepr c.rhsRow.repr})"
+      else if tag == "Refined" then
+        "RefCons(${serializeRepr c.subject.repr},${c.predVar},${serializePredExpr c.predExpr})"
+      else builtins.toJSON c;
 
-  # ── Variant 序列化 ────────────────────────────────────────────────────────
-  serializeVariant = v: {
-    n  = v.name;
-    o  = v.ordinal;
-    fs = map (f: serializeRepr f.repr) (v.fields or []);
-  };
+  # ══ PredExpr 序列化（用于 Refined 类型）══════════════════════════════
+  serializePredExpr = pe:
+    if !builtins.isAttrs pe then builtins.toJSON pe
+    else
+      let tag = pe.__predTag or null; in
+      if tag == "PTrue"  then "⊤"
+      else if tag == "PFalse" then "⊥"
+      else if tag == "PLit"   then "Lit(${builtins.toJSON pe.value})"
+      else if tag == "PVar"   then "PVar(${pe.name})"
+      else if tag == "PCmp"   then
+        "Cmp(${pe.op},${serializePredExpr pe.lhs},${serializePredExpr pe.rhs})"
+      else if tag == "PAnd"   then
+        "And(${serializePredExpr pe.lhs},${serializePredExpr pe.rhs})"
+      else if tag == "POr"    then
+        "Or(${serializePredExpr pe.lhs},${serializePredExpr pe.rhs})"
+      else if tag == "PNot"   then
+        "Not(${serializePredExpr pe.body})"
+      else builtins.toJSON pe;
 
-  # ── Handler Branch 序列化 ─────────────────────────────────────────────────
-  serializeBranch = b: {
-    tag = b.effectTag or b.tag or "?";
-    ret = serializeRepr (b.body or b.returnType or { __variant = "?"; }).repr;
-  };
+  # ══ TypeRepr 序列化（public API）══════════════════════════════════════
+  # Type: TypeRepr → String（canonical，alpha-规范化）
+  serializeRepr = r:
+    _serializeWithEnv {} 0 r;
 
-  # ── TypeRepr 序列化（核心：必须 canonical）────────────────────────────────
-  # Type: TypeRepr -> AttrSet (JSON-serializable, deterministic)
-  serializeRepr = repr:
-    let v = repr.__variant or null; in
-    if v == "Primitive" then { v = "P"; n = repr.name; }
-
-    else if v == "Var" then
-      { v = "V"; n = repr.name; s = repr.scope or ""; }
-
-    else if v == "Lambda" then
-      # alpha-规范化：参数名参与序列化（de Bruijn 风格需要完整 rename 机制）
-      # Phase 4.1: 使用参数名 + body，依赖 capture-safe substitute 保证正确性
-      { v = "L";
-        p  = repr.param;
-        pk = kindLib.serializeKind (repr.paramKind or kindLib.KStar);
-        b  = serializeRepr repr.body.repr; }
-
-    else if v == "Apply" then
-      { v = "A";
-        f = serializeRepr repr.fn.repr;
-        a = map (x: serializeRepr x.repr) (repr.args or []); }
-
-    else if v == "Constructor" then
-      { v = "C";
-        n  = repr.name;
-        ps = repr.params or [];
-        b  = serializeRepr repr.body.repr; }
-
-    else if v == "Fn" then
-      { v = "F";
-        fr = serializeRepr repr.from.repr;
-        to = serializeRepr repr.to.repr; }
-
-    else if v == "ADT" then
-      { v = "D";
-        cl = repr.closed;
-        vs = map serializeVariant (repr.variants or []); }
-
-    else if v == "Constrained" then
-      { v = "CT";
-        b  = serializeRepr repr.base.repr;
-        # constraints 按 canonical 顺序序列化（sort by serialized form）
-        cs = let
-          raw = map serializeConstraint (repr.constraints or []);
-          sorted = lib.sort (a: b: builtins.toJSON a < builtins.toJSON b) raw;
-        in sorted; }
-
-    else if v == "Mu" then
-      { v = "MU"; var = repr.var; b = serializeRepr repr.body.repr; }
-
-    else if v == "Record" then
+  # Type: Type → String（完整 Type，含 kind）
+  serializeType = t:
+    if !builtins.isAttrs t || (t.tag or null) != "Type" then builtins.toJSON t
+    else
       let
-        fnames = lib.sort (a: b: a < b) (builtins.attrNames (repr.fields or {}));
-        fs = map (n: { k = n; t = serializeRepr repr.fields.${n}.repr; }) fnames;
-      in { v = "REC"; fs = fs; }
+        reprStr = serializeRepr t.repr;
+        kindStr = serializeKind t.kind;
+      in
+      "T(${reprStr}:${kindStr})";
 
-    else if v == "RowExtend" then
-      { v = "RE";
-        l  = repr.label;
-        ft = serializeRepr repr.fieldType.repr;
-        r  = serializeRepr repr.rest.repr; }
+  # ══ canonical hash（供 hashLib 使用）══════════════════════════════════
+  canonicalHash = t:
+    builtins.hashString "sha256" (serializeType t);
 
-    else if v == "RowEmpty" then { v = "R0"; }
-
-    else if v == "RowVar" then { v = "RV"; n = repr.name; }
-
-    else if v == "VariantRow" then
-      let
-        vnames = lib.sort (a: b: a < b) (builtins.attrNames (repr.variants or {}));
-        vs = map (n: { k = n; t = serializeRepr repr.variants.${n}.repr; }) vnames;
-        ext = if repr.extension == null then null
-              else serializeRepr repr.extension.repr;
-      in { v = "VR"; vs = vs; ext = ext; }
-
-    else if v == "Pi"    then
-      { v = "PI";
-        p  = repr.param;
-        d  = serializeRepr repr.domain.repr;
-        b  = serializeRepr repr.body.repr; }
-
-    else if v == "Sigma" then
-      { v = "SG";
-        p  = repr.param;
-        d  = serializeRepr repr.domain.repr;
-        b  = serializeRepr repr.body.repr; }
-
-    else if v == "Effect" then
-      { v = "EFF"; r = serializeRepr repr.effectRow.repr; }
-
-    else if v == "EffectMerge" then
-      { v = "EM";
-        l  = serializeRepr repr.left.repr;
-        r  = serializeRepr repr.right.repr; }
-
-    else if v == "Opaque" then
-      { v = "OP"; t = repr.tag; i = serializeRepr repr.inner.repr; }
-
-    else if v == "Ascribe" then
-      { v = "AS";
-        e = serializeRepr repr.expr.repr;
-        t = serializeRepr repr.type.repr; }
-
-    else if v == "Refined" then
-      { v = "RF";
-        b  = serializeRepr repr.base.repr;
-        pv = repr.predVar;
-        pe = serializePred repr.predExpr; }
-
-    else if v == "Sig" then
-      let
-        fnames = lib.sort (a: b: a < b) (builtins.attrNames (repr.fields or {}));
-        fs = map (n: { k = n; t = serializeRepr repr.fields.${n}.repr; }) fnames;
-      in { v = "SIG"; fs = fs; }
-
-    else if v == "Struct" then
-      { v = "STR";
-        sg = serializeRepr repr.sig.repr;
-        im = let
-          inames = lib.sort (a: b: a < b) (builtins.attrNames (repr.impl or {}));
-        in map (n: { k = n; t = serializeRepr repr.impl.${n}.repr; }) inames; }
-
-    else if v == "ModFunctor" then
-      { v = "MF";
-        p  = repr.param;
-        pt = serializeRepr repr.paramTy.repr;
-        b  = serializeRepr repr.body.repr; }
-
-    else if v == "Handler" then
-      { v = "HD";
-        e  = repr.effectTag;
-        bs = map serializeBranch (repr.branches or []);
-        rt = serializeRepr repr.returnType.repr; }
-
-    else if v == "Kind" then
-      { v = "KD"; f = builtins.toJSON (repr.form or {}); }
-
-    else { v = "?"; raw = builtins.toJSON repr; };
-
-  # ── canonical hash（INV-4 核心）──────────────────────────────────────────
-  # Type: TypeRepr -> String
-  canonicalHash = repr:
-    builtins.hashString "sha256"
-      (builtins.toJSON (serializeRepr repr));
-
-  # Type: Type -> String  (对完整 Type 结构 hash)
-  canonicalTypeHash = t:
-    canonicalHash t.repr;
+  canonicalHashRepr = r:
+    builtins.hashString "sha256" (serializeRepr r);
 }

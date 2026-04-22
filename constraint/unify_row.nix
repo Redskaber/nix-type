@@ -1,178 +1,133 @@
-# constraint/unify_row.nix — Phase 4.1
-# Row 合一（开放行多态）
-# 支持 RowVar（行变量）的合一
+# constraint/unify_row.nix — Phase 4.2
+# Row 多态 unification
 { lib, typeLib, reprLib, kindLib, substLib, normalizeLib }:
 
 let
-  inherit (typeLib) isType mkTypeWith mkTypeDefault;
-  inherit (reprLib) rRowExtend rRowEmpty rRowVar isRowEmpty isRowVar isRowExtend;
+  inherit (typeLib) isType mkTypeDefault mkTypeWith;
+  inherit (reprLib) rRowEmpty rRowExtend rVariantRow rVar;
   inherit (kindLib) KRow;
-  inherit (substLib) substitute;
+  inherit (substLib) singleRowBinding composeSubst emptySubst applySubst;
   inherit (normalizeLib) normalize';
 
-  # ── Row spine 展开 ────────────────────────────────────────────────────────
-  flattenRow = t:
-    let v = t.repr.__variant or null; in
-    if v == "RowExtend" then
-      let rest = flattenRow t.repr.rest; in
-      { entries = [ { label = t.repr.label; fieldType = t.repr.fieldType; } ] ++ rest.entries;
-        tail    = rest.tail; }
-    else
-      { entries = []; tail = t; };
+in rec {
 
-  # ── Row 重建 ──────────────────────────────────────────────────────────────
-  rebuildRow = entries: tail:
-    lib.foldr
-      (e: acc:
-        mkTypeDefault (rRowExtend e.label e.fieldType acc) KRow)
-      tail
-      entries;
+  # ══ Row 结构分析 ═══════════════════════════════════════════════════════
+  # Type: Type → { labels: {label→Type}; tail: Type|null }
+  _rowSpine = row:
+    let v = row.repr.__variant or null; in
+    if v == "RowEmpty" then { labels = {}; tail = null; }
+    else if v == "RowExtend" then
+      let inner = _rowSpine row.repr.tail; in
+      { labels = { ${row.repr.label} = row.repr.ty; } // inner.labels;
+        tail   = inner.tail; }
+    else if v == "VariantRow" then
+      { labels = row.repr.variants; tail = row.repr.tail; }
+    else if v == "Var" then
+      { labels = {}; tail = row; }
+    else { labels = {}; tail = row; };
 
-  # ── RowVar subst（行变量替换）────────────────────────────────────────────
-  applyRowVarSubst = rowSubst: t:
-    if !isType t then t
-    else
-      let v = t.repr.__variant or null; in
-      if v == "RowVar" then
-        let bound = rowSubst.${t.repr.name} or null; in
-        if bound == null then t else bound
-      else if v == "RowExtend" then
-        let
-          ft'   = applyRowVarSubst rowSubst t.repr.fieldType;
-          rest' = applyRowVarSubst rowSubst t.repr.rest;
-        in mkTypeWith (rRowExtend t.repr.label ft' rest') t.kind t.meta
-      else t;
-
-  # ── Row 合一主函数 ────────────────────────────────────────────────────────
-  # Type: AttrSet -> Type -> Type -> { ok; typeSubst; rowSubst; error? }
-  unifyRow = typeSubst: rowSubst: r1: r2:
+  # ══ Row 重建（从 labels + tail）══════════════════════════════════════
+  _rebuildRow = labels: tail:
     let
-      flat1 = flattenRow r1;
-      flat2 = flattenRow r2;
-      tail1 = flat1.tail;
-      tail2 = flat2.tail;
-      entries1 = flat1.entries;
-      entries2 = flat2.entries;
-
-      # 按 label 分组
-      labels1 = map (e: e.label) entries1;
-      labels2 = map (e: e.label) entries2;
-      allLabels = lib.unique (labels1 ++ labels2);
-
-      # 匹配公共 label
-      commonLabels = lib.filter (l: builtins.elem l labels1 && builtins.elem l labels2) allLabels;
-      only1        = lib.filter (l: builtins.elem l labels1 && !(builtins.elem l labels2)) allLabels;
-      only2        = lib.filter (l: !(builtins.elem l labels1) && builtins.elem l labels2) allLabels;
-
-      getField = entries: label:
-        let e = lib.findFirst (x: x.label == label) null entries; in
-        if e == null then null else e.fieldType;
-
-      # 合一公共 label 的类型
-      matchResult = lib.foldl'
-        (acc: label:
-          if !acc.ok then acc
-          else
-            let
-              ft1 = getField entries1 label;
-              ft2 = getField entries2 label;
-            in
-            if ft1 == null || ft2 == null
-            then { ok = false; typeSubst = acc.typeSubst; rowSubst = acc.rowSubst;
-                   error = "Row label ${label} missing"; }
-            else
-              # 使用类型合一（这里简化：hash 比较）
-              if builtins.toJSON ft1.repr == builtins.toJSON ft2.repr
-              then acc
-              else
-                let v1 = ft1.repr.__variant or null; in
-                if v1 == "Var" then
-                  { ok = true;
-                    typeSubst = acc.typeSubst // { ${ft1.repr.name} = ft2; };
-                    rowSubst  = acc.rowSubst; }
-                else
-                  let v2 = ft2.repr.__variant or null; in
-                  if v2 == "Var" then
-                    { ok = true;
-                      typeSubst = acc.typeSubst // { ${ft2.repr.name} = ft1; };
-                      rowSubst  = acc.rowSubst; }
-                  else
-                    { ok = false;
-                      typeSubst = acc.typeSubst;
-                      rowSubst  = acc.rowSubst;
-                      error = "Row field type mismatch at ${label}"; })
-        { ok = true; typeSubst = typeSubst; rowSubst = rowSubst; }
-        commonLabels;
-
-      # 处理 only1（r1 有但 r2 没有的 label）
-      # 如果 r2.tail 是 RowVar，可以扩展
-      # 如果 r2.tail 是 RowEmpty，则 r1 多出的 label 报错
-      result1 = matchResult;
+      sorted = lib.sort builtins.lessThan (builtins.attrNames labels);
+      base   = if tail == null then mkTypeDefault rRowEmpty KRow else tail;
     in
-    if !result1.ok then result1
+    lib.foldl' (acc: l:
+      mkTypeWith (rRowExtend l labels.${l} acc) KRow (acc.meta)
+    ) base (lib.reverseList sorted);
+
+  # ══ Row Unification（标准 row polymorphism）═══════════════════════════
+  # Type: Type → Type → { ok: Bool; subst: UnifiedSubst; error?: String }
+  unifyRow = a: b:
+    let
+      na = normalize' a;
+      nb = normalize' b;
+      sa = _rowSpine na;
+      sb = _rowSpine nb;
+
+      # Labels in a but not b
+      onlyA = lib.filterAttrs (l: _: !(sb.labels ? ${l})) sa.labels;
+      # Labels in b but not a
+      onlyB = lib.filterAttrs (l: _: !(sa.labels ? ${l})) sb.labels;
+      # Labels in both
+      common = lib.filterAttrs (l: _: sb.labels ? ${l}) sa.labels;
+
+      # Unify common fields
+      commonResult = lib.foldl' (acc: l:
+        if !acc.ok then acc
+        else
+          let
+            ta = applySubst acc.subst sa.labels.${l};
+            tb = applySubst acc.subst sb.labels.${l};
+            # Use type unification for field types
+            r  = _unifyTypes ta tb;
+          in
+          if !r.ok then r
+          else { ok = true; subst = composeSubst r.subst acc.subst; }
+      ) { ok = true; subst = emptySubst; }
+        (builtins.attrNames common);
+    in
+    if !commonResult.ok then commonResult
     else
-      let
-        vTail1 = tail1.repr.__variant or null;
-        vTail2 = tail2.repr.__variant or null;
+      let s0 = commonResult.subst; in
+      # Case 1: same labels, both closed
+      if onlyA == {} && onlyB == {} && sa.tail == null && sb.tail == null then
+        { ok = true; subst = s0; }
+      # Case 2: a has extra labels, b has row var tail
+      else if onlyA == {} && onlyB != {} && sa.tail != null then
+        # sa.tail = { onlyB | ? }
+        let
+          aVar = sa.tail;
+        in
+        if (aVar.repr.__variant or null) != "Var" then
+          { ok = false; error = "row tail mismatch: extra labels in b but a has non-var tail"; }
+        else
+          let
+            newRow = _rebuildRow onlyB sb.tail;
+            r      = singleRowBinding aVar.repr.name newRow;
+          in
+          { ok = true; subst = composeSubst r s0; }
+      # Case 3: b has extra labels, a has row var tail
+      else if onlyB == {} && onlyA != {} && sb.tail != null then
+        let
+          bVar = sb.tail;
+        in
+        if (bVar.repr.__variant or null) != "Var" then
+          { ok = false; error = "row tail mismatch: extra labels in a but b has non-var tail"; }
+        else
+          let
+            newRow = _rebuildRow onlyA sa.tail;
+            r      = singleRowBinding bVar.repr.name newRow;
+          in
+          { ok = true; subst = composeSubst r s0; }
+      # Case 4: both have extra labels + row vars → introduce fresh var
+      else if onlyA != {} && onlyB != {} && sa.tail != null && sb.tail != null then
+        if (sa.tail.repr.__variant or null) != "Var" ||
+           (sb.tail.repr.__variant or null) != "Var" then
+          { ok = false; error = "cannot unify open rows with non-var tails"; }
+        else
+          let
+            freshVar = mkTypeDefault (rVar "_r${builtins.hashString "sha256" (builtins.toJSON {a=sa;b=sb;})}" "") KRow;
+            rowForA  = _rebuildRow onlyB (if sb.tail != null then sb.tail else freshVar);
+            rowForB  = _rebuildRow onlyA (if sa.tail != null then sa.tail else freshVar);
+            r1       = singleRowBinding sa.tail.repr.name rowForA;
+            r2       = singleRowBinding sb.tail.repr.name rowForB;
+          in
+          { ok = true; subst = composeSubst (composeSubst r2 r1) s0; }
+      # Case 5: mismatch
+      else
+        { ok = false; error = "row label mismatch"; };
+
+  # 委托给 unify.nix（避免循环，使用简单的 hash 比较）
+  _unifyTypes = a: b:
+    if builtins.hashString "sha256" (builtins.toJSON a) ==
+       builtins.hashString "sha256" (builtins.toJSON b)
+    then { ok = true; subst = emptySubst; }
+    else
+      let va = a.repr.__variant or null;
+          vb = b.repr.__variant or null;
       in
-      # 两个尾都是 RowEmpty，且 only1/only2 都为空 → 完全匹配
-      if only1 == [] && only2 == [] && vTail1 == "RowEmpty" && vTail2 == "RowEmpty"
-      then { ok = true; typeSubst = result1.typeSubst; rowSubst = result1.rowSubst; }
-
-      # r1 多出 label，r2.tail 是 RowVar → 绑定 r2.tail = {only1} ++ r1.tail
-      else if only1 != [] && vTail2 == "RowVar" then
-        let
-          extra1 = lib.filter (l: builtins.elem l only1) labels1;
-          extraEntries = map (l: { label = l; fieldType = getField entries1 l; }) extra1;
-          extendedRow  = rebuildRow extraEntries tail1;
-          rowVarName   = tail2.repr.name;
-        in
-        if result1.rowSubst ? ${rowVarName} then
-          # 已有绑定，检查一致性（简化：不重合一）
-          result1
-        else
-          { ok = true;
-            typeSubst = result1.typeSubst;
-            rowSubst  = result1.rowSubst // { ${rowVarName} = extendedRow; }; }
-
-      # r2 多出 label，r1.tail 是 RowVar
-      else if only2 != [] && vTail1 == "RowVar" then
-        let
-          extra2 = lib.filter (l: builtins.elem l only2) labels2;
-          extraEntries = map (l: { label = l; fieldType = getField entries2 l; }) extra2;
-          extendedRow  = rebuildRow extraEntries tail2;
-          rowVarName   = tail1.repr.name;
-        in
-        if result1.rowSubst ? ${rowVarName} then result1
-        else
-          { ok = true;
-            typeSubst = result1.typeSubst;
-            rowSubst  = result1.rowSubst // { ${rowVarName} = extendedRow; }; }
-
-      # 两个 RowVar 互相绑定（引入新 RowVar 作为尾）
-      else if vTail1 == "RowVar" && vTail2 == "RowVar" && tail1.repr.name != tail2.repr.name then
-        let
-          freshRowVar = mkTypeDefault (rRowVar ("_r_" +
-            builtins.substring 0 8
-              (builtins.hashString "md5" "${tail1.repr.name}${tail2.repr.name}"))) KRow;
-          extra1Entries = map (l: { label = l; fieldType = getField entries1 l; }) only1;
-          extra2Entries = map (l: { label = l; fieldType = getField entries2 l; }) only2;
-          bound1 = rebuildRow extra2Entries freshRowVar;
-          bound2 = rebuildRow extra1Entries freshRowVar;
-        in
-        { ok = true;
-          typeSubst = result1.typeSubst;
-          rowSubst  = result1.rowSubst
-                   // { ${tail1.repr.name} = bound1; }
-                   // { ${tail2.repr.name} = bound2; }; }
-
-      # 不匹配的情况
-      else if only1 != [] || only2 != []
-      then { ok = false; typeSubst = result1.typeSubst; rowSubst = result1.rowSubst;
-             error = "Row labels unmatched: only-in-r1=${builtins.toJSON only1} only-in-r2=${builtins.toJSON only2}"; }
-
-      else result1;
-
-in {
-  inherit unifyRow flattenRow rebuildRow applyRowVarSubst;
+      if va == "Var" then { ok = true; subst = singleRowBinding a.repr.name b; }
+      else if vb == "Var" then { ok = true; subst = singleRowBinding b.repr.name a; }
+      else { ok = false; error = "type mismatch in row field"; };
 }

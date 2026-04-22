@@ -1,56 +1,56 @@
-# lib/default.nix — Phase 4.1
-# 统一导出入口：所有模块的聚合
-# 严格按依赖拓扑顺序（Layer 0 → 22）
+# lib/default.nix — Phase 4.2
+# 统一导出（Layer 0~22 拓扑顺序）
+# 所有 duplicate 名称通过命名空间前缀消歧义
 { lib }:
 
 let
-  # ── Layer 0: Kind ─────────────────────────────────────────────────────────
+
+  # ══ Layer 0 ════════════════════════════════════════════════════════
   kindLib = import ../core/kind.nix { inherit lib; };
 
-  # ── Layer 1: Serialize（仅依赖 lib + kindLib）─────────────────────────────
+  # ══ Layer 1 ════════════════════════════════════════════════════════
   serialLib = import ../meta/serialize.nix { inherit lib kindLib; };
 
-  # ── Layer 2: Meta ─────────────────────────────────────────────────────────
+  # ══ Layer 2 ════════════════════════════════════════════════════════
   metaLib = import ../core/meta.nix { inherit lib; };
 
-  # ── Layer 3: Type（依赖 kindLib + metaLib + serialLib）───────────────────
-  typeLib = import ../core/type.nix { inherit lib kindLib metaLib; };
+  # ══ Layer 3 ════════════════════════════════════════════════════════
+  typeLib = import ../core/type.nix {
+    inherit lib kindLib metaLib;
+  };
 
-  # ── Layer 4: Repr（依赖 typeLib + kindLib）────────────────────────────────
+  # ══ Layer 4 ════════════════════════════════════════════════════════
   reprLib = import ../repr/all.nix { inherit lib kindLib; };
 
-  # ── Layer 5: Subst（依赖 reprLib + typeLib）───────────────────────────────
+  # ══ Layer 5 ════════════════════════════════════════════════════════
   substLib = import ../normalize/substitute.nix {
     inherit lib typeLib reprLib kindLib;
   };
 
-  # ── Layer 6: Rules（依赖 substLib + kindLib + reprLib + typeLib）──────────
-  # Phase 4.1: 合并所有规则（不再有 rules_p33.nix / rules_p40.nix）
+  # ══ Layer 6 ════════════════════════════════════════════════════════
   rulesLib = import ../normalize/rules.nix {
     inherit lib typeLib reprLib kindLib substLib;
   };
 
-  # ── Layer 7: Normalize ────────────────────────────────────────────────────
+  # ══ Layer 7 ════════════════════════════════════════════════════════
   normalizeLib = import ../normalize/rewrite.nix {
-    inherit lib typeLib reprLib rulesLib kindLib;
+    inherit lib typeLib reprLib kindLib substLib rulesLib;
   };
 
-  # ── Layer 8: Hash ─────────────────────────────────────────────────────────
-  hashLib = import ../meta/hash.nix {
-    inherit lib typeLib normalizeLib serialLib;
-  };
+  # ══ Layer 8 ════════════════════════════════════════════════════════
+  hashLib = import ../meta/hash.nix { inherit lib serialLib; };
 
-  # ── Layer 9: Equality ─────────────────────────────────────────────────────
+  # ══ Layer 9 ════════════════════════════════════════════════════════
   equalityLib = import ../meta/equality.nix {
-    inherit lib typeLib normalizeLib serialLib hashLib;
+    inherit lib hashLib serialLib;
   };
 
-  # ── Layer 10: Constraint IR ───────────────────────────────────────────────
+  # ══ Layer 10 ═══════════════════════════════════════════════════════
   constraintLib = import ../constraint/ir.nix {
-    inherit lib typeLib reprLib kindLib serialLib;
+    inherit lib serialLib;
   };
 
-  # ── Layer 11: Unification ─────────────────────────────────────────────────
+  # ══ Layer 11 ═══════════════════════════════════════════════════════
   unifyRowLib = import ../constraint/unify_row.nix {
     inherit lib typeLib reprLib kindLib substLib normalizeLib;
   };
@@ -59,177 +59,216 @@ let
     inherit lib typeLib reprLib kindLib substLib hashLib normalizeLib;
   };
 
-  # ── Layer 12: Instance DB ─────────────────────────────────────────────────
+  # ══ Layer 12 ═══════════════════════════════════════════════════════
   instanceLib = import ../runtime/instance.nix {
     inherit lib typeLib reprLib kindLib hashLib normalizeLib;
   };
 
-  # ── Layer 13: UnifiedSubst ────────────────────────────────────────────────
+  # ══ Layer 13 ═══════════════════════════════════════════════════════
   unifiedSubstLib = import ../normalize/unified_subst.nix {
-    inherit lib typeLib kindLib reprLib substLib;
+    inherit lib typeLib reprLib kindLib substLib;
   };
 
-  # ── Layer 14: Refined Types ───────────────────────────────────────────────
+  # ══ Layer 14 ═══════════════════════════════════════════════════════
   refinedLib = import ../refined/types.nix {
     inherit lib typeLib reprLib kindLib hashLib normalizeLib;
   };
 
-  # ── Layer 15: Module System ───────────────────────────────────────────────
+  # ══ Layer 15 ═══════════════════════════════════════════════════════
   moduleLib = import ../module/system.nix {
     inherit lib typeLib reprLib kindLib normalizeLib hashLib unifiedSubstLib;
   };
 
-  # ── Layer 16: Effect Handlers ─────────────────────────────────────────────
+  # ══ Layer 16 ═══════════════════════════════════════════════════════
   effectLib = import ../effect/handlers.nix {
     inherit lib typeLib reprLib kindLib normalizeLib hashLib;
   };
 
-  # ── Layer 17: Solver（统一，合并 solver + solver_p40）────────────────────
+  # ══ Layer 17 ═══════════════════════════════════════════════════════
   solverLib = import ../constraint/solver.nix {
-    inherit lib typeLib reprLib kindLib
-            constraintLib substLib unifiedSubstLib
-            unifyLib unifyRowLib instanceLib
-            hashLib normalizeLib;
+    inherit lib typeLib reprLib kindLib constraintLib substLib unifiedSubstLib
+            unifyLib unifyRowLib instanceLib hashLib normalizeLib;
   };
 
-  # ── Layer 18: Bidirectional ───────────────────────────────────────────────
+  # ══ Layer 18 ═══════════════════════════════════════════════════════
   bidirLib = import ../bidir/check.nix {
-    inherit lib typeLib reprLib kindLib normalizeLib constraintLib substLib hashLib;
+    inherit lib typeLib reprLib kindLib normalizeLib constraintLib substLib unifiedSubstLib hashLib;
   };
 
-  # ── Layer 19: Incremental Graph ───────────────────────────────────────────
+  # ══ Layer 19 ═══════════════════════════════════════════════════════
   graphLib = import ../incremental/graph.nix { inherit lib; };
 
-  # ── Layer 20: Memo + Query ────────────────────────────────────────────────
-  memoLib  = import ../incremental/memo.nix { inherit lib hashLib; };
+  # ══ Layer 20 ═══════════════════════════════════════════════════════
+  memoLib  = import ../incremental/memo.nix  { inherit lib hashLib; };
   queryLib = import ../incremental/query.nix { inherit lib hashLib; };
 
-  # ── Layer 21: Pattern Matching ────────────────────────────────────────────
+  # ══ Layer 21 ═══════════════════════════════════════════════════════
   patternLib = import ../match/pattern.nix {
     inherit lib typeLib reprLib kindLib;
   };
 
-  # ── Phase 4.1 Meta ────────────────────────────────────────────────────────
-  meta = {
-    name        = "nix-types";
-    version     = "4.1.0";
-    phase       = "4.1";
-    description = "Pure Nix native type system — Phase 4.1";
-    license     = "MIT";
-    homepage    = "https://github.com/redskaber/nix-type";
+in {
 
-    capabilities = {
-      # Phase 1-3
-      kindSystem          = true;
-      systemFomega        = true;
-      dependentTypes      = true;
-      rowPolymorphism     = true;
-      effectSystem        = true;
-      equiRecursive       = true;
-      bidirectional       = true;
-      constraintSolver    = true;
-      instanceDB          = true;
-      patternMatching     = true;
-      incrementalGraph    = true;
-      memoization         = true;
-      openRowUnification  = true;
-      effectRowMerge      = true;
-      variantRowCanonical = true;
-      # Phase 4.0
-      refinedTypes        = true;
-      moduleSystem        = true;
-      effectHandlers      = true;
-      unifiedSubst        = true;
-      queryKeyIncremental = true;
-      # Phase 4.1 新增
-      smtOracleInterface  = true;   # checkRefinedSubtype with user-provided SMT
-      dualCacheConsistency = true;  # QueryDB + Memo 统一入口
-      qualifiedModuleName = true;   # ModFunctor qualified naming（RISK-E 修复）
-      queryKeyValidation  = true;   # schema validation（INV-QK-SCHEMA）
-      canDischargeSound   = true;   # impl != null 验证（RISK-A 修复）
-      nfHashInstanceKey   = true;   # NF-hash based instance key（RISK-B 修复）
-      worklistRequeue     = true;   # 真正 incremental worklist（INV-SOL5）
-      functorCompose      = true;   # composeFunctors（INV-MOD-6）
-      instanceMerge       = true;   # mergeLocalInstances（INV-MOD-7）
-      staleCleanState     = true;   # clean-stale FSM（INV-G2 修复）
-      topoSortFixed       = true;   # Kahn in-degree 方向修正（INV-G1）
-    };
+  # ══ Kind ═══════════════════════════════════════════════════════════
+  inherit (kindLib) KStar KArrow KRow KEffect KVar KUnbound
+                    isKind isStar isKArrow isKRow isKEffect isKVar
+                    kindEq kindArity applyKind applyKindSubst unifyKind
+                    serializeKind defaultKinds;
+
+  # ══ TypeRepr ═══════════════════════════════════════════════════════
+  inherit (reprLib)
+    rPrimitive rVar rLambda rApply rConstructor rFn rADT rConstrained
+    rMu rPi rSigma rRecord rRowExtend rRowEmpty rVariantRow rEffect
+    rEffectMerge rHandler rRefined rSig rStruct rModFunctor rOpaque
+    rForall rDynamic rHole mkVariant mkBranch mkBranchWithCont;
+
+  # ══ Meta ═══════════════════════════════════════════════════════════
+  inherit (metaLib) defaultMeta nominalMeta lazyMeta schemeMeta opaqueMeta
+                    mkMeta mergeMeta isMeta isNominal isLazy;
+
+  # ══ Type Universe ══════════════════════════════════════════════════
+  inherit (typeLib) mkTypeDefault mkTypeWith
+                    tInt tBool tString tFloat tUnit tPrim
+                    mkScheme monoScheme isScheme schemeBody schemeCons schemeForall
+                    isType freeVars typeRepr typeKind typeMeta typeId
+                    withRepr withKind withMeta;
+
+  # ══ Normalize ══════════════════════════════════════════════════════
+  inherit (normalizeLib) normalize' normalizeDeep normalizeWithFuel
+                         normalizeConstraint deduplicateConstraints isNormalForm;
+
+  # ══ Hash ═══════════════════════════════════════════════════════════
+  inherit (hashLib) typeHash reprHash constraintHash schemeHash substHash;
+
+  # ══ Equality ═══════════════════════════════════════════════════════
+  inherit (equalityLib) typeEq typeEqN constraintEq schemeEq alphaEq isSubtype;
+
+  # ══ Serialize ══════════════════════════════════════════════════════
+  inherit (serialLib) serializeRepr serializeType serializeConstraint
+                      canonicalHash canonicalHashRepr;
+
+  # ══ Substitute ═════════════════════════════════════════════════════
+  inherit (substLib) substitute substituteMany substituteParams applyUnifiedSubst;
+
+  # ══ UnifiedSubst ═══════════════════════════════════════════════════
+  inherit (unifiedSubstLib) emptySubst singleTypeBinding singleRowBinding singleKindBinding
+                            composeSubst applySubst applySubstToConstraints
+                            applySubstToConstraint fromLegacyTypeSubst fromLegacyRowSubst
+                            substDomain substRange isEmpty isSubst;
+
+  # ══ Constraint IR ══════════════════════════════════════════════════
+  inherit (constraintLib)
+    mkEqConstraint mkClassConstraint mkPredConstraint mkImpliesConstraint
+    mkRowEqConstraint mkRefinedConstraint mkSchemeConstraint mkKindConstraint
+    mkInstanceConstraint
+    isConstraint isEqConstraint isClassConstraint isPredConstraint
+    isRowEqConstraint isRefinedConstraint mergeConstraints constraintKey;
+
+  # PredExpr constructors (canonical — from refinedLib for Refined semantics)
+  # Also available as pred.* namespace below
+  mkPTrue  = refinedLib.mkPTrue;
+  mkPFalse = refinedLib.mkPFalse;
+  mkPLit   = refinedLib.mkPLit;
+  mkPVar   = refinedLib.mkPVar;
+  mkPCmp   = refinedLib.mkPCmp;
+  mkPAnd   = refinedLib.mkPAnd;
+  mkPOr    = refinedLib.mkPOr;
+  mkPNot   = refinedLib.mkPNot;
+
+  # ══ Unify ══════════════════════════════════════════════════════════
+  inherit (unifyLib) unify unifyAll occursIn;
+  inherit (unifyRowLib) unifyRow;
+
+  # ══ Solver ═════════════════════════════════════════════════════════
+  inherit (solverLib) solve solveSimple getTypeSubst getRowSubst;
+
+  # ══ Instance DB ════════════════════════════════════════════════════
+  inherit (instanceLib) mkInstance mkInstanceRecord registerInstance
+                        lookupInstance resolveWithFallback canDischarge
+                        checkGlobalCoherence mergeLocalInstances;
+  # 'emptyDB' disambiguation: instanceLib vs queryLib
+  instanceEmptyDB = instanceLib.emptyDB;
+  queryEmptyDB    = queryLib.emptyDB;
+  # Default emptyDB = queryLib (most commonly used directly)
+  emptyDB = queryLib.emptyDB;
+
+  # ══ Refined Types ══════════════════════════════════════════════════
+  inherit (refinedLib) mkRefined isRefined refinedBase refinedPredVar refinedPredExp
+                       staticEvalPred checkRefinedSubtype defaultSmtOracle
+                       normalizeRefined tPositiveInt tNonNegInt tNonEmptyString;
+
+  # ══ Module System ══════════════════════════════════════════════════
+  inherit (moduleLib) mkSig mkStruct mkModFunctor applyFunctor
+                      composeFunctors composeFunctorChain
+                      sigCompatible sigMerge seal unseal structField
+                      isSig isStruct isModFunctor;
+
+  # ══ Effect Handlers ════════════════════════════════════════════════
+  inherit (effectLib) mkHandler mkDeepHandler mkShallowHandler isHandler
+                      emptyEffectRow singleEffect effectMerge
+                      checkHandler handleAll subtractEffect
+                      deepHandlerCovers shallowHandlerResult checkEffectWellFormed;
+
+  # ══ Bidirectional Inference ════════════════════════════════════════
+  inherit (bidirLib) infer check generalize
+                     eVar eLam eLamA eApp eLet eAnn eIf ePrim eLit;
+
+  # ══ Incremental Graph ══════════════════════════════════════════════
+  inherit (graphLib) emptyGraph addNode removeNode addEdge removeEdge
+                     invalidateNode topologicalSort hasCycle reachable
+                     markStale markClean nodeState isClean isStale;
+
+  # ══ Memo ═══════════════════════════════════════════════════════════
+  inherit (memoLib) emptyMemo storeNormalize lookupNormalize
+                    storeSubstitute lookupSubstitute storeSolve lookupSolve
+                    bumpEpoch currentEpoch;
+
+  # ══ QueryDB ════════════════════════════════════════════════════════
+  inherit (queryLib) mkQueryKey storeResult lookupResult
+                     invalidateKey cacheNormalize bumpEpochDB
+                     hasDependencyCycle cacheStats;
+
+  # ══ Pattern Matching ═══════════════════════════════════════════════
+  inherit (patternLib) mkPWild mkArm compileMatch checkExhaustive patternVars;
+  # Pattern constructors — disambiguated from PredExpr ones
+  mkPCtor   = patternLib.mkPCtor;
+  mkPRecord = patternLib.mkPRecord;
+  mkPAnd_p  = patternLib.mkPAnd;   # pattern AND (vs pred AND)
+  mkPVar_p  = patternLib.mkPVar;   # pattern Var (vs pred Var)
+  mkPLit_p  = patternLib.mkPLit;   # pattern Lit (vs pred Lit)
+  mkPGuard  = patternLib.mkPGuard;
+
+  # ══ Module namespace references (for advanced users) ═══════════════
+  __modules = {
+    inherit kindLib serialLib metaLib typeLib reprLib substLib rulesLib
+            normalizeLib hashLib equalityLib constraintLib unifyRowLib
+            unifyLib instanceLib unifiedSubstLib refinedLib moduleLib
+            effectLib solverLib bidirLib graphLib memoLib queryLib patternLib;
   };
 
-in {
-  # ── 所有库导出 ────────────────────────────────────────────────────────────
-  inherit
-    kindLib serialLib metaLib typeLib reprLib substLib
-    rulesLib normalizeLib hashLib equalityLib
-    constraintLib unifyLib unifyRowLib
-    instanceLib unifiedSubstLib
-    refinedLib moduleLib effectLib
-    solverLib bidirLib
-    graphLib memoLib queryLib
-    patternLib;
+  # ══ Version ════════════════════════════════════════════════════════
+  __version = "4.2.0";
+  __phase   = "4.2";
 
-  # ── Meta 信息 ─────────────────────────────────────────────────────────────
-  inherit meta;
+  # ══ INV verification ═══════════════════════════════════════════════
+  __checkInvariants = {
+    inv4 = a: b:
+      if equalityLib.typeEq a b
+      then hashLib.typeHash a == hashLib.typeHash b
+      else true;
 
-  # ── 顶层便捷 API（常用函数直接导出）──────────────────────────────────────
-  inherit (typeLib)    mkTypeDefault mkTypeWith isType;
-  inherit (kindLib)    KStar KArrow KRow KEffect kindInferRepr kindEq;
-  inherit (reprLib)
-    rPrimitive rVar rVarK rLambda rLambdaK rApply rConstructor rFn rADT
-    rConstrained rMu rRecord rRowExtend rRowEmpty rRowVar rVariantRow
-    rPi rSigma rEffect rEffectMerge rOpaque rAscribe
-    rRefined rSig rStruct rModFunctor rHandler
-    mkVariant;
-  inherit (constraintLib)
-    mkEqConstraint mkClassConstraint mkPredConstraint
-    mkImpliesConstraint mkRowEqConstraint mkRefinedConstraint
-    normalizeConstraint deduplicateConstraints constraintKey;
-  inherit (normalizeLib)  normalize' normalizeWithFuel;
-  inherit (equalityLib)   typeEq reprEq;
-  inherit (hashLib)       typeHash instanceKey;
-  inherit (unifiedSubstLib)
-    emptySubst singleTypeBinding singleRowBinding
-    composeSubst applyUnifiedSubst fromLegacyTypeSubst fromLegacyRowSubst;
-  inherit (solverLib)     solve solveSimple solveOne;
-  inherit (instanceLib)
-    emptyDB registerInstance resolveWithFallback canDischarge listInstances;
-  inherit (refinedLib)
-    mkRefined mkPositiveInt mkNonNegInt
-    staticEvalPred smtBridge refinedSubtypeObligation checkRefinedSubtype
-    mkPTrue mkPFalse mkPAnd mkPOr mkPNot mkPCmp mkPVar mkPLit mkPApp;
-  inherit (moduleLib)
-    mkSig mkStruct mkModFunctor checkSig applyFunctor
-    composeFunctors seal unseal mergeLocalInstances;
-  inherit (effectLib)
-    mkHandler mkDeepHandler mkShallowHandler effectMerge
-    checkHandler handleAll subtractEffect;
-  inherit (queryLib)
-    emptyQueryDB mkQueryKey storeResult lookupResult
-    invalidateKey detectCycle bumpEpochDB cacheNormalize;
-  inherit (patternLib)
-    mkPatConstructor mkPatVar mkPatWildcard mkPatLiteral mkPatOr mkPatRecord
-    mkArm compileMatch checkExhaustive;
+    inv6 = c: constraintLib.isConstraint c;
 
-  # ── p41 namespace（Phase 4.1 专属 API）───────────────────────────────────
-  p41 = {
-    # 双缓存统一操作
-    cacheNormalize      = queryLib.cacheNormalize;
-    cacheHash           = queryLib.cacheHash;
-    bumpEpochDB         = queryLib.bumpEpochDB;
-    # Refined subtype 自动化
-    checkRefinedSubtype = refinedLib.checkRefinedSubtype;
-    # ModFunctor qualified naming
-    applyFunctor        = moduleLib.applyFunctor;
-    composeFunctors     = moduleLib.composeFunctors;
-    # QueryKey validation
-    validateQueryKey    = queryLib.validateQueryKey;
-    mkQueryKey          = queryLib.mkQueryKey;
-    # Effect Handler continuations
-    mkDeepHandler       = effectLib.mkDeepHandler;
-    mkShallowHandler    = effectLib.mkShallowHandler;
-    # Graph stale-clean
-    markStale           = graphLib.markStale;
-    STATE_CLEAN_STALE   = graphLib.STATE_CLEAN_STALE;
-    STATE_CLEAN_VALID   = graphLib.STATE_CLEAN_VALID;
+    invMod8 = f1: f2:
+      let composed = moduleLib.composeFunctors f1 f2; in
+      moduleLib.isModFunctor composed;
+
+    invBidir1 = ctx: expr:
+      let r = bidirLib.infer ctx expr; in
+      r ? type && r ? constraints;
+
+    invScheme1 = ctx: ty: cs:
+      let s = bidirLib.generalize ctx ty cs; in
+      typeLib.isScheme s || builtins.isAttrs s;
   };
 }

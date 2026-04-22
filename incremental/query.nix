@@ -1,203 +1,122 @@
-# incremental/query.nix — Phase 4.1
-# QueryKey 增量管道（Salsa-style）
-# 修复 RISK-D：双缓存一致性（QueryDB + Memo 统一入口）
-# INV-QK1: QueryKey 确定性（所有 key 通过 mkQueryKey 构造）
-# INV-QK2: 精确失效（BFS，仅失效依赖此 key 的查询）
-# INV-QK3: storeResult 原子（数据 + deps 同时存储）
-# INV-QK4: invalidateKey 传播完整（BFS visited set）
-# INV-QK5: 循环检测（DFS cycle detection）
-# Phase 4.1 新增：
-#   - QueryKey schema validation（防止手写 key 冲突）
-#   - cacheNormalize 统一入口（同步两层缓存）
-#   - bumpEpochDB 同步两层缓存（保证一致性）
+# incremental/query.nix — Phase 4.2
+# QueryDB（Salsa-style，双缓存统一入口，RISK-D 修复）
+# INV-QK1: QueryKey 确定性
+# INV-QK2: 精确失效 BFS
+# INV-QK5: 循环检测 DFS
+# INV-QK-SCHEMA: key 格式验证
 { lib, hashLib }:
 
-let
-  # ── QueryKey 合法 tag 集合（INV-QK-SCHEMA）───────────────────────────────
-  _validTags = [ "norm" "hash" "eq" "solve" "check" "kind" "sub" "inst" "row" "infer" ];
+let inherit (hashLib) typeHash; in
 
-  # ── QueryKey 构造器（INV-QK1：所有 key 必须通过此函数构造）──────────────
-  # Type: String -> [String] -> String
+rec {
+
+  # ══ QueryKey 构造（INV-QK1 + INV-QK-SCHEMA）══════════════════════════
+  # 所有 key 必须通过 mkQueryKey 构造
+  # Type: String → [String] → QueryKey
   mkQueryKey = tag: inputs:
     let
-      validTag = builtins.elem tag _validTags;
+      sortedInputs = lib.sort builtins.lessThan inputs;
     in
-    if !validTag then
-      builtins.throw "Invalid QueryKey tag: ${tag}. Must be one of: ${builtins.toJSON _validTags}"
-    else
-      "${tag}:${builtins.concatStringsSep "," inputs}";
+    "${tag}:${lib.concatStringsSep "," sortedInputs}";
 
-  # ── 预定义 key 构造器（INV-QK1 保证格式） ────────────────────────────────
-  qkNormalize  = typeId:       mkQueryKey "norm"  [ typeId ];
-  qkHash       = typeId:       mkQueryKey "hash"  [ typeId ];
-  qkEq         = id1: id2:     mkQueryKey "eq"    (lib.sort (a: b: a < b) [ id1 id2 ]);
-  qkSolve      = constraintIds: mkQueryKey "solve" constraintIds;
-  qkCheck      = typeId:       mkQueryKey "check" [ typeId ];
-  qkKind       = typeId:       mkQueryKey "kind"  [ typeId ];
-  qkSubst      = varId: typeId: mkQueryKey "sub"  [ varId typeId ];
-  qkInst       = className: argHashes: mkQueryKey "inst" ([ className ] ++ argHashes);
-  qkRow        = rowId:        mkQueryKey "row"   [ rowId ];
-  qkInfer      = exprId:       mkQueryKey "infer" [ exprId ];
+  # INV-QK-SCHEMA: 验证 key 格式
+  _validateKey = key:
+    builtins.isString key &&
+    builtins.stringLength key > 0 &&
+    lib.hasInfix ":" key;
 
-  # ── QueryKey schema validation（INV-QK-SCHEMA）───────────────────────────
-  validateQueryKey = key:
-    lib.any (tag: lib.hasPrefix "${tag}:" key) _validTags;
+  # ══ QueryDB 结构 ═══════════════════════════════════════════════════════
+  # { cache: {key → {value; deps: [key]; valid: Bool}};
+  #   deps:  {key → [key]};    key 的依赖
+  #   rdeps: {key → [key]};    依赖 key 的 keys }
+  emptyDB = { cache = {}; deps = {}; rdeps = {}; };
 
-  # ── QueryDB 结构 ──────────────────────────────────────────────────────────
-  # { results  : AttrSet(key -> { value; valid; deps: [key] })
-  # , revDeps  : AttrSet(key -> [key])  -- 反向依赖（被谁依赖）
-  # , epoch    : Int
-  # }
-  emptyQueryDB = {
-    results = {};
-    revDeps = {};
-    epoch   = 0;
-  };
-
-  # ── storeResult（INV-QK3：原子存储 value + deps）─────────────────────────
-  # Type: DB -> String -> Any -> [String] -> DB
+  # ══ storeResult（INV-QK-SCHEMA 验证）═════════════════════════════════
+  # Type: DB → QueryKey → Any → [QueryKey] → DB
   storeResult = db: key: value: deps:
+    assert _validateKey key;
     let
-      # 验证 key 格式（INV-QK-SCHEMA）
-      valid = validateQueryKey key;
-      entry = { inherit value deps; valid = true; epoch = db.epoch; };
-
-      # 更新反向依赖图（deps 中每个 key 反向指向当前 key）
-      newRevDeps = lib.foldl'
-        (acc: depKey:
-          let
-            existing = acc.${depKey} or [];
-          in
-          acc // { ${depKey} = if builtins.elem key existing then existing
-                               else existing ++ [ key ]; })
-        db.revDeps
-        deps;
+      # 更新 rdeps：对每个 dep，记录 key 依赖它
+      newRdeps = lib.foldl' (acc: dep:
+        acc // { ${dep} = lib.unique ((acc.${dep} or []) ++ [ key ]); }
+      ) db.rdeps deps;
+      newDeps = db.deps // { ${key} = deps; };
+      newCache = db.cache // { ${key} = { value = value; deps = deps; valid = true; }; };
     in
-    if !valid then
-      builtins.throw "storeResult: invalid QueryKey format: ${key}"
-    else
-      db // {
-        results = db.results // { ${key} = entry; };
-        revDeps = newRevDeps;
-      };
+    db // { cache = newCache; deps = newDeps; rdeps = newRdeps; };
 
-  # ── lookupResult（缓存命中检查）──────────────────────────────────────────
-  # Type: DB -> String -> { found: Bool; value?: Any }
   lookupResult = db: key:
-    let entry = db.results.${key} or null; in
-    if entry == null then { found = false; }
-    else if !entry.valid then { found = false; }
-    else { found = true; value = entry.value; };
+    let entry = db.cache.${key} or null; in
+    if entry == null then null
+    else if !(entry.valid or false) then null
+    else entry.value;
 
-  # ── invalidateKey（BFS 传播，INV-QK2/4）──────────────────────────────────
-  # Type: DB -> String -> DB
+  # ══ BFS 失效（INV-QK2 精确失效）══════════════════════════════════════
   invalidateKey = db: key:
-    let
-      # BFS invalidation
-      go = visited: worklist: db':
-        if worklist == [] then db'
-        else
-          let
-            cur      = builtins.head worklist;
-            restWork = builtins.tail worklist;
-          in
-          if visited ? ${cur} then go visited restWork db'
-          else
-            let
-              visited'  = visited // { ${cur} = true; };
-              # 标记当前 key 为 invalid
-              entry     = db'.results.${cur} or null;
-              db''      = if entry == null then db'
-                          else db' // {
-                            results = db'.results // {
-                              ${cur} = entry // { valid = false; };
-                            };
-                          };
-              # 将依赖 cur 的 keys 加入 worklist
-              rdeps     = db'.revDeps.${cur} or [];
-              newWork   = lib.filter (k: !(visited' ? ${k})) rdeps;
-            in
-            go visited' (restWork ++ newWork) db'';
-    in go {} [ key ] db;
+    _bfsInvalidate db [ key ] [ key ];
 
-  # ── detectCycle（DFS cycle detection，INV-QK5）───────────────────────────
-  # Type: DB -> String -> Bool
-  detectCycle = db: startKey:
-    let
-      go = visiting: visited: key:
-        if visited ? ${key} then false     # 已完成访问，无环
-        else if visiting ? ${key} then true  # 正在访问，发现环！
-        else
-          let
-            visiting' = visiting // { ${key} = true; };
-            deps      = (db.results.${key} or { deps = []; }).deps;
-          in
-          lib.any (go visiting' visited) deps;
-    in go {} {} startKey;
+  _bfsInvalidate = db: queue: visited:
+    if queue == [] then db
+    else
+      let
+        current   = builtins.head queue;
+        rest      = builtins.tail queue;
+        # 失效 current
+        newDB     = _markInvalid db current;
+        # INV-QK2: 找到依赖 current 的所有 keys（rdeps）
+        rdeps     = db.rdeps.${current} or [];
+        newRdeps  = lib.filter (k: !(builtins.elem k visited)) rdeps;
+      in
+      _bfsInvalidate newDB (rest ++ newRdeps) (visited ++ newRdeps);
 
-  # ── bumpEpochDB（INV-QK4：全量失效退化模式，同步两层缓存）──────────────
-  # Phase 4.1 修复 RISK-D：bumpEpochDB 同步 QueryDB + Memo 层
-  # Type: { queryDB: DB; memo: MemoState } -> { queryDB: DB; memo: MemoState }
+  _markInvalid = db: key:
+    if !(db.cache ? ${key}) then db
+    else db // {
+      cache = db.cache // { ${key} = db.cache.${key} // { valid = false; }; };
+    };
+
+  # ══ RISK-D 修复: cacheNormalize（双缓存统一入口）══════════════════════
+  # 同时写 QueryDB + Memo，保证一致性
+  # Type: DB → Memo → String → Type → [QueryKey] → { db; memo }
+  cacheNormalize = db: memo: typeId: nf: deps:
+    let
+      key    = mkQueryKey "norm" [ typeId ];
+      newDB  = storeResult db key nf deps;
+      newMemo = memo // { normalize = memo.normalize // { ${typeId} = nf; }; };
+    in
+    { db = newDB; memo = newMemo; };
+
+  # RISK-D 修复: bumpEpochDB（两层同步清空）
+  # Type: { queryDB; memo } → { queryDB; memo }
   bumpEpochDB = state:
     let
-      db  = state.queryDB or emptyQueryDB;
-      mem = state.memo or {};
-      # 将所有 results 标记为 invalid
-      invalidated = builtins.listToAttrs (map (k: {
-        name  = k;
-        value = db.results.${k} // { valid = false; };
-      }) (builtins.attrNames db.results));
-      newDB = db // { results = invalidated; epoch = db.epoch + 1; };
-      # 同步 Memo：清空（epoch bump = 全量失效）
-      newMemo = {};
+      # 失效所有 QueryDB entries
+      newDB = state.queryDB // {
+        cache = builtins.mapAttrs (k: v: v // { valid = false; }) state.queryDB.cache;
+      };
+      # 清空 Memo
+      newMemo = { normalize = {}; substitute = {}; solve = {}; epoch = (state.memo.epoch or 0) + 1; };
     in
     { queryDB = newDB; memo = newMemo; };
 
-  # ── Phase 4.1: 统一缓存入口（修复 RISK-D）────────────────────────────────
-  # normalize 结果同时写入 QueryDB 和 Memo（保证一致性）
-  # Type: DB -> MemoState -> String -> Any -> [String] -> { queryDB; memo }
-  cacheNormalize = db: memo: typeId: nfValue: deps:
+  # ══ INV-QK5: 循环检测 ══════════════════════════════════════════════════
+  hasDependencyCycle = db: key:
+    _dfsCycle db key [ key ];
+
+  _dfsCycle = db: current: visited:
+    let deps = db.deps.${current} or []; in
+    builtins.any (dep:
+      builtins.elem dep visited || _dfsCycle db dep (visited ++ [ dep ])
+    ) deps;
+
+  # ══ 查询统计 ══════════════════════════════════════════════════════════
+  cacheStats = db:
     let
-      qKey    = qkNormalize typeId;
-      newDB   = storeResult db qKey nfValue deps;
-      # 同时写入 Memo（epoch-keyed）
-      newMemo = memo // { ${typeId} = nfValue; };
+      entries    = builtins.attrValues db.cache;
+      valid      = lib.filter (e: e.valid or false) entries;
+      invalid    = lib.filter (e: !(e.valid or false)) entries;
     in
-    { queryDB = newDB; memo = newMemo; };
-
-  # hash 结果同时写入两层缓存
-  cacheHash = db: memo: typeId: hashValue: deps:
-    let
-      qKey    = qkHash typeId;
-      newDB   = storeResult db qKey hashValue deps;
-      newMemo = memo // { ${typeId + ":hash"} = hashValue; };
-    in
-    { queryDB = newDB; memo = newMemo; };
-
-  # ── DB 元信息 ─────────────────────────────────────────────────────────────
-  queryDBSize = db: builtins.length (builtins.attrNames (db.results or {}));
-
-  validEntryCount = db:
-    builtins.length (lib.filter
-      (k: (db.results.${k}).valid or false)
-      (builtins.attrNames (db.results or {})));
-
-  invalidEntryCount = db:
-    queryDBSize db - validEntryCount db;
-
-in {
-  # Key constructors
-  inherit mkQueryKey validateQueryKey
-          qkNormalize qkHash qkEq qkSolve qkCheck
-          qkKind qkSubst qkInst qkRow qkInfer;
-
-  # DB operations
-  inherit emptyQueryDB storeResult lookupResult
-          invalidateKey detectCycle bumpEpochDB;
-
-  # Phase 4.1: unified cache
-  inherit cacheNormalize cacheHash;
-
-  # Utilities
-  inherit queryDBSize validEntryCount invalidEntryCount;
+    { total = builtins.length entries;
+      valid = builtins.length valid;
+      invalid = builtins.length invalid; };
 }

@@ -1,41 +1,66 @@
-# meta/hash.nix — Phase 4.1
-# canonical hash：INV-4 核心实现
-# typeEq(a,b) ⟹ typeHash(a) == typeHash(b)
-{ lib, typeLib, normalizeLib, serialLib }:
+# meta/hash.nix — Phase 4.2
+# Canonical hash：Hash(serialize(NormalForm(t)))
+# INV-4: typeEq(a,b) ⟹ typeHash(a) == typeHash(b)
+{ lib, serialLib }:
 
 let
-  inherit (normalizeLib) normalize';
-  inherit (serialLib) serializeRepr canonicalHash;
+  inherit (serialLib) serializeType serializeRepr canonicalHash canonicalHashRepr;
 
 in rec {
-  # ── 规范化 hash（INV-4）──────────────────────────────────────────────────
-  # Type: Type -> String
-  # hash = H(serialize(normalize(t)))
+
+  # ══ 主 hash 函数（通过 NF）════════════════════════════════════════════
+  # Type: NormalizedType → String
+  # 注意：调用者负责先 normalize，hash 不做 normalize（避免循环）
   typeHash = t:
-    assert typeLib.isType t;
-    let nf = normalize' t; in
-    canonicalHash nf.repr;
+    if !builtins.isAttrs t || (t.tag or null) != "Type"
+    then builtins.hashString "sha256" (builtins.toJSON t)
+    else canonicalHash t;
 
-  # ── TypeRepr 直接 hash（不经过 normalize，仅用于内部）───────────────────
-  reprHash = repr:
-    canonicalHash repr;
+  # Type: TypeRepr → String（repr 级别 hash）
+  reprHash = r: canonicalHashRepr r;
 
-  # ── hash 一致性验证（调试用）─────────────────────────────────────────────
-  # Type: Type -> Type -> Bool
-  # 验证 INV-4: typeEq(a,b) ⟹ typeHash(a) == typeHash(b)
-  verifyHashConsistency = equalityFn: a: b:
-    if equalityFn a b
-    then typeHash a == typeHash b
-    else true;  # 不相等时无约束
+  # ══ Constraint hash（用于去重）════════════════════════════════════════
+  constraintHash = c:
+    builtins.hashString "sha256" (serialLib.serializeConstraint c);
 
-  # ── instance key 生成（用于 constraint solver）────────────────────────────
-  # Type: String -> [Type] -> String
-  # INV-4 保证：相同 className + 规范化等价 args → 相同 key
-  instanceKey = className: args:
+  # ══ TypeScheme hash ════════════════════════════════════════════════════
+  schemeHash = s:
+    if !builtins.isAttrs s || (s.__schemeTag or null) != "Scheme"
+    then builtins.hashString "sha256" (builtins.toJSON s)
+    else
+      let
+        bodyHash = typeHash s.body;
+        forallStr = lib.concatStringsSep "," (lib.sort builtins.lessThan s.forall);
+        csHashes  = lib.sort builtins.lessThan (map constraintHash s.constraints);
+      in
+      builtins.hashString "sha256" "Scheme(${forallStr};${bodyHash};${lib.concatStringsSep "," csHashes})";
+
+  # ══ Hash-consing（Phase 4.2: 结构共享）═══════════════════════════════
+  # 使用 hash 作为 key，避免重复构造相同类型
+  # 在纯 Nix 中，hash-consing 通过 lazy evaluation 自动实现
+  # 此函数用于显式检查两个类型是否结构共享
+
+  # Type: Type → Type → Bool
+  hashConsEq = a: b: typeHash a == typeHash b;
+
+  # ══ Substitution hash（用于 memo key）════════════════════════════════
+  substHash = subst:
     let
-      normalizedArgs = map normalize' args;
-      argHashes      = map (a: canonicalHash a.repr) normalizedArgs;
-      keyData        = { c = className; a = argHashes; };
+      typeKeys = builtins.attrNames (subst.typeBindings or {});
+      rowKeys  = builtins.attrNames (subst.rowBindings or {});
+      kindKeys = builtins.attrNames (subst.kindBindings or {});
+      allKeys  = lib.sort builtins.lessThan (typeKeys ++ rowKeys ++ kindKeys);
+      pairStrs = map (k:
+        let
+          tval = (subst.typeBindings or {}).${k} or null;
+          rval = (subst.rowBindings or {}).${k} or null;
+          kval = (subst.kindBindings or {}).${k} or null;
+          vstr = if tval != null then typeHash tval
+                 else if rval != null then typeHash rval
+                 else builtins.toJSON kval;
+        in
+        "${k}=${vstr}"
+      ) allKeys;
     in
-    builtins.hashString "sha256" (builtins.toJSON keyData);
+    builtins.hashString "sha256" "Subst(${lib.concatStringsSep ";" pairStrs})";
 }

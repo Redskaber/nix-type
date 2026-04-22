@@ -1,206 +1,132 @@
-# normalize/rewrite.nix — Phase 4.1
-# TRS 主引擎：fuel-based 强制终止
-# INV-2: 所有计算 = Rewrite(TypeIR)
-# INV-3: normalize 结果唯一（confluence 由规则顺序保证）
-{ lib, typeLib, reprLib, rulesLib, kindLib }:
+# normalize/rewrite.nix — Phase 4.2
+# TRS 主引擎（fuel-based，保证终止）
+# INV-2: 所有计算 = Rewrite(TypeIR)，fuel 保证终止
+# INV-3: 结果 = NormalForm（无可归约子项）
+{ lib, typeLib, reprLib, kindLib, substLib, rulesLib }:
 
 let
   inherit (typeLib) isType mkTypeWith;
-  inherit (rulesLib) applyOneRule isNFShallow;
-  inherit (reprLib)
-    rLambdaK rApply rFn rConstrained rConstructor rRecord rRowExtend
-    rVariantRow rEffect rEffectMerge rMu rPi rSigma rOpaque rAscribe
-    rRefined rSig rStruct rModFunctor rHandler;
+  inherit (rulesLib) applyFirstRule allRules;
 
-  # ── 深度规范化主函数 ──────────────────────────────────────────────────────
-  # Type: Int -> Type -> Type
-  # fuel: 最大重写步骤数（INV-2 终止性保证）
-  normalize = fuel: t:
-    if !isType t then t
-    else if fuel <= 0 then t  # ⚠️ fuel 耗尽，返回当前形式
+in rec {
+
+  # ══ 默认 fuel 常量 ════════════════════════════════════════════════════
+  DEFAULT_FUEL = 1000;
+  DEEP_FUEL    = 3000;  # 深度嵌套类型
+
+  # ══ 核心 normalize（fuel-controlled）════════════════════════════════
+  # Type: Int → Type → Type
+  normalizeWithFuel = fuel: t:
+    if fuel <= 0 then t
+    else if !isType t then t
     else
-      # Step 1: 尝试顶层规则
-      let topResult = applyOneRule t; in
-      if topResult != null
-      then normalize (fuel - 1) topResult  # 应用规则，继续
-      else
-        # Step 2: 顶层无规则，递归规范化子项
-        normalizeSubterms fuel t;
+      # Step 1: 递归 normalize 子项
+      let t1 = _normalizeChildren (fuel - 1) t; in
+      # Step 2: 应用规则（outermost-first strategy）
+      let r = applyFirstRule t1; in
+      if r == null then t1
+      else normalizeWithFuel (fuel - 1) r.result;
 
-  # ── 子项递归规范化 ────────────────────────────────────────────────────────
-  # 子项规范化后，重新尝试顶层规则（子项可能解锁新规则）
-  normalizeSubterms = fuel: t:
-    let
-      v    = t.repr.__variant or null;
-      fuel1 = fuel - 1;
-    in
-
-    if v == "Lambda" then
-      let body' = normalize fuel1 t.repr.body; in
-      mkTypeWith (rLambdaK t.repr.param (t.repr.paramKind or kindLib.KStar) body')
-                 t.kind t.meta
-
-    else if v == "Apply" then
+  # ── 子项递归（structural recursion）────────────────────────────────
+  _normalizeChildren = fuel: t:
+    if !isType t || fuel <= 0 then t
+    else
       let
-        fn'   = normalize fuel1 t.repr.fn;
-        args' = map (normalize fuel1) (t.repr.args or []);
-        t'    = mkTypeWith (rApply fn' args') t.kind t.meta;
-        # 子项规范化后重新尝试顶层
-        top   = applyOneRule t';
+        v     = t.repr.__variant or null;
+        go    = normalizeWithFuel (fuel - 1);
+        goR   = f: mkTypeWith f t.kind t.meta;
       in
-      if top != null then normalize fuel1 top else t'
+      if v == "Lambda" then
+        goR { __variant = "Lambda"; param = t.repr.param; body = go t.repr.body; }
+      else if v == "Apply" then
+        goR { __variant = "Apply"; fn = go t.repr.fn; args = map go (t.repr.args or []); }
+      else if v == "Fn" then
+        goR { __variant = "Fn"; from = go t.repr.from; to = go t.repr.to; }
+      else if v == "Constrained" then
+        goR { __variant = "Constrained"; base = go t.repr.base; constraints = t.repr.constraints; }
+      else if v == "Mu" then
+        goR { __variant = "Mu"; var = t.repr.var; body = go t.repr.body; }
+      else if v == "Record" then
+        goR { __variant = "Record"; fields = builtins.mapAttrs (n: f: go f) t.repr.fields; }
+      else if v == "RowExtend" then
+        goR { __variant = "RowExtend"; label = t.repr.label; ty = go t.repr.ty; tail = go t.repr.tail; }
+      else if v == "VariantRow" then
+        goR { __variant = "VariantRow";
+              variants = builtins.mapAttrs (n: vt: go vt) t.repr.variants;
+              tail = if t.repr.tail != null then go t.repr.tail else null; }
+      else if v == "Effect" then
+        goR { __variant = "Effect"; effectRow = go t.repr.effectRow; resultType = go t.repr.resultType; }
+      else if v == "EffectMerge" then
+        goR { __variant = "EffectMerge"; e1 = go t.repr.e1; e2 = go t.repr.e2; }
+      else if v == "Refined" then
+        goR { __variant = "Refined"; base = go t.repr.base; predVar = t.repr.predVar; predExpr = t.repr.predExpr; }
+      else if v == "Sig" then
+        goR { __variant = "Sig"; fields = builtins.mapAttrs (n: f: go f) t.repr.fields; }
+      else if v == "Struct" then
+        goR { __variant = "Struct"; sig = go t.repr.sig;
+              impls = builtins.mapAttrs (n: i: go i) t.repr.impls; }
+      else if v == "ModFunctor" then
+        goR { __variant = "ModFunctor"; param = t.repr.param;
+              paramSig = go t.repr.paramSig; body = go t.repr.body; }
+      else if v == "Forall" then
+        goR { __variant = "Forall"; vars = t.repr.vars; body = go t.repr.body; }
+      else if v == "Pi" then
+        goR { __variant = "Pi"; param = t.repr.param;
+              paramType = go t.repr.paramType; body = go t.repr.body; }
+      else if v == "Sigma" then
+        goR { __variant = "Sigma"; param = t.repr.param;
+              paramType = go t.repr.paramType; body = go t.repr.body; }
+      else t;  # Primitive, Var, Hole, Dynamic — leaves
 
-    else if v == "Fn" then
-      let
-        from' = normalize fuel1 t.repr.from;
-        to'   = normalize fuel1 t.repr.to;
-      in mkTypeWith (rFn from' to') t.kind t.meta
+  # ══ Public API ════════════════════════════════════════════════════════
 
-    else if v == "Constrained" then
-      let base' = normalize fuel1 t.repr.base; in
-      mkTypeWith (rConstrained base' t.repr.constraints) t.kind t.meta
+  # Type: Type → Type（default fuel = 1000）
+  normalize' = normalizeWithFuel DEFAULT_FUEL;
 
-    else if v == "Constructor" then
-      let body' = normalize fuel1 t.repr.body; in
-      mkTypeWith (rConstructor t.repr.name t.repr.kind t.repr.params body')
-                 t.kind t.meta
+  # Type: Type → Type（deep, fuel = 3000）
+  normalizeDeep = normalizeWithFuel DEEP_FUEL;
 
-    else if v == "Record" then
-      let
-        fnames  = builtins.attrNames (t.repr.fields or {});
-        fields' = builtins.listToAttrs (map (n: {
-          name  = n;
-          value = normalize fuel1 t.repr.fields.${n};
-        }) fnames);
-      in mkTypeWith (rRecord fields') t.kind t.meta
-
-    else if v == "RowExtend" then
-      let
-        ft'   = normalize fuel1 t.repr.fieldType;
-        rest' = normalize fuel1 t.repr.rest;
-        t'    = mkTypeWith (rRowExtend t.repr.label ft' rest') t.kind t.meta;
-        top   = applyOneRule t';
-      in if top != null then normalize fuel1 top else t'
-
-    else if v == "VariantRow" then
-      let
-        vnames    = builtins.attrNames (t.repr.variants or {});
-        variants' = builtins.listToAttrs (map (n: {
-          name  = n;
-          value = normalize fuel1 t.repr.variants.${n};
-        }) vnames);
-        ext' = if t.repr.extension == null then null
-               else normalize fuel1 t.repr.extension;
-        t'   = mkTypeWith (rVariantRow variants' ext') t.kind t.meta;
-        top  = applyOneRule t';
-      in if top != null then normalize fuel1 top else t'
-
-    else if v == "Mu" then
-      # equi-recursive: 不展开 μ（避免无限 fuel 消耗）
-      # 仅规范化 body 一层
-      let body' = normalize fuel1 t.repr.body; in
-      mkTypeWith (rMu t.repr.var body') t.kind t.meta
-
-    else if v == "Effect" then
-      let er' = normalize fuel1 t.repr.effectRow; in
-      mkTypeWith (rEffect er') t.kind t.meta
-
-    else if v == "EffectMerge" then
-      let
-        l'  = normalize fuel1 t.repr.left;
-        r'  = normalize fuel1 t.repr.right;
-        t'  = mkTypeWith (rEffectMerge l' r') t.kind t.meta;
-        top = applyOneRule t';
-      in if top != null then normalize fuel1 top else t'
-
-    else if v == "Pi" then
-      let
-        domain' = normalize fuel1 t.repr.domain;
-        body'   = normalize fuel1 t.repr.body;
-      in mkTypeWith (rPi t.repr.param domain' body') t.kind t.meta
-
-    else if v == "Sigma" then
-      let
-        domain' = normalize fuel1 t.repr.domain;
-        body'   = normalize fuel1 t.repr.body;
-      in mkTypeWith (rSigma t.repr.param domain' body') t.kind t.meta
-
-    else if v == "Refined" then
-      let base' = normalize fuel1 t.repr.base; in
-      let t' = mkTypeWith (rRefined base' t.repr.predVar t.repr.predExpr) t.kind t.meta; in
-      let top = applyOneRule t'; in
-      if top != null then normalize fuel1 top else t'
-
-    else if v == "Opaque" then
-      let inner' = normalize fuel1 t.repr.inner; in
-      mkTypeWith (rOpaque inner' t.repr.tag) t.kind t.meta
-
-    else if v == "Ascribe" then
-      let expr' = normalize fuel1 t.repr.expr; in
-      mkTypeWith (rAscribe expr' t.repr.type) t.kind t.meta
-
-    else if v == "Sig" then
-      let
-        fnames  = builtins.attrNames (t.repr.fields or {});
-        fields' = builtins.listToAttrs (map (n: {
-          name  = n;
-          value = normalize fuel1 t.repr.fields.${n};
-        }) fnames);
-        t'  = mkTypeWith (rSig fields') t.kind t.meta;
-        top = applyOneRule t';
-      in if top != null then normalize fuel1 top else t'
-
-    else if v == "Struct" then
-      let
-        sig' = normalize fuel1 t.repr.sig;
-        inames = builtins.attrNames (t.repr.impl or {});
-        impl' = builtins.listToAttrs (map (n: {
-          name  = n;
-          value = normalize fuel1 t.repr.impl.${n};
-        }) inames);
-      in mkTypeWith (rStruct sig' impl') t.kind t.meta
-
-    else if v == "ModFunctor" then
-      let
-        paramTy' = normalize fuel1 t.repr.paramTy;
-        body'    = normalize fuel1 t.repr.body;
-      in mkTypeWith (rModFunctor t.repr.param paramTy' body') t.kind t.meta
-
-    else if v == "Handler" then
-      let
-        branches' = map (b:
-          b // { body = normalize fuel1 b.body; }
-        ) (t.repr.branches or []);
-        rt' = normalize fuel1 t.repr.returnType;
-      in mkTypeWith (rHandler t.repr.effectTag branches' rt') t.kind t.meta
-
-    else t;  # Primitive, Var, ADT, RowEmpty, RowVar, Kind — 已是 NF
-
-  # ── 公开 API ──────────────────────────────────────────────────────────────
-
-  # 默认 fuel（1000 步，足应付实际类型表达式）
-  defaultFuel = 1000;
-
-  # Type: Type -> Type  (使用默认 fuel)
-  normalize' = normalize defaultFuel;
-
-  # Type: Int -> Type -> Type  (自定义 fuel)
-  normalizeWithFuel = normalize;
-
-  # Type: Type -> Bool  (浅层 NF 检查)
+  # ══ 标准化检查（已经是 NF？）═════════════════════════════════════════
+  # Type: Type → Bool
   isNormalForm = t:
-    isNFShallow t && _normSubtermsCheck t;
+    if !isType t then true
+    else applyFirstRule t == null;
 
-  _normSubtermsCheck = t:
-    let v = t.repr.__variant or null; in
-    if v == "Lambda" then isNormalForm t.repr.body
-    else if v == "Apply" then
-      isNormalForm t.repr.fn && lib.all isNormalForm (t.repr.args or [])
-    else if v == "Fn" then
-      isNormalForm t.repr.from && isNormalForm t.repr.to
-    else if v == "Constrained" then isNormalForm t.repr.base
-    else true;
+  # ══ Constraint normalize（规范化约束，用于 solver）════════════════════
+  # INV-SOL1: 等价约束规范化（对称性 + NF hash）
+  # Type: Constraint → Constraint
+  normalizeConstraint = c:
+    if !builtins.isAttrs c then c
+    else
+      let tag = c.__constraintTag or null; in
+      if tag == "Equality" then
+        let
+          lhsN = normalize' c.lhs;
+          rhsN = normalize' c.rhs;
+          # canonical: smaller hash first
+          lhsH = builtins.hashString "sha256" (builtins.toJSON lhsN);
+          rhsH = builtins.hashString "sha256" (builtins.toJSON rhsN);
+        in
+        if lhsH <= rhsH then c // { lhs = lhsN; rhs = rhsN; }
+        else c // { lhs = rhsN; rhs = lhsN; }
+      else if tag == "Class" then
+        c // { args = map normalize' c.args; }
+      else if tag == "RowEquality" then
+        c // { lhsRow = normalize' c.lhsRow; rhsRow = normalize' c.rhsRow; }
+      else if tag == "Refined" then
+        c // { subject = normalize' c.subject; }
+      else c;
 
-in {
-  inherit normalize normalize' normalizeWithFuel isNormalForm;
+  # ══ Constraint 去重 ════════════════════════════════════════════════════
+  # Type: [Constraint] → [Constraint]
+  deduplicateConstraints = cs:
+    let
+      withKeys = map (c: { k = builtins.toJSON c; v = c; }) cs;
+      uniq = lib.foldl' (acc: x:
+        if builtins.elem x.k acc.seen
+        then acc
+        else { seen = acc.seen ++ [x.k]; result = acc.result ++ [x.v]; }
+      ) { seen = []; result = []; } withKeys;
+    in
+    uniq.result;
 }

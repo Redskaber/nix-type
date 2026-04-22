@@ -1,211 +1,138 @@
-# match/pattern.nix — Phase 4.1
-# Pattern Matching + Decision Tree 编译器
-# 合并原 match/pattern.nix + match/pattern_p33.nix
-# Pattern → Decision Tree → O(1) ordinal dispatch
+# match/pattern.nix — Phase 4.2
+# Pattern Matching + Decision Tree 编译器（合并版）
+# Pattern → Decision Tree（ordinal O(1) dispatch）
 { lib, typeLib, reprLib, kindLib }:
 
 let
-  inherit (typeLib) isType mkTypeDefault;
-  inherit (reprLib) rADT mkVariant;
-  inherit (kindLib) KStar;
+  inherit (typeLib) isType;
 
 in rec {
 
-  # ══ Pattern IR ═════════════════════════════════════════════════════════════
+  # ══ Pattern IR ════════════════════════════════════════════════════════
+  # Pattern =
+  #   PWild                       # 通配符
+  # | PVar String                 # 变量绑定
+  # | PCtor String [Pattern]      # 构造器模式
+  # | PLit Any                    # 字面量模式
+  # | PAnd Pattern Pattern        # AND 模式（@ 绑定）
+  # | PGuard Pattern Expr         # 守卫模式
 
-  # 构造器模式（匹配 ADT variant）
-  mkPatConstructor = variantName: subPatterns: guard:
-    { __patTag    = "Constructor";
-      variantName = variantName;
-      subPatterns = subPatterns;  # [Pattern]
-      guard       = guard;        # PredExpr | null
-    };
+  mkPWild  = { __patTag = "Wild"; };
+  mkPVar   = name: { __patTag = "Var"; name = name; };
+  mkPCtor  = name: fields: { __patTag = "Ctor"; name = name; fields = fields; };
+  mkPLit   = value: { __patTag = "Lit"; value = value; };
+  mkPAnd   = p1: p2: { __patTag = "And"; p1 = p1; p2 = p2; };
+  mkPGuard = pat: guard: { __patTag = "Guard"; pat = pat; guard = guard; };
+  mkPRecord = fields: { __patTag = "Record"; fields = fields; };
 
-  # 变量绑定模式（always match，绑定值）
-  mkPatVar = name:
-    { __patTag = "Var"; name = name; };
+  isPattern = p: builtins.isAttrs p && p ? __patTag;
+  isWild    = p: isPattern p && p.__patTag == "Wild";
+  isVar     = p: isPattern p && p.__patTag == "Var";
+  isCtor    = p: isPattern p && p.__patTag == "Ctor";
+  isLit     = p: isPattern p && p.__patTag == "Lit";
 
-  # 通配符（always match，不绑定）
-  mkPatWildcard =
-    { __patTag = "Wildcard"; };
+  # ══ Match Arm（模式 + 分支体）══════════════════════════════════════════
+  # Type: Pattern → Any(body) → MatchArm
+  mkArm = pat: body: { __armTag = "Arm"; pat = pat; body = body; };
 
-  # 字面量模式
-  mkPatLiteral = value:
-    { __patTag = "Literal"; value = value; };
+  # ══ Decision Tree IR ══════════════════════════════════════════════════
+  # DTree =
+  #   DTLeaf { body }                      # 匹配成功
+  # | DTFail                               # 匹配失败
+  # | DTSwitch { scrutinee; branches; default }  # ordinal switch
+  # | DTGuard { guard; yes; no }           # 守卫条件
 
-  # OR 模式（p1 | p2）
-  mkPatOr = left: right:
-    { __patTag = "Or"; inherit left right; };
+  mkDTLeaf   = bindings: body: { __dtTag = "Leaf"; bindings = bindings; body = body; };
+  mkDTFail   = { __dtTag = "Fail"; };
+  mkDTSwitch = scrutinee: branches: default_:
+    { __dtTag = "Switch"; scrutinee = scrutinee; branches = branches; default_ = default_; };
+  mkDTGuard  = guard: yes: no:
+    { __dtTag = "Guard"; guard = guard; yes = yes; no = no; };
 
-  # Tuple/Record 模式
-  mkPatRecord = fields:
-    { __patTag = "Record"; inherit fields; };
-
-  # ── Pattern 谓词 ──────────────────────────────────────────────────────────
-  isPat         = p: builtins.isAttrs p && p ? __patTag;
-  isPatCtor     = p: isPat p && p.__patTag == "Constructor";
-  isPatVar      = p: isPat p && p.__patTag == "Var";
-  isPatWildcard = p: isPat p && p.__patTag == "Wildcard";
-  isPatLiteral  = p: isPat p && p.__patTag == "Literal";
-  isPatOr       = p: isPat p && p.__patTag == "Or";
-  isPatRecord   = p: isPat p && p.__patTag == "Record";
-
-  # ══ Match Arm ══════════════════════════════════════════════════════════════
-
-  # Type: Pattern -> Any(body) -> MatchArm
-  mkArm = pattern: body: { inherit pattern body; };
-
-  # ══ Decision Tree（编译目标）═══════════════════════════════════════════════
-
-  # DTLeaf: 匹配成功，执行 body
-  mkDTLeaf = body: bindings:
-    { __dtTag = "Leaf"; inherit body bindings; };
-
-  # DTFail: 匹配失败
-  mkDTFail =
-    { __dtTag = "Fail"; };
-
-  # DTSwitch: 按 ordinal dispatch（O(1)）
-  mkDTSwitch = scrutinee: cases: defaultCase:
-    { __dtTag   = "Switch";
-      inherit scrutinee cases defaultCase; };
-  # cases: AttrSet(ordinal:String -> DecisionTree)
-
-  # DTGuard: 带 guard 的条件跳转
-  mkDTGuard = guard: thenBranch: elseBranch:
-    { __dtTag   = "Guard";
-      inherit guard thenBranch elseBranch; };
-
-  # DTBind: 变量绑定
-  mkDTBind = varName: source: continuation:
-    { __dtTag   = "Bind";
-      inherit varName source continuation; };
-
-  # ══ Decision Tree 编译器 ════════════════════════════════════════════════════
-
-  # Type: [MatchArm] -> ADT Type -> DecisionTree
-  # 将 arms 列表编译为 Decision Tree
-  compileMatch = arms: scrutineeType:
+  # ══ 模式编译器（Pattern → Decision Tree）══════════════════════════════
+  # Type: [MatchArm] → ADTVariants → DTree
+  compileMatch = arms: adtVariants:
     if arms == [] then mkDTFail
     else
       let
         firstArm = builtins.head arms;
         restArms = builtins.tail arms;
-        pat      = firstArm.pattern;
-        body     = firstArm.body;
+        pat      = firstArm.pat;
+        tag      = pat.__patTag or null;
       in
-      _compilePat pat body restArms;
+      if tag == "Wild" || tag == "Var" then
+        # Wild/Var: always matches，绑定变量
+        let
+          bindings = if tag == "Var" then { ${pat.name} = "__scrutinee"; } else {};
+        in
+        mkDTLeaf bindings firstArm.body
+      else if tag == "Lit" then
+        # Literal match
+        mkDTSwitch "__scrutinee"
+          { ${builtins.toJSON pat.value} = mkDTLeaf {} firstArm.body; }
+          (compileMatch restArms adtVariants)
+      else if tag == "Ctor" then
+        # 构造器模式：按 ordinal O(1) dispatch
+        let
+          ctorOrdinal = _lookupOrdinal adtVariants pat.name;
+          ctorKey     = builtins.toString ctorOrdinal;
+          # 编译子模式（fields）
+          fieldArms   = if pat.fields == [] then [ (mkArm mkPWild firstArm.body) ]
+            else
+              let innerArm = mkArm (builtins.head pat.fields) firstArm.body; in
+              [ innerArm ];
+          innerDT     = compileMatch fieldArms adtVariants;
+          restDT      = compileMatch restArms adtVariants;
+        in
+        mkDTSwitch "__scrutinee"
+          { ${ctorKey} = innerDT; }
+          restDT
+      else if tag == "Guard" then
+        let
+          matchPat  = mkArm pat.pat firstArm.body;
+          innerDT   = compileMatch ([ matchPat ] ++ restArms) adtVariants;
+        in
+        mkDTGuard pat.guard innerDT (compileMatch restArms adtVariants)
+      else if tag == "And" then
+        let
+          innerArm = mkArm pat.p1 (mkArm pat.p2 firstArm.body);
+          nestedDT = compileMatch ([ innerArm ] ++ restArms) adtVariants;
+        in
+        nestedDT
+      else if tag == "Record" then
+        # Record 模式：展开字段
+        mkDTLeaf pat.fields firstArm.body
+      else
+        mkDTFail;
 
-  # 按模式类型分发编译策略
-  _compilePat = pat: body: restArms:
-    if isPatWildcard pat || isPatVar pat then
-      # 通配符/变量：always match
-      let
-        leaf = mkDTLeaf body
-          (if isPatVar pat then [ { var = pat.name; source = "scrutinee"; } ] else []);
-      in leaf  # 后续 restArms 不可达（警告：可选，Phase 4.x）
+  # ── ordinal 查找（O(1) dispatch）────────────────────────────────────
+  _lookupOrdinal = adtVariants: ctorName:
+    let variant = lib.findFirst (v: v.name == ctorName) null adtVariants; in
+    if variant != null then variant.ordinal else -1;
 
-    else if isPatLiteral pat then
-      # 字面量：guard 形式
-      let
-        guard    = { __predTag = "PCmp"; op = "eq";
-                     lhs = { __predTag = "PVar"; name = "_scrutinee_"; };
-                     rhs = { __predTag = "PLit"; value = pat.value; }; };
-        thenBranch = mkDTLeaf body [];
-        elseBranch = compileMatch restArms null;
-      in mkDTGuard guard thenBranch elseBranch
-
-    else if isPatCtor pat then
-      # 构造器：按 ordinal dispatch
-      _compileCtor pat body restArms
-
-    else if isPatOr pat then
-      # OR 模式：编译两个分支
-      let
-        left  = mkArm pat.left body;
-        right = mkArm pat.right body;
-      in compileMatch ([ left right ] ++ restArms) null
-
-    else if isPatRecord pat then
-      # Record 模式：依次检查各字段
-      _compileRecord pat body restArms
-
-    else
-      # 未知模式：fallthrough
-      mkDTLeaf body [];
-
-  # 构造器模式编译（ordinal-based switch）
-  _compileCtor = pat: body: restArms:
+  # ══ 穷尽性检查（Exhaustiveness）══════════════════════════════════════
+  # Type: [MatchArm] → ADT → { exhaustive: Bool; missing: [String] }
+  checkExhaustive = arms: adtVariants:
     let
-      # 收集所有处理相同 variant 的 arm
-      sameVariant = lib.filter (arm:
-        isPatCtor arm.pattern && arm.pattern.variantName == pat.variantName
-      ) restArms;
-      otherArms = lib.filter (arm:
-        !(isPatCtor arm.pattern && arm.pattern.variantName == pat.variantName)
-      ) restArms;
-
-      # 当前 arm 的 body（含子模式）
-      subDT = _compileSubPatterns (pat.subPatterns or []) body;
-
-      # 带 guard
-      patDT = if pat.guard == null then subDT
-              else mkDTGuard pat.guard subDT mkDTFail;
-
-      # 构建 switch case（按 ordinal）
-      ordinalStr = builtins.toString (pat.ordinal or 0);
-
-      # 编译 default（其他模式）
-      defaultDT = compileMatch otherArms null;
-    in
-    mkDTSwitch "_scrutinee_"
-      { ${ordinalStr} = patDT; }
-      defaultDT;
-
-  # 子模式编译（按位置 bind）
-  _compileSubPatterns = subPats: body:
-    if subPats == [] then mkDTLeaf body []
-    else
-      let
-        indexed = lib.imap0 (i: p:
-          { idx = i; pat = p; source = "_field_${builtins.toString i}"; }
-        ) subPats;
-        # 依次 bind 各字段
-        go = acc: item:
-          let
-            p = item.pat;
-            src = item.source;
-          in
-          if isPatVar p then
-            mkDTBind p.name src acc
-          else if isPatWildcard p then acc
-          else acc;  # 简化：嵌套模式 Phase 4.x 完善
-      in lib.foldl' go (mkDTLeaf body []) (lib.reverseList indexed);
-
-  # Record 模式编译
-  _compileRecord = pat: body: restArms:
-    let
-      fieldNames = builtins.attrNames (pat.fields or {});
-      # 将字段模式转为 bindings
-      bindings = map (n: { var = n; source = "_field_${n}"; }) fieldNames;
-    in mkDTLeaf body bindings;
-
-  # ══ Pattern 合法性检查（静态穷尽性 — 简化版）══════════════════════════════
-
-  # Type: [MatchArm] -> ADT Type -> { exhaustive: Bool; missing: [String] }
-  checkExhaustive = arms: adtType:
-    let
-      variantNames = if isType adtType && (adtType.repr.__variant or null) == "ADT"
-                     then map (v: v.name) (adtType.repr.variants or [])
-                     else [];
-      coveredVariants = lib.concatMap (arm:
-        let p = arm.pattern; in
-        if isPatCtor p then [ p.variantName ]
-        else if isPatWildcard p || isPatVar p then variantNames  # covers all
+      ctorsCovered = lib.concatMap (arm:
+        let pat = arm.pat; in
+        if (pat.__patTag or null) == "Ctor" then [ pat.name ]
+        else if (pat.__patTag or null) == "Wild" || (pat.__patTag or null) == "Var" then
+          map (v: v.name) adtVariants  # covers all
         else []
       ) arms;
-      missing = lib.filter (v: !builtins.elem v coveredVariants) variantNames;
+      allCtors = map (v: v.name) adtVariants;
+      missing  = lib.filter (c: !(builtins.elem c ctorsCovered)) allCtors;
     in
-    { exhaustive = missing == [];
-      missing    = missing; };
+    { exhaustive = missing == []; missing = missing; };
+
+  # ══ Pattern 变量提取 ══════════════════════════════════════════════════
+  patternVars = pat:
+    let tag = pat.__patTag or null; in
+    if tag == "Var" then [ pat.name ]
+    else if tag == "Ctor" then lib.concatMap patternVars pat.fields
+    else if tag == "And" then patternVars pat.p1 ++ patternVars pat.p2
+    else if tag == "Guard" then patternVars pat.pat
+    else if tag == "Record" then builtins.attrNames pat.fields
+    else [];
 }

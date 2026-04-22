@@ -1,196 +1,186 @@
-# runtime/instance.nix — Phase 4.1
-# Instance DB：typeclass 实例系统
-# 修复 Phase 3.x 关键 bugs：
-#   - RISK-A: canDischarge 现在验证 impl != null（soundness）
-#   - RISK-B: instanceKey 使用 NF-hash（INV-4 coherence）
-#   - superclass resolution 返回真实 impl（不再是 null）
-#   - coherence 覆盖 exact match（INV-I2）
+# runtime/instance.nix — Phase 4.2
+# Instance DB（RISK-A/B 修复，NF-hash instanceKey）
+# INV-I1: instanceKey = canonical hash（α-等价 → 相同 key）
+# INV-I2: canDischarge requires impl != null（soundness）
 { lib, typeLib, reprLib, kindLib, hashLib, normalizeLib }:
 
 let
-  inherit (typeLib) isType;
-  inherit (hashLib) typeHash instanceKey;
+  inherit (typeLib) isType mkTypeDefault;
+  inherit (hashLib) typeHash;
   inherit (normalizeLib) normalize';
 
 in rec {
-  # ── Instance DB 结构 ──────────────────────────────────────────────────────
-  # DB = {
-  #   instances : AttrSet(key -> InstanceEntry)
-  #   byClass   : AttrSet(className -> [key])
-  # }
-  # InstanceEntry = {
-  #   className   : String
-  #   args        : [Type]         -- 规范化后
-  #   impl        : Any | null     -- null 仅对 primitive builtins
-  #   specificity : Int            -- 越高越优先（overlapping 时）
-  #   source      : String         -- "user" | "primitive" | "derived"
-  #   overlaps    : [String]       -- 已知 overlap instance keys
-  # }
 
-  emptyDB = { instances = {}; byClass = {}; };
-
-  # ── 内部 key 生成（INV-4: NF-hash based，修复 RISK-B）────────────────────
-  # Type: String -> [Type] -> String
-  _instanceKey = className: args:
+  # ══ Instance 结构 ══════════════════════════════════════════════════════
+  # Type: Type → String → Any → Instance
+  mkInstance = ty: ctorName: data:
     let
+      normType = normalize' ty;
+      typeH    = typeHash normType;
+      dataH    = builtins.hashString "sha256" (builtins.toJSON data);
+    in {
+      __type = "Instance";
+      type   = normType;
+      ctor   = ctorName;
+      data   = data;
+      hash   = builtins.hashString "sha256" "${typeH}:${dataH}";
+    };
+
+  isInstance = i:
+    builtins.isAttrs i && (i.__type or null) == "Instance";
+
+  instanceEq = a: b:
+    assert isInstance a && isInstance b;
+    a.hash == b.hash;
+
+  instanceData = i: assert isInstance i; i.data;
+  instanceType = i: assert isInstance i; i.type;
+
+  # ══ Typeclass Instance 注册结构 ════════════════════════════════════════
+  # instanceRecord: { className; args: [Type]; impl; superclasses }
+  mkInstanceRecord = className: args: impl: superclasses:
+    let
+      # INV-I1 (RISK-B修复): NF-hash key（不用 toJSON）
       normArgs = map normalize' args;
-      argHashes = map (a: typeHash a) normArgs;
-    in
-    # sha256 of (className, sorted argHashes) — canonical
-    builtins.hashString "sha256"
-      (builtins.toJSON { c = className; a = argHashes; });
+      argHashes = lib.sort builtins.lessThan (map typeHash normArgs);
+      key = builtins.hashString "sha256"
+        (builtins.toJSON { c = className; a = argHashes; });
+      superclasses = if superclasses != null then superclasses else [];
+    in {
+      __type       = "InstanceRecord";
+      className    = className;
+      args         = normArgs;
+      impl         = impl;
+      superclasses = superclasses;
+      key          = key;
+    };
 
-  # ── Instance 注册 ─────────────────────────────────────────────────────────
-  # Type: DB -> String -> [Type] -> Any -> AttrSet -> DB
-  registerInstance = db: className: args: impl: opts:
+  isInstanceRecord = r:
+    builtins.isAttrs r && (r.__type or null) == "InstanceRecord";
+
+  # ══ Instance DB ════════════════════════════════════════════════════════
+  # DB = { className → { instanceKey → InstanceRecord } }
+  emptyDB = {};
+
+  # Type: DB → InstanceRecord → DB
+  registerInstance = db: record:
+    assert isInstanceRecord record;
     let
-      key         = _instanceKey className args;
-      specificity = opts.specificity or 0;
-      source      = opts.source or "user";
-      overlaps    = opts.overlaps or [];
-      normArgs    = map normalize' args;
-      entry = {
-        inherit className specificity source overlaps;
-        args   = normArgs;
-        impl   = impl;
-        key    = key;
-      };
-      # INV-I1: 禁止完全相同 key 的重复注册（exact coherence）
-      existing = db.instances.${key} or null;
-      # INV-I2: 检测 overlap（简化：仅 exact key 检测；Phase 4.2 扩展部分合一）
-      conflict = existing != null && existing.source != "primitive";
+      existing = db.${record.className} or {};
     in
-    if conflict then
-      builtins.throw "Instance coherence violation: duplicate instance for ${className}[${key}]"
-    else
-      let
-        newInstances = db.instances // { ${key} = entry; };
-        oldByClass   = db.byClass.${className} or [];
-        newByClass   = db.byClass // { ${className} = oldByClass ++ [ key ]; };
-      in
-      { instances = newInstances; byClass = newByClass; };
+    db // { ${record.className} = existing // { ${record.key} = record; }; };
 
-  # ── Primitive 内建 instances（不参与 coherence check，不可覆盖）──────────
-  _primitiveClasses = [ "Eq" "Ord" "Show" "Num" "Bool" "Hashable" ];
-
-  _resolvePrimitive = className: args:
+  # Type: DB → String → [Type] → InstanceRecord | null
+  lookupInstance = db: className: args:
     let
-      supported = _primitiveClasses;
-      isSup = builtins.elem className supported;
+      normArgs  = map normalize' args;
+      argHashes = lib.sort builtins.lessThan (map typeHash normArgs);
+      key       = builtins.hashString "sha256"
+        (builtins.toJSON { c = className; a = argHashes; });
+      classDB   = db.${className} or {};
     in
-    if !isSup then { found = false; impl = null; source = "none"; }
-    else
-      let
-        firstArg = if args == [] then null else builtins.head args;
-        primName = if firstArg == null then null
-                   else firstArg.repr.name or null;
-        isBuiltinPrim = primName != null &&
-          builtins.elem primName [ "Int" "Bool" "String" "Float" "Null" ];
-      in
-      if isBuiltinPrim
-      then
-        { found       = true;
-          # primitive impl 是标记（非 null），表示"内建实现"
-          impl        = { __primImpl = true; className = className; typeName = primName; };
-          source      = "primitive";
-          specificity = 100; }  # primitive 优先级最高
-      else { found = false; impl = null; source = "none"; };
+    classDB.${key} or null;
 
-  # ── DB 查询（exact match）───────────────────────────────────────────────
-  _resolveExact = db: className: args:
-    let key = _instanceKey className args; in
-    if db.instances ? ${key}
-    then
-      let e = db.instances.${key}; in
-      { found       = true;
-        impl        = e.impl;
-        source      = e.source;
-        specificity = e.specificity; }
-    else { found = false; impl = null; source = "none"; specificity = 0; };
-
-  # ── Superclass resolution（修复 RISK-A：返回真实 impl）────────────────────
-  # Type: AttrSet(classGraph) -> DB -> String -> [Type] -> ResolveResult
-  # classGraph: AttrSet(className -> [superclassName])
-  _resolveViaSuperclass = classGraph: db: className: args:
-    let
-      # 找到 className 的所有直接子类（sub <: className）
-      # 注意：classGraph[A] = [B, C] 表示 A 是 B 和 C 的超类
-      # 我们需要找：谁的 superclasses 包含 className？
-      allClasses = builtins.attrNames classGraph;
-      subClasses = lib.filter (sub:
-        builtins.elem className (classGraph.${sub} or [])
-      ) allClasses;
-      # 对每个 subclass，尝试查找 instance
-      subResults = map (sub:
-        let r = _resolveExact db sub args; in
-        r // { subClass = sub; }
-      ) subClasses;
-      # 找到第一个有 impl != null 的
-      validResults = lib.filter (r: r.found && r.impl != null) subResults;
-    in
-    if validResults == []
-    then { found = false; impl = null; source = "none"; specificity = 0; }
-    else
-      # 选 specificity 最高的（deterministic selection）
-      let best = lib.foldl'
-        (acc: r: if r.specificity > acc.specificity then r else acc)
-        (builtins.head validResults)
-        (builtins.tail validResults);
-      in
-      { found       = best.found;
-        impl        = best.impl;  # ← 修复 RISK-A：返回真实 impl
-        source      = "via-superclass:${best.subClass}";
-        specificity = best.specificity - 1; };  # 降低一档优先级
-
-  # ── 主 resolution pipeline（primitive → exact → superclass）─────────────
-  # Type: AttrSet(classGraph) -> DB -> String -> [Type] -> ResolveResult
+  # ══ resolveWithFallback（RISK-A 修复）════════════════════════════════
+  # INV-I2: found=true requires impl != null
+  # Type: ClassGraph → DB → String → [Type] → { found: Bool; impl; }
   resolveWithFallback = classGraph: db: className: args:
     let
-      # 阶段 1: primitive
-      prim = _resolvePrimitive className args;
+      direct = lookupInstance db className args;
     in
-    if prim.found then prim
+    if direct != null then
+      # Direct instance found
+      { found = true; impl = direct.impl; record = direct; }
+    else
+      # Try superclass resolution
+      let
+        superclasses = (classGraph.${className} or {}).superclasses or [];
+        superResult = lib.foldl' (acc: superClass:
+          if acc.found then acc
+          else resolveWithFallback classGraph db superClass args
+        ) { found = false; impl = null; record = null; } superclasses;
+      in
+      if superResult.found && superResult.impl != null then
+        # INV-I2: only return found=true if impl != null
+        superResult
+      else
+        { found = false; impl = null; record = null; };
+
+  # INV-I2 guard（RISK-A 修复）
+  canDischarge = resolveResult:
+    resolveResult.found && resolveResult.impl != null;
+
+  # ══ Phase 4.2: Global Coherence Check ════════════════════════════════
+  # INV-COH-1: No two instances overlap（全局一致性）
+  # 检测 DB 中是否存在重叠（相同 className + unifiable args）的 instances
+  checkGlobalCoherence = db: unifyFn:
+    let
+      checkClass = className: classDB:
+        let
+          records = builtins.attrValues classDB;
+          pairs   = lib.concatLists (lib.imap0 (i: r1:
+            lib.imap0 (j: r2:
+              if i >= j then []
+              else [ { a = r1; b = r2; } ]
+            ) records
+          ) records);
+          conflicts = lib.filter (pair:
+            let
+              r = lib.foldl' (acc: p:
+                if !acc.ok then acc
+                else unifyFn p.fst p.snd
+              ) { ok = true; subst = {}; }
+                (lib.zipListsWith (x: y: { fst = x; snd = y; })
+                  pair.a.args pair.b.args);
+            in
+            r.ok
+          ) pairs;
+        in
+        map (conflict: {
+          className  = className;
+          instance1  = conflict.a.key;
+          instance2  = conflict.b.key;
+        }) conflicts;
+    in
+    let
+      allConflicts = lib.concatLists (lib.mapAttrsToList checkClass db);
+    in
+    { ok = allConflicts == []; conflicts = allConflicts; };
+
+  # ══ mergeLocalInstances（INV-MOD-7, Phase 4.2 升级）═════════════════
+  # Phase 4.2: 支持 partial-unify overlap detection
+  # Type: DB(global) → DB(local) → UnifyFn → MergeResult
+  mergeLocalInstances = global: local: unifyFn:
+    let
+      localClasses = builtins.attrNames local;
+      # 检查 local 中每个 class 是否与 global 有 overlap
+      conflicts = lib.concatLists (map (className:
+        let
+          localRecords  = builtins.attrValues (local.${className} or {});
+          globalRecords = builtins.attrValues (global.${className} or {});
+        in
+        lib.concatLists (map (lr:
+          lib.filter (gr:
+            let
+              r = lib.foldl' (acc: p:
+                if !acc.ok then acc
+                else unifyFn p.fst p.snd
+              ) { ok = true; subst = {}; }
+                (lib.zipListsWith (x: y: { fst = x; snd = y; }) lr.args gr.args);
+            in r.ok
+          ) globalRecords
+        ) localRecords)
+      ) localClasses);
+    in
+    if conflicts != [] then
+      { ok = false; conflicts = map (r: r.key) conflicts; db = global; }
     else
       let
-        # 阶段 2: exact DB match
-        exact = _resolveExact db className args;
+        merged = lib.foldl' (acc: className:
+          let localClass  = local.${className} or {};
+              globalClass = acc.${className} or {};
+          in acc // { ${className} = globalClass // localClass; }
+        ) global localClasses;
       in
-      if exact.found then exact
-      else
-        # 阶段 3: superclass resolution（修复 RISK-A）
-        _resolveViaSuperclass classGraph db className args;
-
-  # ── canDischarge（修复 RISK-A: 必须验证 impl != null）────────────────────
-  # Type: AttrSet(classGraph) -> DB -> Constraint -> Bool
-  canDischarge = classGraph: db: constraint:
-    let tag = constraint.__constraintTag or null; in
-    if tag == "Class" then
-      let r = resolveWithFallback classGraph db constraint.className (constraint.args or []); in
-      # 修复：found AND impl != null（soundness 保证）
-      r.found && r.impl != null
-    else false;
-
-  # ── Instance listing（调试/反射用，stable 顺序）──────────────────────────
-  listInstances = db:
-    let keys = lib.sort (a: b: a < b) (builtins.attrNames db.instances); in
-    map (key:
-      let e = db.instances.${key}; in
-      { inherit key;
-        className   = e.className;
-        specificity = e.specificity;
-        source      = e.source;
-        hasImpl     = e.impl != null;
-        overlaps    = e.overlaps or []; }
-    ) keys;
-
-  listClassInstances = db: className:
-    let
-      keys = db.byClass.${className} or [];
-      withSpec = map (k:
-        let e = db.instances.${k} or {}; in
-        { key = k; specificity = e.specificity or 0; }
-      ) keys;
-    in lib.sort (a: b: a.specificity > b.specificity) withSpec;
-
-  instanceCount = db: builtins.length (builtins.attrNames db.instances);
+      { ok = true; conflicts = []; db = merged; };
 }

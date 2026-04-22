@@ -1,222 +1,151 @@
-# normalize/unified_subst.nix — Phase 4.1
-# UnifiedSubst：统一替换系统（type + row + kind）
-# INV-US1: compose law 成立
-# INV-US2: apply idempotent（apply ∘ apply = apply）
-# INV-US3: 前缀不冲突（t: vs r: vs k:）
-# INV-US4: fromLegacy 转换保持语义
-# INV-US5: empty 是左右单位元
-{ lib, typeLib, kindLib, reprLib, substLib }:
+# normalize/unified_subst.nix — Phase 4.2
+# UnifiedSubst: type + row + kind 统一替换
+# INV-US1: compose law (f ∘ g)(x) = f(g(x))
+# INV-US3: 键前缀不冲突 t:/r:/k:
+{ lib, typeLib, reprLib, kindLib, substLib }:
 
 let
-  inherit (typeLib) isType mkTypeWith mkTypeDefault;
-  inherit (kindLib) isKind;
-  inherit (substLib) substitute applySubst freeVars;
+  inherit (typeLib) isType mkTypeWith;
+  inherit (kindLib) applyKindSubst;
+  inherit (substLib) substitute applyUnifiedSubst;
 
-  # ── 前缀常量（INV-US3）────────────────────────────────────────────────────
-  TYPE_PREFIX = "t:";
-  ROW_PREFIX  = "r:";
-  KIND_PREFIX = "k:";
+in rec {
 
-  # ── UnifiedSubst 构造器 ────────────────────────────────────────────────────
-  # { typeBindings: "t:${name}" -> Type
-  # , rowBindings:  "r:${name}" -> Type(Row)
-  # , kindBindings: "k:${name}" -> Kind
-  # }
+  # ══ UnifiedSubst 构造器 ════════════════════════════════════════════════
+  # { typeBindings: {name → Type}; rowBindings: {name → Type}; kindBindings: {name → Kind} }
+
   emptySubst = {
     typeBindings = {};
     rowBindings  = {};
     kindBindings = {};
   };
 
-  mkSubst = typeB: rowB: kindB: {
-    typeBindings = typeB;
-    rowBindings  = rowB;
-    kindBindings = kindB;
-  };
+  # Type: String → Type → UnifiedSubst
+  singleTypeBinding = name: t:
+    emptySubst // { typeBindings = { ${name} = t; }; };
 
-  # ── 单条 binding 构造器 ───────────────────────────────────────────────────
-  # Type: String -> Type -> UnifiedSubst
-  singleTypeBinding = varName: ty:
-    mkSubst { ${TYPE_PREFIX + varName} = ty; } {} {};
+  # Type: String → Type → UnifiedSubst
+  singleRowBinding = name: r:
+    emptySubst // { rowBindings = { ${name} = r; }; };
 
-  singleRowBinding = rowVarName: rowTy:
-    mkSubst {} { ${ROW_PREFIX + rowVarName} = rowTy; } {};
+  # Type: String → Kind → UnifiedSubst
+  singleKindBinding = name: k:
+    emptySubst // { kindBindings = { ${name} = k; }; };
 
-  singleKindBinding = kindVarName: k:
-    mkSubst {} {} { ${KIND_PREFIX + kindVarName} = k; };
+  # ══ Subst 判断 ═════════════════════════════════════════════════════════
+  isSubst = s:
+    builtins.isAttrs s &&
+    s ? typeBindings && s ? rowBindings && s ? kindBindings;
 
-  # ── Subst 应用（apply type subst to Type）────────────────────────────────
-  # INV-US1: applyTypeSubst(compose(s1,s2), t) = applyTypeSubst(s2, applyTypeSubst(s1, t))
-  applyTypeSubst = subst: t:
+  isEmpty = s:
+    isSubst s &&
+    builtins.attrNames s.typeBindings == [] &&
+    builtins.attrNames s.rowBindings  == [] &&
+    builtins.attrNames s.kindBindings == [];
+
+  # ══ Subst 组合（INV-US1: compose law）════════════════════════════════
+  # composeSubst f g: 先应用 g，再应用 f
+  # (f ∘ g)(t) = f(g(t))
+  composeSubst = f: g:
+    let
+      # 将 f 应用到 g 的 typeBindings 的每个值
+      newTypeBindings =
+        (builtins.mapAttrs (n: t:
+          _applySubstToType f t
+        ) g.typeBindings)
+        //
+        # f 中 g 没有的绑定保留
+        (lib.filterAttrs (n: v: !(g.typeBindings ? ${n})) f.typeBindings);
+
+      newRowBindings =
+        (builtins.mapAttrs (n: r:
+          _applySubstToType f r
+        ) g.rowBindings)
+        //
+        (lib.filterAttrs (n: v: !(g.rowBindings ? ${n})) f.rowBindings);
+
+      newKindBindings =
+        (builtins.mapAttrs (n: k:
+          applyKindSubst f.kindBindings k
+        ) g.kindBindings)
+        //
+        (lib.filterAttrs (n: v: !(g.kindBindings ? ${n})) f.kindBindings);
+    in
+    {
+      typeBindings = newTypeBindings;
+      rowBindings  = newRowBindings;
+      kindBindings = newKindBindings;
+    };
+
+  # ── 内部：将 subst 应用到 type ───────────────────────────────────────
+  _applySubstToType = usubst: t:
     if !isType t then t
     else
       let
-        # 从 typeBindings 提取 varName -> Type 映射
-        typeB  = subst.typeBindings or {};
-        tkeys  = builtins.attrNames typeB;
-        # 去掉前缀 "t:"
-        varMap = builtins.listToAttrs (map (k: {
-          name  = builtins.substring (builtins.stringLength TYPE_PREFIX) (-1) k;
-          value = typeB.${k};
-        }) tkeys);
+        # 先 apply typeBindings 中的绑定
+        typeBindings = usubst.typeBindings or {};
+        rowBindings  = usubst.rowBindings or {};
+        v            = t.repr.__variant or null;
       in
-      applySubst varMap t;
+      if v == "Var" then
+        let bound = typeBindings.${t.repr.name} or null; in
+        if bound != null then bound else t
+      else
+        # 递归 apply 到子项
+        applyUnifiedSubst usubst t;
 
-  # Row subst 应用
-  applyRowSubst = subst: t:
-    if !isType t then t
+  # ══ Subst 应用（主 API）═══════════════════════════════════════════════
+  # Type: UnifiedSubst → Type → Type
+  applySubst = usubst: t:
+    if isEmpty usubst then t
+    else _applySubstToType usubst t;
+
+  # ══ Constraint 上的 Subst 应用 ════════════════════════════════════════
+  # Type: UnifiedSubst → Constraint → Constraint
+  applySubstToConstraint = usubst: c:
+    if !builtins.isAttrs c then c
     else
-      let
-        rowB   = subst.rowBindings or {};
-        rkeys  = builtins.attrNames rowB;
-        varMap = builtins.listToAttrs (map (k: {
-          name  = builtins.substring (builtins.stringLength ROW_PREFIX) (-1) k;
-          value = rowB.${k};
-        }) rkeys);
-      in
-      applySubst varMap t;
+      let tag = c.__constraintTag or null; in
+      if tag == "Equality" then
+        c // { lhs = applySubst usubst c.lhs; rhs = applySubst usubst c.rhs; }
+      else if tag == "Class" then
+        c // { args = map (applySubst usubst) c.args; }
+      else if tag == "RowEquality" then
+        c // { lhsRow = applySubst usubst c.lhsRow; rhsRow = applySubst usubst c.rhsRow; }
+      else if tag == "Predicate" then
+        c // { subject = applySubst usubst c.subject; }
+      else if tag == "Refined" then
+        c // { subject = applySubst usubst c.subject; }
+      else if tag == "Implies" then
+        c // {
+          premises   = map (applySubstToConstraint usubst) c.premises;
+          conclusion = applySubstToConstraint usubst c.conclusion;
+        }
+      else c;
 
-  # 完整 UnifiedSubst 应用（先 type，再 row）
-  applyUnifiedSubst = subst: t:
-    let
-      t1 = applyTypeSubst subst t;
-      t2 = applyRowSubst  subst t1;
-    in t2;
+  # Type: UnifiedSubst → [Constraint] → [Constraint]
+  applySubstToConstraints = usubst: cs:
+    if isEmpty usubst then cs
+    else map (applySubstToConstraint usubst) cs;
 
-  # ── Constraint 应用 ────────────────────────────────────────────────────────
-  applySubstToType = subst: t: applyUnifiedSubst subst t;
+  # ══ Legacy compat（Phase 4.0 API）════════════════════════════════════
+  # Type: {name→Type} → UnifiedSubst
+  fromLegacyTypeSubst = ts:
+    emptySubst // { typeBindings = ts; };
 
-  applySubstToConstraint = subst: c:
-    let tag = c.__constraintTag or c.__tag or null; in
-    if tag == "Equality" then
-      c // { lhs = applySubstToType subst c.lhs;
-             rhs = applySubstToType subst c.rhs; }
-    else if tag == "Class" then
-      c // { args = map (applySubstToType subst) (c.args or []); }
-    else if tag == "Predicate" then
-      c // { subject = applySubstToType subst (c.subject or c.arg); }
-    else if tag == "RowEquality" then
-      c // { lhsRow = applySubstToType subst c.lhsRow;
-             rhsRow = applySubstToType subst c.rhsRow; }
-    else if tag == "Implies" then
-      c // { premises   = map (applySubstToConstraint subst) (c.premises or []);
-             conclusion = applySubstToConstraint subst c.conclusion; }
-    else if tag == "Refined" then
-      c // { subject = applySubstToType subst c.subject; }
-    else c;  # 未知 tag，原样返回
+  # Type: {name→Type} → UnifiedSubst
+  fromLegacyRowSubst = rs:
+    emptySubst // { rowBindings = rs; };
 
-  applySubstToConstraints = subst: cs:
-    map (applySubstToConstraint subst) cs;
+  # ══ Subst 域（用于 occurs check）═════════════════════════════════════
+  substDomain = s:
+    builtins.attrNames s.typeBindings ++
+    builtins.attrNames s.rowBindings ++
+    builtins.attrNames s.kindBindings;
 
-  # ── Compose（INV-US1 核心）────────────────────────────────────────────────
-  # compose(s1, s2).apply(t) = s2.apply(s1.apply(t))
-  # 实现：s2 的 bindings 中对 value 应用 s1，再合并
-  composeSubst = s1: s2:
-    let
-      # s2 中所有 type bindings 的 value，用 s1 替换
-      s2TypeKeys = builtins.attrNames (s2.typeBindings or {});
-      newTypeB   = builtins.listToAttrs (map (k: {
-        name  = k;
-        value = applyTypeSubst s1 s2.typeBindings.${k};
-      }) s2TypeKeys);
-
-      # s2 中所有 row bindings 的 value，用 s1 替换
-      s2RowKeys = builtins.attrNames (s2.rowBindings or {});
-      newRowB   = builtins.listToAttrs (map (k: {
-        name  = k;
-        value = applyRowSubst s1 s2.rowBindings.${k};
-      }) s2RowKeys);
-
-      # s2 kind bindings（kind subst 独立，不互相依赖）
-      newKindB = s2.kindBindings or {};
-
-      # 合并：s2 优先（s2 的 binding 覆盖 s1 中相同 key）
-      mergedTypeB = (s1.typeBindings or {}) // newTypeB;
-      mergedRowB  = (s1.rowBindings  or {}) // newRowB;
-      mergedKindB = (s1.kindBindings or {}) // newKindB;
-    in
-    mkSubst mergedTypeB mergedRowB mergedKindB;
-
-  # ── Legacy 转换（从旧格式迁移）───────────────────────────────────────────
-  # INV-US4: 语义保持
-
-  # 从 AttrSet(String -> Type) 转为 UnifiedSubst（类型替换部分）
-  fromLegacyTypeSubst = legacySubst:
-    let
-      keys     = builtins.attrNames legacySubst;
-      typeB    = builtins.listToAttrs (map (k: {
-        name  = TYPE_PREFIX + k;
-        value = legacySubst.${k};
-      }) keys);
-    in mkSubst typeB {} {};
-
-  # 从 AttrSet(String -> Type) 转为 UnifiedSubst（行替换部分）
-  fromLegacyRowSubst = legacyRowSubst:
-    let
-      keys  = builtins.attrNames legacyRowSubst;
-      rowB  = builtins.listToAttrs (map (k: {
-        name  = ROW_PREFIX + k;
-        value = legacyRowSubst.${k};
-      }) keys);
-    in mkSubst {} rowB {};
-
-  # 提取 type bindings 为旧格式（向后兼容）
-  toLegacyTypeSubst = subst:
-    let
-      typeB = subst.typeBindings or {};
-      keys  = builtins.attrNames typeB;
-    in
-    builtins.listToAttrs (map (k: {
-      name  = builtins.substring (builtins.stringLength TYPE_PREFIX) (-1) k;
-      value = typeB.${k};
-    }) keys);
-
-  toLegacyRowSubst = subst:
-    let
-      rowB  = subst.rowBindings or {};
-      keys  = builtins.attrNames rowB;
-    in
-    builtins.listToAttrs (map (k: {
-      name  = builtins.substring (builtins.stringLength ROW_PREFIX) (-1) k;
-      value = rowB.${k};
-    }) keys);
-
-  # ── Subst 查询 ────────────────────────────────────────────────────────────
-  lookupType = subst: varName:
-    let k = TYPE_PREFIX + varName; in
-    if subst.typeBindings ? ${k} then subst.typeBindings.${k} else null;
-
-  lookupRow = subst: rowVarName:
-    let k = ROW_PREFIX + rowVarName; in
-    if subst.rowBindings ? ${k} then subst.rowBindings.${k} else null;
-
-  # ── Subst 元信息 ──────────────────────────────────────────────────────────
-  isEmptySubst = subst:
-    builtins.attrNames (subst.typeBindings or {}) == [] &&
-    builtins.attrNames (subst.rowBindings  or {}) == [] &&
-    builtins.attrNames (subst.kindBindings or {}) == [];
-
-  substSize = subst:
-    builtins.length (builtins.attrNames (subst.typeBindings or {})) +
-    builtins.length (builtins.attrNames (subst.rowBindings  or {})) +
-    builtins.length (builtins.attrNames (subst.kindBindings or {}));
-
-  # ── Phase 4.1: QueryKey schema validation ────────────────────────────────
-  # INV-QK-SCHEMA: 所有 key 通过 mkQueryKey 构造，格式固定
-  validSubstKeyPrefixes = [ TYPE_PREFIX ROW_PREFIX KIND_PREFIX ];
-
-  validateSubstKey = key:
-    lib.any (pfx: lib.hasPrefix pfx key) validSubstKeyPrefixes;
-
-in {
-  inherit emptySubst mkSubst
-          singleTypeBinding singleRowBinding singleKindBinding
-          applyTypeSubst applyRowSubst applyUnifiedSubst
-          applySubstToType applySubstToConstraint applySubstToConstraints
-          composeSubst
-          fromLegacyTypeSubst fromLegacyRowSubst
-          toLegacyTypeSubst toLegacyRowSubst
-          lookupType lookupRow
-          isEmptySubst substSize
-          validateSubstKey;
+  # ══ Subst 上的 vars（值域的自由变量）════════════════════════════════
+  substRange = s:
+    let typeVars = lib.concatMap (typeLib.freeVars) (builtins.attrValues s.typeBindings);
+        rowVars  = lib.concatMap (typeLib.freeVars) (builtins.attrValues s.rowBindings);
+    in lib.unique (typeVars ++ rowVars);
 }

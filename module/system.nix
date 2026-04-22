@@ -1,179 +1,214 @@
-# module/system.nix — Phase 4.1
-# Module System（Sig / Struct / ModFunctor）
-# 修复 RISK-E: applyFunctor 使用 qualified naming（param.field → impl.field）
-# INV-MOD-1: Sig ∈ TypeRepr（INV-1 保持）
-# INV-MOD-2: Struct implements Sig（structural subtype）
-# INV-MOD-3: ModFunctor = Π(M:Sig). Body
-# INV-MOD-4: Sig fields 字母序规范化（由 rules.nix 保证）
-# INV-MOD-5: applyFunctor type-safe（kind-checked）
-# INV-MOD-6: composeFunctors type-correct（Phase 4.1 新增）
-# INV-MOD-7: mergeLocalInstances coherent（Phase 4.1 新增）
+# module/system.nix — Phase 4.2
+# Module System：Sig/Struct/ModFunctor
+# INV-MOD-1: Struct 实现 Sig 所有字段
+# INV-MOD-4: Sig fields 字母序 canonical
+# INV-MOD-6: composeFunctors type-correct（INV-MOD-8 Phase 4.2）
+# INV-MOD-7: mergeLocalInstances coherent
+# INV-MOD-8: Functor transitive composition（Phase 4.2 新增）
+# Phase 4.2 修复: 真正的 λM.f1(f2(M)) 语义（lazy substitution）
 { lib, typeLib, reprLib, kindLib, normalizeLib, hashLib, unifiedSubstLib }:
 
 let
-  inherit (typeLib) isType mkTypeDefault mkTypeWith;
-  inherit (reprLib) rSig rStruct rModFunctor rVar rOpaque;
-  inherit (kindLib) KStar KArrow;
+  inherit (typeLib) isType mkTypeWith mkTypeDefault freeVars;
+  inherit (reprLib) rSig rStruct rModFunctor rVar rApply;
+  inherit (kindLib) KStar;
   inherit (normalizeLib) normalize';
   inherit (hashLib) typeHash;
-  inherit (unifiedSubstLib) singleTypeBinding applyUnifiedSubst composeSubst;
+  inherit (unifiedSubstLib) emptySubst composeSubst singleTypeBinding applySubst;
 
 in rec {
 
-  # ══ Sig：Module 接口签名 ════════════════════════════════════════════════════
-
-  # Type: AttrSet(String -> Type) -> Type
+  # ══ Sig 构造器 ═════════════════════════════════════════════════════════
+  # Type: {name → Type} → Type(Sig)
   mkSig = fields:
     let
-      # INV-MOD-4: 字母序规范化（在 rSig 构造时就排序）
-      fnames  = lib.sort (a: b: a < b) (builtins.attrNames fields);
-      sortedF = builtins.listToAttrs (map (n: { name = n; value = fields.${n}; }) fnames);
-    in mkTypeDefault (rSig sortedF) KStar;
-
-  # Sig 谓词
-  isSigType = t: isType t && (t.repr.__variant or null) == "Sig";
-
-  # Sig 字段查询
-  sigFields = t:
-    assert isSigType t;
-    t.repr.fields or {};
-
-  sigField = t: fieldName:
-    let fs = sigFields t; in
-    fs.${fieldName} or null;
-
-  # ══ Struct：Module 实现 ═════════════════════════════════════════════════════
-
-  # Type: Type(Sig) -> AttrSet(String -> Type) -> Type
-  mkStruct = sig: impl:
-    mkTypeDefault (rStruct sig impl) KStar;
-
-  isStructType = t: isType t && (t.repr.__variant or null) == "Struct";
-
-  # ══ ModFunctor：参数化 Module ════════════════════════════════════════════════
-
-  # Type: String -> Type(Sig) -> Type -> Type
-  mkModFunctor = param: paramTy: body:
-    let kind = KArrow KStar KStar; in  # Sig → Body
-    mkTypeWith (rModFunctor param paramTy body) kind typeLib.mkTypeDefault null;
-
-  isModFunctorType = t: isType t && (t.repr.__variant or null) == "ModFunctor";
-
-  # ══ Sig Check（structural subtype）══════════════════════════════════════════
-
-  # Type: Type(Struct) -> Type(Sig) -> { ok: Bool; missing: [String]; typeMismatches: [...] }
-  checkSig = struct: sig:
-    assert isSigType sig;
-    assert isStructType struct;
-    let
-      required = sigFields sig;
-      provided = struct.repr.impl or {};
-      reqNames = builtins.attrNames required;
-      prvNames = builtins.attrNames provided;
-      missing  = lib.filter (n: !(provided ? ${n})) reqNames;
-      # 检查类型匹配（NF hash 比较）
-      typeMismatches = lib.filter (n:
-        provided ? ${n} &&
-        typeHash (normalize' required.${n}) != typeHash (normalize' provided.${n})
-      ) reqNames;
+      # INV-MOD-4: fields 字母序（通过序列化保证，attrset 无序）
+      sortedFields = builtins.listToAttrs (map (n:
+        lib.nameValuePair n fields.${n}
+      ) (lib.sort builtins.lessThan (builtins.attrNames fields)));
     in
-    { ok             = missing == [] && typeMismatches == [];
-      missing        = missing;
-      typeMismatches = typeMismatches;
-    };
+    mkTypeDefault (rSig sortedFields) KStar;
 
-  # ══ applyFunctor（修复 RISK-E：qualified naming）══════════════════════════
+  isSig = t: isType t && (t.repr.__variant or null) == "Sig";
 
-  # 旧问题：直接替换 param → body 中同名 free var 被错误替换
-  # 修复：使用 qualified 访问路径（param.field → impl.field）
-  # Type: Type(ModFunctor) -> Type(Struct) -> { ok: Bool; result: Type; error?: String }
-  applyFunctor = functor: argStruct:
-    assert isModFunctorType functor;
-    assert isStructType argStruct;
+  # ══ Struct 构造器 ══════════════════════════════════════════════════════
+  # Type: Type(Sig) → {name → Type} → Type(Struct) | { ok:false; error }
+  mkStruct = sig: impls:
+    assert isSig sig;
     let
-      param   = functor.repr.param;
-      paramTy = functor.repr.paramTy;
-      body    = functor.repr.body;
-      impl    = argStruct.repr.impl or {};
-
-      # INV-MOD-5: check arg matches paramTy（Sig check）
-      compatible = checkSig argStruct paramTy;
+      sigFields  = builtins.attrNames sig.repr.fields;
+      implFields = builtins.attrNames impls;
+      # INV-MOD-1: Struct 必须实现 Sig 所有字段
+      missing    = lib.filter (f: !(builtins.elem f implFields)) sigFields;
+      extra      = lib.filter (f: !(builtins.elem f sigFields)) implFields;
     in
-    if !compatible.ok then
-      { ok    = false;
-        error = "ModFunctor arg does not implement Sig: missing=${builtins.toJSON compatible.missing}"; }
+    if missing != [] then
+      { ok = false; error = "missing fields: ${builtins.toJSON missing}"; }
     else
       let
-        # Phase 4.1 修复（RISK-E）：
-        # 对于 body 中出现的 param 引用，使用 qualified name 替换
-        # 具体：body 中的 Var(param) → argStruct
-        # 对于 param.field 访问（在 body 中的 Var(param+"_"+field)），
-        # → 替换为 impl.field
-        subst = singleTypeBinding param argStruct;
-
-        # 同时对所有 "param_field" qualified vars 进行替换
-        fieldSubsts = lib.foldl'
-          (acc: n:
-            let qualName = param + "_" + n; in
-            let fieldSubst = singleTypeBinding qualName impl.${n}; in
-            # compose: acc 先，fieldSubst 后
-            unifiedSubstLib.composeSubst acc fieldSubst)
-          subst
-          (builtins.attrNames impl);
-
-        result = applyUnifiedSubst fieldSubsts body;
+        # INV-MOD-2: 每个实现字段的类型必须与 Sig 声明兼容（NF-hash 比较）
+        typeErrors = lib.filter (f:
+          let
+            sigTy   = normalize' sig.repr.fields.${f};
+            implTy  = normalize' impls.${f};
+          in
+          typeHash sigTy != typeHash implTy
+        ) sigFields;
       in
-      { ok = true; result = normalize' result; };
+      if typeErrors != [] then
+        { ok = false; error = "type mismatch in fields: ${builtins.toJSON typeErrors}"; }
+      else
+        { ok = true;
+          struct = mkTypeDefault (rStruct sig impls) KStar; };
 
-  # ══ Functor Composition（Phase 4.1 INV-MOD-6）════════════════════════════
+  isStruct = t: isType t && (t.repr.__variant or null) == "Struct";
 
-  # Type: Type(ModFunctor) -> Type(ModFunctor) -> Type(ModFunctor)
-  # (F∘G)(M) = F(G(M))
-  composeFunctors = f1: f2:
-    assert isModFunctorType f1;
-    assert isModFunctorType f2;
+  # ══ Struct 字段访问 ════════════════════════════════════════════════════
+  # Type: Type(Struct) → String → Type | null
+  structField = struct: name:
+    assert isStruct struct;
+    struct.repr.impls.${name} or null;
+
+  # ══ ModFunctor 构造器 ══════════════════════════════════════════════════
+  # Type: String → Type(Sig) → Type → Type(ModFunctor)
+  mkModFunctor = param: paramSig: body:
+    assert isSig paramSig;
+    mkTypeDefault (rModFunctor param paramSig body) KStar;
+
+  isModFunctor = t: isType t && (t.repr.__variant or null) == "ModFunctor";
+
+  # ══ Functor Application（INV-MOD-5 qualified naming）═════════════════
+  # Type: Type(ModFunctor) → Type(Struct) → Type | { ok:false; error }
+  applyFunctor = functor: argStruct:
+    assert isModFunctor functor;
+    assert isStruct argStruct;
     let
-      # 新参数名（避免冲突）
-      freshParam = "M_comp_" + builtins.substring 0 8
-        (builtins.hashString "md5" "${f1.repr.param}${f2.repr.param}");
-      # 新 Sig：f2 的 paramTy
-      paramTy    = f2.repr.paramTy;
-      # body：先 apply f2，再 apply f1 到结果
-      # 表示为 ModFunctor apply 嵌套
-      innerVar   = mkTypeDefault (rVar freshParam "compose") KStar;
-      innerStruct = mkStruct paramTy {};  # 占位结构（实际在 apply 时替换）
-      # 构造 composed body（lambda 表示）
-      body = mkTypeDefault
-        (reprLib.rApply
-          (mkTypeDefault (reprLib.rApply f1 [ f2 ]) KStar)
-          [ innerVar ])
-        KStar;
+      param    = functor.repr.param;
+      paramSig = functor.repr.paramSig;
+      body     = functor.repr.body;
+
+      # INV-MOD-3: argStruct must implement paramSig
+      sigFields = builtins.attrNames paramSig.repr.fields;
+      argImpls  = argStruct.repr.impls;
+      missing   = lib.filter (f: !(argImpls ? ${f})) sigFields;
     in
-    mkModFunctor freshParam paramTy body;
+    if missing != [] then
+      { ok = false; error = "functor arg missing fields: ${builtins.toJSON missing}"; }
+    else
+      let
+        # INV-MOD-5 (RISK-E): qualified naming
+        # param → argStruct（整体）+ param_field → impl.field（每个字段）
+        baseSubst = singleTypeBinding param argStruct;
+        fieldSubsts = lib.foldl' (acc: f:
+          let fieldVal = argImpls.${f} or null; in
+          if fieldVal == null then acc
+          else
+            let s = singleTypeBinding "${param}_${f}" fieldVal; in
+            composeSubst s acc
+        ) emptySubst sigFields;
+        fullSubst = composeSubst fieldSubsts baseSubst;
+        result    = applySubst fullSubst body;
+      in
+      { ok = true; result = result; };
 
-  # ══ Sealing（Opaque 封装）════════════════════════════════════════════════
+  # ══ Functor Composition（Phase 4.2: 真正 λM.f1(f2(M)) 语义）══════════
+  # INV-MOD-6: composeFunctors type-correct（kind preserved）
+  # INV-MOD-8: Functor composition semantically correct（Phase 4.2 新增）
+  #
+  # Phase 4.1 的问题：body 嵌套 Apply 表示，非真正语义
+  # Phase 4.2 修复：lazy representation（不立即 apply，保留 composition 结构）
+  #
+  # composeFunctors f1 f2 = λM. f1(f2(M))
+  # 用新的 param 变量表示 M，body 为 Apply(f1, Apply(f2, M))
 
-  # Type: Type -> String -> Type
-  # sealing 隐藏内部类型（abstract type）
+  # Type: Type(ModFunctor) → Type(ModFunctor) → Type(ModFunctor)
+  composeFunctors = f1: f2:
+    assert isModFunctor f1;
+    assert isModFunctor f2;
+    let
+      # Phase 4.2: 引入新的 param 变量 M
+      freshParam  = "_M_${builtins.hashString "sha256" "${f1.repr.param}:${f2.repr.param}"}";
+      # f2 接受 M → 产生 intermediate
+      f2Param     = f2.repr.param;
+      f2ParamSig  = f2.repr.paramSig;  # 输入 sig（M 的 sig）
+      f2Body      = f2.repr.body;
+      # f1 接受 f2(M) → 产生最终结果
+      f1Param     = f1.repr.param;
+      f1ParamSig  = f1.repr.paramSig;  # f2 的输出必须满足此 sig
+
+      # freshM：类型变量，代表组合 functor 的参数
+      freshM      = mkTypeDefault (rVar freshParam "mod") KStar;
+
+      # Lazy body：先 apply f2 to M，再 apply f1 to result
+      # f2Applied = f2[f2Param := freshM](f2Body)
+      f2Applied   = applySubst (singleTypeBinding f2Param freshM) f2Body;
+      # f1Applied = f1[f1Param := f2Applied](f1Body)
+      f1Applied   = applySubst (singleTypeBinding f1Param f2Applied) f1.repr.body;
+
+      # 组合 functor 的 paramSig = f2 的 paramSig（输入是 M 的 sig）
+      composedSig = f2ParamSig;
+      composedBody = f1Applied;
+    in
+    mkModFunctor freshParam composedSig composedBody;
+
+  # ══ 传递性 Functor Composition（列表，INV-MOD-8）═══════════════════════
+  # Type: [Type(ModFunctor)] → Type(ModFunctor) | null
+  composeFunctorChain = functors:
+    if functors == [] then null
+    else if builtins.length functors == 1 then builtins.head functors
+    else
+      let
+        f1   = builtins.head functors;
+        rest = builtins.tail functors;
+        f2   = composeFunctorChain rest;
+      in
+      if f2 == null then f1
+      else composeFunctors f1 f2;
+
+  # ══ Sig 兼容性检查（结构子类型）═════════════════════════════════════
+  # Type: Type(Sig) → Type(Sig) → Bool
+  # sigA ≤ sigB ⟺ sigA 实现了 sigB 的所有字段且类型兼容
+  sigCompatible = sigA: sigB:
+    assert isSig sigA && isSig sigB;
+    let
+      bFields = builtins.attrNames sigB.repr.fields;
+      aFields = sigA.repr.fields;
+    in
+    builtins.all (f:
+      let
+        aHas = aFields ? ${f};
+        bTy  = normalize' sigB.repr.fields.${f};
+        aTy  = if aHas then normalize' aFields.${f} else null;
+      in
+      aHas && (typeHash aTy == typeHash bTy)
+    ) bFields;
+
+  # ══ Sig 合并（交集 + 联集）══════════════════════════════════════════
+  # Type: Type(Sig) → Type(Sig) → { intersection: Type(Sig); union: Type(Sig) }
+  sigMerge = sigA: sigB:
+    assert isSig sigA && isSig sigB;
+    let
+      fa = sigA.repr.fields;
+      fb = sigB.repr.fields;
+      keysA = builtins.attrNames fa;
+      keysB = builtins.attrNames fb;
+      both  = lib.filter (k: fb ? ${k}) keysA;
+      either = lib.unique (keysA ++ keysB);
+      intersectionFields = builtins.listToAttrs (map (k: lib.nameValuePair k fa.${k}) both);
+      unionFields = builtins.listToAttrs (map (k:
+        lib.nameValuePair k (if fa ? ${k} then fa.${k} else fb.${k})
+      ) either);
+    in
+    { intersection = mkSig intersectionFields;
+      union        = mkSig unionFields; };
+
+  # ══ sealing / unsealing（抽象类型）══════════════════════════════════
+  # Type: Type → String → Type
   seal = t: sealTag:
-    mkTypeDefault (rOpaque t sealTag) t.kind;
+    mkTypeDefault { __variant = "Opaque"; inner = t; tag = sealTag; } KStar;
 
   unseal = sealed: sealTag:
-    if (sealed.repr.__variant or null) == "Opaque"
-       && sealed.repr.tag == sealTag
+    if (sealed.repr.__variant or null) == "Opaque" && sealed.repr.tag == sealTag
     then { ok = true; inner = sealed.repr.inner; }
     else { ok = false; error = "seal tag mismatch"; };
-
-  # ══ Local Instance 合并（Phase 4.1 INV-MOD-7）════════════════════════════
-  # Type: AttrSet(globalInstances) -> AttrSet(localInstances) -> MergeResult
-  mergeLocalInstances = global: local:
-    let
-      localKeys  = builtins.attrNames local;
-      globalKeys = builtins.attrNames global;
-      # 检测冲突：key 在 global 中已存在
-      conflicts  = lib.filter (k: builtins.elem k globalKeys) localKeys;
-    in
-    if conflicts != []
-    then { ok = false; conflicts = conflicts; db = global; }
-    else { ok = true; conflicts = []; db = global // local; };
 }

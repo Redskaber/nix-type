@@ -1,59 +1,50 @@
-# core/meta.nix — Phase 4.1
-# MetaType：语义控制层（控制 normalize/equality/hash 行为）
-# Meta 不是注释，是语义参数
+# core/meta.nix — Phase 4.2
+# MetaType：语义控制层（不只是 metadata，控制 normalize/equality/hash 行为）
 { lib }:
 
 rec {
-  # ── MetaType 结构 ─────────────────────────────────────────────────────────
-  mkMeta =
-    { eqStrategy   ? "structural"  # "structural" | "nominal"
-    , hashStrategy ? "normalized"  # "repr" | "normalized"（INV-4 要求 normalized）
-    , evalStrategy ? "lazy"        # "strict" | "lazy"
-    , muPolicy     ? "equi"        # "equi" | "iso" — 递归类型展开策略
-    , rowPolicy    ? "open"        # "open" | "closed" — Row 类型策略
-    , bidirPolicy  ? "check"       # "check" | "infer" — 双向类型策略
-    , constraints  ? []            # 默认附加约束 [Constraint]
-    , phase        ? "4.1"         # 创建时的 Phase（便于迁移诊断）
-    }:
-    { __type       = "MetaType";
-      eqStrategy   = eqStrategy;
-      hashStrategy = hashStrategy;
-      evalStrategy = evalStrategy;
-      muPolicy     = muPolicy;
-      rowPolicy    = rowPolicy;
-      bidirPolicy  = bidirPolicy;
-      constraints  = constraints;
-      phase        = phase;
-    };
+  # ══ MetaType 默认值 ════════════════════════════════════════════════════
+  defaultMeta = {
+    eqStrategy   = "structural";  # "structural" | "nominal" | "alpha"
+    hashStrategy = "normalized";  # "repr" | "normalized"
+    evalStrategy = "strict";      # "strict" | "lazy"
+    muPolicy     = "guardset";    # "guardset" | "bisim" (Phase 4.3)
+    rowPolicy    = "canonical";   # "canonical" | "raw"
+    bidirPolicy  = "check";       # "check" | "infer" | "synth"
+    schemePolicy = "generalize";  # "generalize" | "mono" (Phase 4.2)
+    constraints  = [];            # 附加约束列表
+    annotations  = {};            # 任意用户标注（不影响语义）
+  };
 
-  # ── 预定义 Meta 配置 ──────────────────────────────────────────────────────
-  defaultMeta  = mkMeta {};
-  nominalMeta  = mkMeta { eqStrategy = "nominal"; };
-  strictMeta   = mkMeta { evalStrategy = "strict"; };
-  isoMeta      = mkMeta { muPolicy = "iso"; };
-  closedRowMeta = mkMeta { rowPolicy = "closed"; };
-  inferMeta    = mkMeta { bidirPolicy = "infer"; };
+  # ══ MetaType 构造器 ════════════════════════════════════════════════════
+  mkMeta = overrides: defaultMeta // overrides;
 
-  # ── Meta 语义查询 ─────────────────────────────────────────────────────────
-  isNominal    = meta: (meta.eqStrategy or "structural") == "nominal";
-  isStrict     = meta: (meta.evalStrategy or "lazy") == "strict";
-  isEquiMu     = meta: (meta.muPolicy or "equi") == "equi";
-  isOpenRow    = meta: (meta.rowPolicy or "open") == "open";
-  isBidirInfer = meta: (meta.bidirPolicy or "check") == "infer";
+  # 名义类型 meta（nominal equality：相同 id 才相等）
+  nominalMeta = mkMeta { eqStrategy = "nominal"; };
 
-  # ── Meta 合并（用于 Constrained 类型合并场景）────────────────────────────
-  # Type: MetaType -> MetaType -> MetaType
+  # 懒惰求值 meta（用于 Mu 类型展开控制）
+  lazyMeta = mkMeta { evalStrategy = "lazy"; };
+
+  # TypeScheme meta（Phase 4.2：泛型方案）
+  schemeMeta = mkMeta { schemePolicy = "generalize"; };
+
+  # Opaque / abstract meta（隐藏内部结构）
+  opaqueMeta = mkMeta { eqStrategy = "nominal"; hashStrategy = "repr"; };
+
+  # ══ MetaType 谓词 ══════════════════════════════════════════════════════
+  isMeta = m: builtins.isAttrs m && m ? eqStrategy;
+  isNominal    = m: isMeta m && m.eqStrategy == "nominal";
+  isStructural = m: isMeta m && m.eqStrategy == "structural";
+  isLazy       = m: isMeta m && m.evalStrategy == "lazy";
+  isScheme     = m: isMeta m && m.schemePolicy == "generalize";
+
+  # ══ MetaType 合并（Phase 4.2：Module 合并用）══════════════════════════
+  # Type: Meta → Meta → Meta
+  # 右边优先（后者覆盖前者），但约束合并
   mergeMeta = m1: m2:
-    mkMeta {
-      eqStrategy   = if (m1.eqStrategy or "structural") == "nominal" then "nominal"
-                     else m2.eqStrategy or "structural";
-      hashStrategy = if (m1.hashStrategy or "normalized") == "repr" then "repr"
-                     else m2.hashStrategy or "normalized";
-      evalStrategy = if (m1.evalStrategy or "lazy") == "strict" then "strict"
-                     else m2.evalStrategy or "lazy";
-      muPolicy     = m1.muPolicy or "equi";
-      rowPolicy    = m1.rowPolicy or "open";
-      bidirPolicy  = m1.bidirPolicy or "check";
-      constraints  = (m1.constraints or []) ++ (m2.constraints or []);
-    };
+    let
+      base = m1 // m2;
+      mergedConstraints = m1.constraints ++ m2.constraints;
+    in
+    base // { constraints = mergedConstraints; };
 }
