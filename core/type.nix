@@ -1,26 +1,27 @@
-# core/type.nix — Phase 4.2
+# core/type.nix — Phase 4.3
 # TypeIR 统一宇宙：Type = { tag; id; kind; repr; meta }
 # INV-1: 所有结构 ∈ TypeIR
-{ lib, kindLib, metaLib }:
+# Fix P4.3: _reprToIdStr 改用 serializeRepr（而非 builtins.toJSON）
+#           避免含内嵌 Type 对象的 repr 触发 "cannot convert function to JSON"
+{ lib, kindLib, metaLib, serialLib }:
 
 let
   inherit (kindLib) KStar KArrow isKind serializeKind;
   inherit (metaLib) defaultMeta isMeta;
+  inherit (serialLib) serializeRepr;
 
-  # ── 内部：stable id 生成 ─────────────────────────────────────────────
-  # 使用 repr 的规范序列化作为 id 基础
-  _reprToIdStr = repr:
-    builtins.toJSON repr;
-
+  # ── 内部：stable id 生成（Fix P4.3: canonical serialization）────────
+  # CRITICAL: must use serializeRepr, NOT builtins.toJSON
+  # builtins.toJSON fails on attrsets containing Type objects (with id/kind fields
+  # that embed more Types). serializeRepr produces a pure string deterministically.
   _mkId = repr:
-    builtins.hashString "sha256" (_reprToIdStr repr);
+    builtins.hashString "sha256" (serializeRepr repr);
 
 in rec {
 
   # ══ TypeIR 核心构造器 ══════════════════════════════════════════════════
 
   # Type: TypeRepr → Kind → Meta → Type
-  # 完整构造（使用显式 meta）
   mkTypeWith = repr: kind: meta:
     assert builtins.isAttrs repr;
     assert isKind kind || kind == null;
@@ -34,7 +35,6 @@ in rec {
     };
 
   # Type: TypeRepr → Kind → Type
-  # 默认构造（使用 defaultMeta）
   mkTypeDefault = repr: kind:
     mkTypeWith repr kind defaultMeta;
 
@@ -51,22 +51,19 @@ in rec {
   typeId   = t: assert isType t; t.id;
 
   # ══ TypeIR 更新（保持 id 语义）════════════════════════════════════════
-  # Type: Type → TypeRepr → Type（更新 repr，重新计算 id）
   withRepr = t: newRepr:
     assert isType t;
     mkTypeWith newRepr t.kind t.meta;
 
-  # Type: Type → Kind → Type
   withKind = t: newKind:
     assert isType t;
     mkTypeWith t.repr newKind t.meta;
 
-  # Type: Type → Meta → Type
   withMeta = t: newMeta:
     assert isType t;
     mkTypeWith t.repr t.kind newMeta;
 
-  # ══ 常用原始类型（Phase 4.2 内建）════════════════════════════════════
+  # ══ 常用原始类型 ════════════════════════════════════════════════════════
   tPrim = name:
     mkTypeDefault { __variant = "Primitive"; name = name; } KStar;
 
@@ -76,20 +73,18 @@ in rec {
   tFloat  = tPrim "Float";
   tUnit   = tPrim "Unit";
 
-  # ══ TypeScheme（Phase 4.2 新增：∀ quantification）════════════════════
+  # ══ TypeScheme（∀ quantification）════════════════════════════════════
   # TypeScheme = { __schemeTag; forall: [String]; body: Type; constraints: [Constraint] }
   # 不是 Type（不满足 INV-1），是 Type 的包装，用于泛化/实例化
 
-  # Type: [String] → Type → [Constraint] → TypeScheme
   mkScheme = forall: body: constraints:
     {
       __schemeTag = "Scheme";
-      forall      = lib.sort builtins.lessThan forall;  # canonical 顺序
+      forall      = lib.sort builtins.lessThan forall;
       body        = body;
       constraints = constraints;
     };
 
-  # 单态 scheme（forall []）
   monoScheme = t: mkScheme [] t [];
 
   isScheme = s:
@@ -100,7 +95,6 @@ in rec {
   schemeCons   = s: assert isScheme s; s.constraints;
 
   # ── 自由变量提取（用于泛化）──────────────────────────────────────────
-  # Type: Type → [String]
   freeVars = t:
     if !isType t then []
     else
@@ -111,7 +105,7 @@ in rec {
         lib.filter (n: n != t.repr.param) inner
       else if v == "Apply" then
         let
-          fnVars = freeVars t.repr.fn;
+          fnVars  = freeVars t.repr.fn;
           argVars = lib.concatMap freeVars (t.repr.args or []);
         in
         lib.unique (fnVars ++ argVars)
@@ -122,5 +116,18 @@ in rec {
       else if v == "Mu" then
         let inner = freeVars t.repr.body; in
         lib.filter (n: n != t.repr.var) inner
+      else if v == "Forall" then
+        let inner = freeVars t.repr.body; in
+        lib.filter (n: !(builtins.elem n t.repr.vars)) inner
+      else if v == "Record" then
+        lib.unique (lib.concatMap freeVars (builtins.attrValues t.repr.fields))
+      else if v == "RowExtend" then
+        lib.unique (freeVars t.repr.ty ++ freeVars t.repr.tail)
+      else if v == "VariantRow" then
+        let
+          varFvs  = lib.concatMap freeVars (builtins.attrValues t.repr.variants);
+          tailFvs = if t.repr.tail != null then freeVars t.repr.tail else [];
+        in
+        lib.unique (varFvs ++ tailFvs)
       else [];
 }

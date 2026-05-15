@@ -1,235 +1,217 @@
-# ARCHITECTURE.md — Phase 4.2
+# nix-types Architecture — Phase 4.3 (Fix Round)
 
-## 总体架构
+## 版本：4.3.0-fix
+
+---
+
+## 核心设计原则
+
+### INV-SER1（新增，Phase 4.3-Fix）：序列化边界不变式
+
+> **`builtins.toJSON` 绝不直接碰触含 Type 对象、Constraint 对象、或任何可能持有函数引用的结构。**
+
+所有序列化必须经由以下规范路径之一：
+
+- `meta/serialize.nix → serializeRepr r` （TypeRepr 序列化）
+- `meta/serialize.nix → serializeConstraint c` （Constraint 序列化）
+- `meta/serialize.nix → serializePredExpr pe` （PredExpr 序列化）
+- `meta/serialize.nix → serializeType t` （完整 Type 序列化）
+- `meta/hash.nix → _safeToJSON v` （最后保护层：tryEval + toString 降级）
+
+违反此不变式会导致 `cannot convert a function to JSON` 运行时崩溃。
+
+---
+
+## 模块层次（Layer 0–22）
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                    Nix Type System（Phase 4.2）                        │
-│                                                                        │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │                      TypeIR（统一宇宙）                          │  │
-│  │  Type = { tag; id; kind; repr; meta }                           │  │
-│  │  Kind = KStar|KArrow|KRow|KEffect|KVar★|KUnbound               │  │
-│  │  Meta = { eqStrategy; muPolicy; rowPolicy; schemePolicy★; ... } │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│       │               │               │               │               │
-│  TypeRepr         Normalize       Constraint       Meta Layer          │
-│  25+ 变体         TRS 11规则      IR（INV-6）      serialize           │
-│  rForall★         rules           solver           hash（NF）          │
-│  rHole★           rewrite         unify            equality            │
-│  rDynamic★        unified_subst   unify_row        de Bruijn★          │
-│       │               │               │                               │
-│  ┌────▼───────────────▼───────────────▼──────────────────────────┐   │
-│  │              Phase 4.2 核心新增层                               │   │
-│  │  TypeScheme★   { __schemeTag; forall; body; constraints }      │   │
-│  │  mkScheme/monoScheme/generalize★ (HM INV-SCHEME-1)            │   │
-│  │  instantiateScheme (fresh vars, INV-BIDIR-1)                  │   │
-│  └────┬─────────────────┬───────────────┬──────────────────────┘    │
-│       │                 │               │                             │
-│  Module★           Bidir★          InstanceDB★                       │
-│  composeFunctors   infer/check     checkGlobalCoherence              │
-│  λM.f1(f2(M))     let-gen         mergeLocalInstances(unify)         │
-│  INV-MOD-8         INV-BIDIR-1    INV-COH-1                          │
-└───────────────────────────────────────────────────────────────────────┘
-★ = Phase 4.2 新增/升级
+Layer 0:  core/kind.nix          — Kind 系统（KStar/KArrow/KRow/KEffect/KVar）
+Layer 1:  meta/serialize.nix     — 规范序列化（← kindLib）  ★ INV-SER1 核心
+Layer 2:  core/meta.nix          — MetaType 控制层
+Layer 3:  core/type.nix          — TypeIR 宇宙（← serialLib: _mkId 用 serializeRepr）
+Layer 4:  repr/all.nix           — TypeRepr 构造器（25+ 变体）
+Layer 5:  normalize/substitute.nix — capture-safe 替换
+Layer 6:  normalize/rules.nix    — TRS 规则集（11 规则）
+Layer 7:  normalize/rewrite.nix  — TRS 主引擎（← serialLib: _reprKey/_constraintKey）★
+Layer 8:  meta/hash.nix          — 规范 hash（← serialLib）★ _safeToJSON 保护
+Layer 9:  meta/equality.nix      — 类型等价
+Layer 10: constraint/ir.nix      — Constraint IR（← serialLib: sort 用 serializeConstraint）★
+Layer 11: runtime/instance.nix   — Instance DB
+Layer 12: refined/types.nix      — 精化类型
+Layer 13: normalize/unified_subst.nix — UnifiedSubst（三前缀 t:/r:/k:）
+Layer 14: constraint/unify_row.nix — Row 多态 unification（← serialLib）★
+          constraint/unify.nix   — Robinson unification + Mu bisim（Phase 4.3）
+Layer 15: module/system.nix      — Module 系统
+Layer 16: effect/handlers.nix    — Effect Handlers + continuations
+Layer 17: constraint/solver.nix  — Worklist solver（INV-KIND-1）
+Layer 18: bidir/check.nix        — 双向类型推断
+Layer 19: incremental/graph.nix  — 依赖图（INV-G1–G5）
+Layer 20: incremental/memo.nix   — Memo 层（epoch-based）
+          incremental/query.nix  — Query DB
+Layer 21: match/pattern.nix      — 模式匹配
+```
+
+★ = Phase 4.3-Fix 修改的模块
+
+---
+
+## Phase 4.3-Fix：根因与修复
+
+### 问题描述
+
+`nix run .#test` 崩溃，错误：
+
+```
+error: cannot convert a function to JSON
+at normalize/rewrite.nix:72:29
+```
+
+Nix 报错指向 `normalizeWithFuel = fuel: t:` 的定义处，这是因为 Nix 在 `builtins.toJSON` 失败时，**报告被序列化值的定义位置**，而非 `toJSON` 的调用位置。
+
+### 根因分析
+
+多个 `builtins.toJSON` 调用路径在某些测试场景下会碰触函数值：
+
+| 文件                       | 行       | 具体问题                                                                                 |
+| -------------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `constraint/unify_row.nix` | 96       | `builtins.toJSON { a = sa; b = sb; }` — `sa`/`sb` 含 Type 对象，深度序列化时可能遇函数值 |
+| `constraint/unify_row.nix` | 109–110  | `builtins.toJSON a` / `builtins.toJSON b` — 直接序列化 Type 对象                         |
+| `constraint/ir.nix`        | 38       | `lib.sort (a: b: builtins.toJSON a < builtins.toJSON b)` — 序列化 Constraint 对象        |
+| `normalize/rewrite.nix`    | 20,24,38 | `_reprKey`/`_constraintKey` fallback；`or` 在插值内                                      |
+| `meta/hash.nix`            | 16,29,60 | 非 Type/Scheme 的 fallback path                                                          |
+| `tests/test_all.nix`       | 全局     | 无测试隔离 — 任意一个测试的求值错误中断整个套件                                          |
+
+### 修复策略
+
+1. **`constraint/unify_row.nix`**：添加 `serialLib` 依赖；
+   - `_spineKey` 函数用 `serializeRepr` 生成行脊的确定性 key
+   - `_unifyTypes` 用 `serializeRepr` 替换 `builtins.toJSON`
+   - freshVar name 用 `_spineKey sa + "|" + _spineKey sb` 生成
+
+2. **`constraint/ir.nix`**：`mkImpliesConstraint` 排序比较器改用 `serializeConstraint`
+
+3. **`normalize/rewrite.nix`**：
+   - 添加 `serializePredExpr` 继承
+   - 新增 `_safeToJSON`（tryEval 保护的安全 JSON 化）
+   - 所有 fallback 改用 `_safeToJSON`
+   - `_constraintKey` 全面改写：消除 `or` 在插值内（INV-NIX-1），改用 `let` 绑定
+
+4. **`meta/hash.nix`**：`typeHash`/`schemeHash` fallback 改用 `_safeToJSON`
+
+5. **`lib/default.nix`**：`unifyRowLib` 导入添加 `serialLib` 参数；导出 `serializePredExpr`
+
+6. **`tests/test_all.nix`**：`mkTestBool`/`mkTest` 用 `builtins.tryEval` 包裹，实现测试隔离
+
+---
+
+## 不变式体系
+
+| 不变式     | 描述                                                               | 状态 |
+| ---------- | ------------------------------------------------------------------ | ---- |
+| INV-1      | 所有结构 ∈ TypeIR                                                  | ✅   |
+| INV-2      | 所有计算 = Rewrite(TypeIR)，fuel 保证终止                          | ✅   |
+| INV-3      | 结果 = NormalForm（无可归约子项）                                  | ✅   |
+| INV-4      | typeEq(a,b) ⟹ typeHash(a) == typeHash(b)                           | ✅   |
+| INV-6      | Constraint ∈ TypeRepr                                              | ✅   |
+| INV-8      | Module functor 组合封闭                                            | ✅   |
+| INV-K1     | 每个类型参数有确定 kind                                            | ✅   |
+| INV-KIND-1 | Kind constraints 真正求解（Phase 4.3）                             | ✅   |
+| INV-MU-1   | Mu bisimulation up-to congruence 正确（Phase 4.3）                 | ✅   |
+| INV-EFF-10 | Handler continuation 语义正确（Phase 4.3）                         | ✅   |
+| INV-SER1   | `builtins.toJSON` 不直接碰触 Type/函数值（**Phase 4.3-Fix 新增**） | ✅   |
+| INV-NIX-1  | `or` 不在 `${}` 插值内（**Phase 4.3-Fix 新增**）                   | ✅   |
+| INV-TEST-1 | 单个测试错误不中断整个测试套件（**Phase 4.3-Fix 新增**）           | ✅   |
+
+---
+
+## 序列化边界（INV-SER1 执行图）
+
+```
+Type 对象
+  └──→ serializeRepr(t.repr)          ← meta/serialize.nix
+         └──→ _serializeWithEnv       ← 递归，alpha-eq 规范化
+
+Constraint 对象
+  └──→ serializeConstraint(c)         ← meta/serialize.nix
+         └──→ serializeRepr(c.*.repr) ← 仅访问 .repr，不触碰 kind/meta
+
+PredExpr 对象
+  └──→ serializePredExpr(pe)          ← meta/serialize.nix
+         └──→ 递归 PredExpr 节点
+
+未知值（fallback）
+  └──→ _safeToJSON(v)                 ← meta/hash.nix / normalize/rewrite.nix
+         └──→ tryEval(toJSON(v))
+               ├── success → JSON 字符串
+               └── failure → toString(v)  ← 永不崩溃
 ```
 
 ---
 
-## 依赖拓扑（Layer 0~22，严格无环）
+## 测试套件架构（Phase 4.3-Fix）
 
 ```
-Layer 0:  kindLib          ← （无依赖）            Kind 系统 + unifyKind★
-Layer 1:  serialLib        ← lib, kindLib          de Bruijn alpha-NF
-Layer 2:  metaLib          ← lib                   MetaType 语义控制
-Layer 3:  typeLib          ← kindLib,metaLib        TypeIR + mkScheme★
-Layer 4:  reprLib          ← kindLib               TypeRepr 25+ 变体
-Layer 5:  substLib         ← typeLib,reprLib,kindLib capture-safe subst
-Layer 6:  rulesLib         ← substLib,kindLib,reprLib,typeLib  TRS 11 规则
-Layer 7:  normalizeLib     ← rulesLib,typeLib,reprLib,kindLib  fuel-based TRS
-Layer 8:  hashLib          ← normalizeLib,serialLib  typeHash/schemeHash★
-Layer 9:  equalityLib      ← hashLib,normalizeLib,serialLib   NF equality
-Layer 10: constraintLib    ← typeLib,reprLib,kindLib,serialLib  Constraint IR
-Layer 11: unifyRowLib      ← typeLib,reprLib,kindLib,substLib,normalizeLib
-          unifyLib         ← typeLib,reprLib,kindLib,substLib,hashLib,normalizeLib
-Layer 12: instanceLib      ← typeLib,reprLib,kindLib,hashLib,normalizeLib
-          （checkGlobalCoherence★，mergeLocalInstances升级★）
-Layer 13: unifiedSubstLib  ← typeLib,kindLib,reprLib,substLib
-Layer 14: refinedLib       ← typeLib,reprLib,kindLib,hashLib,normalizeLib
-Layer 15: moduleLib        ← typeLib,reprLib,kindLib,normalizeLib,hashLib,unifiedSubstLib
-          （composeFunctors★ λM.f1(f2(M)) INV-MOD-8）
-Layer 16: effectLib        ← typeLib,reprLib,kindLib,normalizeLib,hashLib
-Layer 17: solverLib        ← constraintLib,substLib,unifiedSubstLib,
-                             unifyLib,unifyRowLib,instanceLib,hashLib,normalizeLib
-                             （_instantiateScheme★ for Scheme constraints）
-Layer 18: bidirLib         ← typeLib,reprLib,kindLib,normalizeLib,constraintLib,
-                             substLib,unifiedSubstLib★,hashLib
-                             （HM let-generalization★ INV-BIDIR-1/SCHEME-1）
-Layer 19: graphLib         （无 type 依赖，纯图算法）
-Layer 20: memoLib          ← hashLib
-          queryLib         ← hashLib
-Layer 21: patternLib       ← typeLib,reprLib,kindLib
-Layer 22: lib/default.nix  ← ALL layers（240 exports，无重复）
+tests/test_all.nix
+  mkTestBool name cond           → tryEval cond → pass/fail（不崩溃）
+  mkTest name result expected    → tryEval result × tryEval expected
+  runGroup name tests            → { passed; total; failed; ok }
+  allGroups = [t1..t23]
+  totalPassed = foldl' (+ .passed) 0 allGroups
+  summary = "Passed: X / Y"
+```
+
+**INV-TEST-1**：每个 `mkTestBool`/`mkTest` 调用通过 `builtins.tryEval` 独立求值。
+一个测试的运行时错误（如 `assert` 失败、类型错误）标记为 `pass=false`，
+不会通过 lazy evaluation 传播到 `totalPassed` 导致整个测试集崩溃。
+
+---
+
+## 文件结构
+
+```
+nix-types/
+├── core/
+│   ├── kind.nix          Layer 0: Kind 系统
+│   ├── type.nix          Layer 3: TypeIR
+│   └── meta.nix          Layer 2: MetaType
+├── repr/all.nix          Layer 4: TypeRepr 构造器
+├── normalize/
+│   ├── substitute.nix    Layer 5
+│   ├── rules.nix         Layer 6
+│   ├── rewrite.nix       Layer 7  ★ Fixed
+│   └── unified_subst.nix Layer 13
+├── meta/
+│   ├── serialize.nix     Layer 1  ★ INV-SER1 核心
+│   ├── hash.nix          Layer 8  ★ Fixed
+│   └── equality.nix      Layer 9
+├── constraint/
+│   ├── ir.nix            Layer 10 ★ Fixed
+│   ├── unify.nix         Layer 14
+│   ├── unify_row.nix     Layer 14 ★ Fixed
+│   └── solver.nix        Layer 17
+├── runtime/instance.nix  Layer 11
+├── refined/types.nix     Layer 12
+├── module/system.nix     Layer 15
+├── effect/handlers.nix   Layer 16
+├── bidir/check.nix       Layer 18
+├── incremental/
+│   ├── graph.nix         Layer 19
+│   ├── memo.nix          Layer 20
+│   └── query.nix         Layer 20
+├── match/pattern.nix     Layer 21
+├── lib/default.nix       统一导出  ★ Fixed
+├── tests/test_all.nix    测试套件  ★ Fixed
+└── flake.nix
 ```
 
 ---
 
-## TRS 规则集（Phase 4.2，11 规则合并）
+## 变更记录
 
-| 规则                      | 触发条件            | 语义                         | 优先级 |
-| ------------------------- | ------------------- | ---------------------------- | ------ |
-| `ruleBetaReduce`          | Apply + Lambda      | β-归约                       | P1     |
-| `ruleConstructorPartial`  | Apply + Constructor | 部分应用 + kind              | P2     |
-| `ruleConstraintMerge`     | Constrained嵌套     | 约束合并                     | P3     |
-| `ruleConstraintFloat`     | Apply + Constrained | 约束上浮                     | P4     |
-| `ruleRowCanonical`        | RowExtend           | spine 字母序（INV-ROW）      | P5     |
-| `ruleVariantRowCanonical` | VariantRow          | flatten + sort + open tail   | P6     |
-| `ruleEffectMerge`         | EffectMerge         | flatten + dedup（INV-EFF-6） | P7     |
-| `ruleRefined`             | Refined PTrue       | → base（INV-SMT-2）          | P8     |
-| `ruleSig`                 | Sig                 | fields 字母序（INV-MOD-4）   | P9     |
-| `ruleRecordCanonical`     | Record              | null field 清理              | P10    |
-| `ruleEffectNormalize`     | Effect              | VariantRow 字母序            | P11    |
-
----
-
-## Solver Pipeline（Phase 4.2）
-
-```
-[Constraint]
-  → normalizeConstraint       # canonical form（对称性 + 去重）
-  → deduplicateConstraints    # O(n) set dedup
-  → _solveLoop (worklist, fuel=2000)
-      ↓ Equality   → unify → composeSubst
-                   → applySubstToConstraints(worklist) ← INV-SOL5 requeue
-      ↓ RowEquality → unifyRow → composeSubst
-                    → applySubstToConstraints(worklist)
-      ↓ Class      → instanceLib.resolveWithFallback
-                   → canDischarge = found && impl != null（RISK-A）
-      ↓ Refined    → staticEvalPred → discharge / smtResidual
-      ↓ Implies    → check premises → enqueue conclusion
-      ↓ Scheme★    → _instantiateScheme → fresh vars → mkEqConstraint
-      ↓ Kind★      → defer to classResidual（Phase 4.3 完整实现）
-  → SolverResult { ok; subst: UnifiedSubst; solved;
-                   classResidual; smtResidual; rowSubst }
-```
-
----
-
-## TypeScheme（Phase 4.2 新增）
-
-```
-TypeScheme = {
-  __schemeTag = "Scheme";
-  forall:      [String];       # sorted canonical
-  body:        Type;           # scheme body
-  constraints: [Constraint];   # class constraints on type vars
-}
-
-INV-SCHEME-1: generalize(Γ, T, cs) = ∀(fv(T) \ fv(Γ)).T
-  → 只泛化 T 的自由变量中不在 Γ 中的变量
-  → 保证 polymorphic let 不会泄漏外层变量
-```
-
----
-
-## Functor Composition（Phase 4.2 核心修复）
-
-```
-Phase 4.1 问题（ADR-006-old）：
-  composeFunctors f1 f2 → body = Apply(f1, Apply(f2, param))
-  语义错误：这是 type-level Apply，不是 functor application
-
-Phase 4.2 修复（ADR-009）：
-  composeFunctors f1 f2 = λM. f1_body[f1.param := f2_body[f2.param := M]]
-
-  实现：
-  1. 生成新鲜参数 M（hash-based unique name）
-  2. freshM = Var(M, "mod")
-  3. f2Applied = applySubst(f2.param → freshM, f2.body)
-  4. f1Applied = applySubst(f1.param → f2Applied, f1.body)
-  5. composedSig = f2.paramSig（输入类型 = f2 的输入）
-  6. return mkModFunctor(M, composedSig, f1Applied)
-
-INV-MOD-8: isModFunctor(composeFunctors f1 f2) = true
-```
-
----
-
-## Phase 4.2 修复总览
-
-| 编号    | 修复项                              | 文件                    | INV           |
-| ------- | ----------------------------------- | ----------------------- | ------------- |
-| P4.2-1  | Functor 真正 λM.f1(f2(M)) 语义      | `module/system.nix`     | INV-MOD-8★    |
-| P4.2-2  | composeFunctorChain 传递性          | `module/system.nix`     | INV-MOD-8★    |
-| P4.2-3  | TypeScheme + mkScheme/monoScheme    | `core/type.nix`         | INV-SCHEME-1★ |
-| P4.2-4  | HM let-generalization               | `bidir/check.nix`       | INV-SCHEME-1★ |
-| P4.2-5  | infer App via constraint generation | `bidir/check.nix`       | INV-BIDIR-1★  |
-| P4.2-6  | Global InstanceDB coherence check   | `runtime/instance.nix`  | INV-COH-1★    |
-| P4.2-7  | mergeLocalInstances + unify overlap | `runtime/instance.nix`  | INV-COH-1★    |
-| P4.2-8  | rForall / rHole / rDynamic variants | `repr/all.nix`          | INV-1★        |
-| P4.2-9  | KVar + unifyKind                    | `core/kind.nix`         | INV-K1★       |
-| P4.2-10 | mkSchemeConstraint/mkKindConstraint | `constraint/ir.nix`     | INV-6★        |
-| P4.2-11 | Solver handles Scheme constraints   | `constraint/solver.nix` | INV-SOL★      |
-| P4.2-12 | de Bruijn serialize (alpha-NF fix)  | `meta/serialize.nix`    | INV-4         |
-| P4.2-13 | schemeHash / substHash              | `meta/hash.nix`         | INV-4★        |
-| P4.2-14 | lib/default.nix 240 exports，无重复 | `lib/default.nix`       | 架构          |
-| P4.2-15 | tests/test_all.nix 150+ tests 20组  | `tests/test_all.nix`    | all           |
-| P4.2-16 | README + ARCHITECTURE + TODO 更新   | 文档                    | —             |
-
----
-
-## 架构风险矩阵（Phase 4.2 → 4.3）
-
-| 风险                              | 等级  | 缓解                                    | 目标 |
-| --------------------------------- | ----- | --------------------------------------- | ---- |
-| Decision Tree prefix sharing      | 🟡 低 | sequential-first；大型 ADT O(n)         | 4.x  |
-| Bidir infer 完整性                | 🟠 中 | App 用约束生成★；let-gen 完整★          | 4.3  |
-| Mu bisimulation 近似（guard set） | 🟡 低 | guard set 覆盖 99%；up-to 精化          | 4.3  |
-| Effect Handler continuations      | 🟠 中 | type-level only；Phase 4.3 cont passing | 4.3  |
-| SMT bridge = string only          | 🟡 低 | 用户提供 oracle；设计合理               | 持续 |
-| Nix evaluation depth（深 ADT）    | 🔴 高 | fuel 3层保护；注意 builtins.seq         | 持续 |
-| Kind inference 部分               | 🟠 中 | KVar + unifyKind★；solver 仅 defer      | 4.3  |
-
----
-
-## 架构决策记录（ADR）
-
-### ADR-001: Constraint ∈ TypeRepr（INV-6）
-
-**决策**: Constraint 是结构化 attrset，不是函数。
-
-### ADR-002: UnifiedSubst（type+row+kind 统一）
-
-**决策**: 单一 UnifiedSubst 替代分散 subst，INV-US1 compose law。
-
-### ADR-003: QueryKey Schema Validation
-
-**决策**: 所有 key 通过 `mkQueryKey` 构造，格式验证。
-
-### ADR-004: 文件合并（Phase 4.1）
-
-**决策**: 消灭所有 `_p33`/`_p40` 碎片文件。
-
-### ADR-005: topologicalSort in-degree 语义
-
-**决策**: `edges[A]=[B]` = A 依赖 B；`in-degree(A) = |edges[A]|`。
-
-### ADR-006: TypeScheme ∉ TypeIR（Phase 4.2）★
-
-**决策**: `mkScheme` 是 TypeIR 的包装，`rForall` 才是 TypeRepr 变体。  
-**理由**: 泛化/实例化在 type inference 层；TypeRepr 保持纯结构。
-
-### ADR-007: Functor Composition = lazy substitution（Phase 4.2）★
-
-**决策**: `composeFunctors f1 f2` = `λM. f1_body[f1.param := f2_body[f2.param := M]]`  
-**理由**: Phase 4.1 的 `Apply` 嵌套不是真正的 functor application 语义。
-
-### ADR-008: HM let-generalization respects Ctx FVs（INV-SCHEME-1）★
-
-**决策**: `generalize(Γ, T) = ∀(fv(T) \ fv(Γ)).T`，不泛化 Γ 中出现的变量。  
-**理由**: 防止 let-polymorphism 违反值限制（value restriction）。
-
-### ADR-009: emptyDB disambiguation★
-
-**决策**: `instanceLib.emptyDB` → `instanceEmptyDB`，`queryLib.emptyDB` → `emptyDB`（default）。  
-**理由**: 两个 lib 均有 `emptyDB`，flat export 需要消歧义。
+| 版本    | 主要变更                                                          |
+| ------- | ----------------------------------------------------------------- |
+| 4.0     | UnifiedSubst 三前缀架构，Phase 分离                               |
+| 4.1     | Row 多态 + Effect Handlers                                        |
+| 4.2     | Kind 约束 + serialize.nix + HM Scheme 约束                        |
+| 4.3     | Mu bisim up-to congruence，Handler continuations，Kind inference  |
+| 4.3-Fix | **INV-SER1/NIX-1/TEST-1**：消除所有不安全 `toJSON` 调用；测试隔离 |

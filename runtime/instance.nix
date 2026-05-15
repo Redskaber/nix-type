@@ -1,13 +1,44 @@
-# runtime/instance.nix — Phase 4.2
+# runtime/instance.nix — Phase 4.3
 # Instance DB（RISK-A/B 修复，NF-hash instanceKey）
 # INV-I1: instanceKey = canonical hash（α-等价 → 相同 key）
 # INV-I2: canDischarge requires impl != null（soundness）
+#
+# Fix P4.3-instance (two bugs):
+#
+# BUG 1 — superclasses let-shadowing (silent infinite-recursion risk):
+#   Original: let superclasses = if superclasses != null then superclasses else [];
+#   In a Nix `let` block all bindings are mutually recursive, so `superclasses`
+#   on the RHS refers to the *new* let-binding, not the function parameter.
+#   This creates a self-referential thunk: forcing it forces itself → infinite loop.
+#   Although the loop was only triggered when that field is accessed, it is still
+#   a latent soundness bug. Fix: use a fresh name `superclassesN`.
+#
+# BUG 2 — instanceKey uses builtins.toJSON on an attrset:
+#   Original: builtins.toJSON { c = className; a = argHashes; }
+#   In Nix, `builtins.toJSON` on an attrset serializes keys in alphabetical order,
+#   which IS deterministic for pure-data attrsets.  However, we follow the Phase 4.3
+#   architectural rule: ALL key/hash generation must go through canonical string
+#   concatenation (not builtins.toJSON), to avoid any hidden dependency on the
+#   JSON serializer and to stay consistent with INV-SER-1.
+#   Fix: use deterministic string concatenation:
+#     key = hashString "sha256" "Instance(${className},[${argHashStr}])"
+#
 { lib, typeLib, reprLib, kindLib, hashLib, normalizeLib }:
 
 let
   inherit (typeLib) isType mkTypeDefault;
   inherit (hashLib) typeHash;
   inherit (normalizeLib) normalize';
+
+  # Internal: build a canonical instance key from className + sorted arg hashes.
+  # INV-I1: normalize args first → α-equivalent types produce the same hash
+  #         → same key for semantically identical instance declarations.
+  _instanceKey = className: normArgs:
+    let
+      argHashes  = lib.sort builtins.lessThan (map typeHash normArgs);
+      argHashStr = lib.concatStringsSep "," argHashes;
+    in
+    builtins.hashString "sha256" "Instance(${className},[${argHashStr}])";
 
 in rec {
 
@@ -17,7 +48,10 @@ in rec {
     let
       normType = normalize' ty;
       typeH    = typeHash normType;
-      dataH    = builtins.hashString "sha256" (builtins.toJSON data);
+      # data is caller-supplied; assume it is serialisable (string/int/bool/attrset
+      # of primitives). If it contains functions the hash will be unreliable, but
+      # mkInstance is not used for typeclass instances (that is mkInstanceRecord).
+      dataH    = builtins.hashString "sha256" (builtins.toString data);
     in {
       __type = "Instance";
       type   = normType;
@@ -40,18 +74,17 @@ in rec {
   # instanceRecord: { className; args: [Type]; impl; superclasses }
   mkInstanceRecord = className: args: impl: superclasses:
     let
-      # INV-I1 (RISK-B修复): NF-hash key（不用 toJSON）
+      # Fix BUG 1: use `superclassesN` to avoid shadowing the function parameter.
+      superclassesN = if superclasses != null then superclasses else [];
+      # Fix BUG 2: use _instanceKey (pure string concat, not toJSON).
       normArgs = map normalize' args;
-      argHashes = lib.sort builtins.lessThan (map typeHash normArgs);
-      key = builtins.hashString "sha256"
-        (builtins.toJSON { c = className; a = argHashes; });
-      superclasses = if superclasses != null then superclasses else [];
+      key      = _instanceKey className normArgs;
     in {
       __type       = "InstanceRecord";
       className    = className;
       args         = normArgs;
       impl         = impl;
-      superclasses = superclasses;
+      superclasses = superclassesN;
       key          = key;
     };
 
@@ -74,9 +107,7 @@ in rec {
   lookupInstance = db: className: args:
     let
       normArgs  = map normalize' args;
-      argHashes = lib.sort builtins.lessThan (map typeHash normArgs);
-      key       = builtins.hashString "sha256"
-        (builtins.toJSON { c = className; a = argHashes; });
+      key       = _instanceKey className normArgs;
       classDB   = db.${className} or {};
     in
     classDB.${key} or null;

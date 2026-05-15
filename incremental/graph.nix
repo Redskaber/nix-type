@@ -1,9 +1,22 @@
-# incremental/graph.nix — Phase 4.2
-# 依赖图（INV-G1~4 全修复）
+# incremental/graph.nix — Phase 4.5.2
+# 依赖图（INV-G1~5 全修复）
 # INV-G1: BFS propagation 正确方向（edges[A]=[B] → A 依赖 B）
 # INV-G2: clean-stale FSM 状态区分
 # INV-G3: 无自环
 # INV-G4: removeNode 无 dangling edge
+# INV-G5: topologicalSort 语义正确（以依赖顺序排序）
+#
+# ★ Phase 4.5.2 修复（BUG-TOPO）:
+#   topologicalSort 之前成功时返回 raw list ["A","B"]，
+#   失败时返回 { error = "cycle detected"; }。
+#   这种不一致的返回类型导致：
+#     1. 测试中 r.ok 访问 list → tryEval 捕获 → pass=false（误判）
+#     2. 在极端情况下（--strict 强制求值路径），list 值可能
+#        被当作 group attrset 使用，触发 "expected a set but found a list"
+#   修复：统一返回 { ok = bool; order = [String]; error = null|String }
+#   同步修复 hasCycle（使用 !result.ok 而非 builtins.isAttrs）
+#
+# INV-TOPO: topologicalSort 始终返回 { ok: Bool; order: [String]; error: Null|String }
 { lib }:
 
 rec {
@@ -115,11 +128,17 @@ rec {
       in
       _bfsInvalidate newGraph (rest ++ newDeps) (visited ++ newDeps);
 
-  # ══ 拓扑排序（INV-G5: 正确语义）══════════════════════════════════════
+  # ══ 拓扑排序（INV-G5, INV-TOPO）══════════════════════════════════════
   # edges[A]=[B] → A 依赖 B → B 先处理
   # in-degree(A) = |edges[A]|（A 的依赖数量，即 A 需要等待的节点数）
+  #
+  # INV-TOPO: 始终返回 { ok = Bool; order = [String]; error = Null|String }
+  # 成功: { ok = true;  order = ["B","A"]; error = null; }
+  # 失败: { ok = false; order = [];        error = "cycle detected"; }
+  #
+  # ★ Phase 4.5.2 修复: 统一返回类型（之前成功时返回 raw list，导致 r.ok 崩溃）
 
-  # Type: Graph → [String] | { error: "cycle" }
+  # Type: Graph → { ok: Bool; order: [String]; error: Null|String }
   topologicalSort = graph:
     let
       nodes = builtins.attrNames graph.nodes;
@@ -129,9 +148,13 @@ rec {
       ) nodes);
       # 初始队列：in-degree = 0 的节点（无依赖，可以立即处理）
       initQueue = lib.filter (n: inDegrees.${n} == 0) nodes;
+      rawResult = _topoLoop graph inDegrees initQueue [];
     in
-    _topoLoop graph inDegrees initQueue [];
+    if builtins.isList rawResult
+    then { ok = true;  order = rawResult; error = null; }
+    else { ok = false; order = [];        error = rawResult.error or "cycle detected"; };
 
+  # Internal: returns [String] on success, { error } on cycle
   _topoLoop = graph: degrees: queue: result:
     if queue == [] then
       if builtins.length result == builtins.length (builtins.attrNames graph.nodes)
@@ -156,10 +179,11 @@ rec {
       in
       _topoLoop graph updatedDegrees newQueue newResult;
 
-  # ══ 循环检测（DFS，INV-QK5）══════════════════════════════════════════
+  # ══ 循环检测（INV-QK5）══════════════════════════════════════════════
+  # ★ Phase 4.5.2 修复: 使用 INV-TOPO 统一 API (!result.ok)
   hasCycle = graph:
-    let topo = topologicalSort graph; in
-    builtins.isAttrs topo && topo ? error;
+    let result = topologicalSort graph; in
+    !result.ok;
 
   # ══ 可达性（BFS）════════════════════════════════════════════════════
   reachable = graph: fromId:

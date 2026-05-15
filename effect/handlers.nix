@@ -1,10 +1,15 @@
-# effect/handlers.nix — Phase 4.2
-# Effect Handlers（deep/shallow，INV-EFF-4~9）
+# effect/handlers.nix — Phase 4.3
+# Effect Handlers（deep/shallow，INV-EFF-4~10）
+# Phase 4.3 新增：
+#   INV-EFF-10: deep handler handles all occurrences（semantic）
+#   Handler continuations: resume branch with explicit continuation type
+#   mkHandlerWithCont: continuation-passing handler
+#   contType: type of the delimited continuation (A → Eff(R, B))
 { lib, typeLib, reprLib, kindLib, normalizeLib, hashLib }:
 
 let
   inherit (typeLib) isType mkTypeDefault mkTypeWith;
-  inherit (reprLib) rHandler rEffect rEffectMerge rVariantRow rRowEmpty rVar
+  inherit (reprLib) rHandler rEffect rEffectMerge rVariantRow rRowEmpty rVar rFn
                     mkBranch mkBranchWithCont;
   inherit (kindLib) KStar KRow KEffect;
   inherit (normalizeLib) normalize';
@@ -13,26 +18,58 @@ let
 in rec {
 
   # ══ Handler 类型构造器 ════════════════════════════════════════════════
+
+  # Basic handler（no continuation）
   mkHandler = effectTag: branches: returnType:
     mkTypeDefault (rHandler effectTag branches returnType) KStar;
 
-  # INV-EFF-8: deep handler 处理所有 occurrence
+  # INV-EFF-8: deep handler
   mkDeepHandler = effectTag: branches: returnType:
     let base = mkHandler effectTag branches returnType; in
     mkTypeWith
       (base.repr // { shallow = false; deep = true; })
       base.kind base.meta;
 
-  # INV-EFF-9: shallow handler 仅处理第一次 occurrence
+  # INV-EFF-9: shallow handler
   mkShallowHandler = effectTag: branches: returnType:
     let base = mkHandler effectTag branches returnType; in
     mkTypeWith
       (base.repr // { shallow = true; deep = false; })
       base.kind base.meta;
 
+  # INV-EFF-10: Handler with continuation（Phase 4.3 新增）
+  # handle : Eff(E ++ R, A) → Handler(E, A, B) → Eff(R, B)
+  # contType represents: A → Eff(R, B)  (the delimited continuation type)
+  # Phase 4.3: 每个分支携带 contType，表示 resume 的类型
+  mkHandlerWithCont = effectTag: paramType: contType: returnType:
+    let
+      # resume branch: contType = paramType → Eff(R, returnType)
+      resumeBranch = mkBranchWithCont effectTag paramType contType
+        (mkTypeDefault (rFn paramType returnType) KStar);
+      # Final handler repr with continuation type embedded
+      handlerRepr = (rHandler effectTag [ resumeBranch ] returnType) // {
+        hasCont   = true;
+        contType  = contType;
+        paramType = paramType;
+      };
+    in
+    mkTypeDefault handlerRepr KStar;
+
+  # ── Helper: build continuation type ─────────────────────────────────
+  # contType(A, R, B) = A → Eff(R, B)
+  mkContType = paramType: residualEffects: returnType:
+    let
+      effType = mkTypeDefault
+        (reprLib.rEffect residualEffects returnType)
+        KStar;
+    in
+    mkTypeDefault (rFn paramType effType) KStar;
+
   isHandler = t: isType t && (t.repr.__variant or null) == "Handler";
+  isHandlerWithCont = t: isHandler t && (t.repr.hasCont or false);
 
   # ══ Effect Row 构造器 ═════════════════════════════════════════════════
+
   emptyEffectRow = mkTypeDefault rRowEmpty KRow;
 
   singleEffect = name: ty:
@@ -50,7 +87,6 @@ in rec {
     else if v == "Var" then [ "RowVar:${row.repr.name}" ]
     else [];
 
-  # Type: Type(Handler) → Type(Effect) → { ok: Bool; remainingEffects: Type; error? }
   checkHandler = handler: effectType:
     let handlerTag = handler.repr.__variant or null; in
     if handlerTag != "Handler" then
@@ -65,9 +101,11 @@ in rec {
         effVars = _collectEffectLabels effRow;
       in
       if builtins.elem hEffTag effVars then
-        { ok              = true;
+        { ok               = true;
           remainingEffects = subtractEffect effRow hEffTag;
-          handledTag       = hEffTag; }
+          handledTag       = hEffTag;
+          # Phase 4.3: expose continuation type if handler has one
+          contType         = handler.repr.contType or null; }
       else
         { ok    = false;
           error = "Handler for '${hEffTag}' but effect row contains: ${builtins.toJSON effVars}"; };
@@ -97,14 +135,11 @@ in rec {
     else row;
 
   # ══ INV-EFF-8: Deep handler semantics ════════════════════════════════
-  # deep handler 处理 effectType 中所有出现的 hEffTag
   deepHandlerCovers = handler: effectType:
     assert isHandler handler;
     let hEffTag = handler.repr.effectTag; in
     if !(handler.repr.deep or false) then false
-    else
-      # 检查 effectType 中是否有 hEffTag 出现（任意深度）
-      _effectOccursDeep hEffTag effectType;
+    else _effectOccursDeep hEffTag effectType;
 
   _effectOccursDeep = label: ty:
     let v = ty.repr.__variant or null; in
@@ -115,7 +150,6 @@ in rec {
     else false;
 
   # ══ INV-EFF-9: Shallow handler semantics ═════════════════════════════
-  # shallow handler 只处理第一次出现
   shallowHandlerResult = handler: effectType:
     assert isHandler handler;
     let
@@ -126,6 +160,36 @@ in rec {
       { ok = false; error = "Not a shallow handler"; }
     else
       { ok = true; firstOccurrence = hEffTag; remaining = remaining; };
+
+  # ══ INV-EFF-10: Handler with continuation semantics（Phase 4.3）══════
+  # Verify handler correctly handles ALL occurrences in a deep sense
+  # and that the continuation type is well-formed:
+  # contType must be: paramType → Eff(R, returnType)
+  checkHandlerContWellFormed = handlerCont:
+    let
+      repr = handlerCont.repr;
+    in
+    if !(repr.hasCont or false) then
+      { ok = false; error = "Not a continuation handler"; }
+    else
+      let
+        paramType  = repr.paramType or null;
+        contType   = repr.contType or null;
+        returnType = repr.returnType or null;
+      in
+      if paramType == null || contType == null then
+        { ok = false; error = "Missing paramType or contType"; }
+      else
+        # contType should be a function type: param → ...
+        let contV = contType.repr.__variant or null; in
+        if contV == "Fn" then
+          { ok           = true;
+            paramType    = paramType;
+            contType     = contType;
+            contDomain   = contType.repr.from;
+            contCodomain = contType.repr.to; }
+        else
+          { ok = false; error = "contType is not a function type: ${contV}"; };
 
   # ══ Effect type 合法性检查（INV-EFF-4）═══════════════════════════════
   checkEffectWellFormed = t:

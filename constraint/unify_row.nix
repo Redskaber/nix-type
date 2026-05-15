@@ -1,6 +1,9 @@
-# constraint/unify_row.nix — Phase 4.2
+# constraint/unify_row.nix — Phase 4.3
 # Row 多态 unification
-{ lib, typeLib, reprLib, kindLib, substLib, unifiedSubstLib, normalizeLib }:
+# Fix P4.3: 替换 builtins.toJSON(Type) 调用
+#   - freshVar name 改用 serializeRepr 生成（避免 toJSON 碰触 Type 字段）
+#   - _unifyTypes 等价检查改用 serializeRepr（而非 builtins.toJSON）
+{ lib, typeLib, reprLib, kindLib, substLib, unifiedSubstLib, normalizeLib, serialLib }:
 
 let
   inherit (typeLib) isType mkTypeDefault mkTypeWith;
@@ -9,10 +12,24 @@ let
   # Fix: inherit from unifiedSubstLib, not substLib
   inherit (unifiedSubstLib) singleRowBinding composeSubst emptySubst applySubst;
   inherit (normalizeLib) normalize';
+  # Fix P4.3: use serializeRepr for safe hashing of Type values
+  inherit (serialLib) serializeRepr;
+
+  # ── safe key for a row spine ─────────────────────────────────────────
+  # Serialize the labels alphabetically, and use `serializeRepr` for the tail.
+  _spineKey = s:
+    let
+      labelKeys = lib.sort builtins.lessThan (builtins.attrNames (s.labels or {}));
+      labelStr  = lib.concatStringsSep "," (map (l:
+        "${l}:${serializeRepr s.labels.${l}.repr}"
+      ) labelKeys);
+      tailStr   = if s.tail == null then "()" else serializeRepr s.tail.repr;
+    in
+    "{${labelStr}|${tailStr}}";
 
 in rec {
 
-  # ══ Row 结构分析 ═══════════════════════════════════════════════════════
+  # ══ Row 結构分析 ═══════════════════════════════════════════════════════
   _rowSpine = row:
     let v = row.repr.__variant or null; in
     if v == "RowEmpty" then { labels = {}; tail = null; }
@@ -92,8 +109,9 @@ in rec {
           { ok = false; error = "cannot unify open rows with non-var tails"; }
         else
           let
+            # Fix P4.3: use _spineKey (serializeRepr-based) instead of builtins.toJSON
             freshVar = mkTypeDefault
-              (rVar "_r${builtins.hashString "sha256" (builtins.toJSON { a = sa; b = sb; })}" "")
+              (rVar "_r${builtins.hashString "sha256" (_spineKey sa + "|" + _spineKey sb)}" "")
               KRow;
             rowForA = _rebuildRow onlyB (if sb.tail != null then sb.tail else freshVar);
             rowForB = _rebuildRow onlyA (if sa.tail != null then sa.tail else freshVar);
@@ -105,9 +123,15 @@ in rec {
         { ok = false; error = "row label mismatch"; };
 
   # 简单类型统一（避免循环依赖，仅处理 Var）
+  # Fix P4.3: use serializeRepr instead of builtins.toJSON for type equality
   _unifyTypes = a: b:
-    if builtins.hashString "sha256" (builtins.toJSON a) ==
-       builtins.hashString "sha256" (builtins.toJSON b)
+    let
+      keyA = if builtins.isAttrs a && a ? repr then serializeRepr a.repr
+             else builtins.toString a;
+      keyB = if builtins.isAttrs b && b ? repr then serializeRepr b.repr
+             else builtins.toString b;
+    in
+    if keyA == keyB
     then { ok = true; subst = emptySubst; }
     else
       let

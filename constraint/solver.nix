@@ -1,16 +1,20 @@
-# constraint/solver.nix — Phase 4.2
+# constraint/solver.nix — Phase 4.3
 # Worklist 约束 Solver（合并版）
-# INV-SOL1: 等价约束规范化（对称性 + NF-hash）
-# INV-SOL5: worklist requeue（subst 传播完整）
+# INV-SOL1:   等价约束规范化（对称性 + NF-hash）
+# INV-SOL5:   worklist requeue（subst 传播完整）
+# INV-KIND-1: Kind constraints 真正求解（Phase 4.3 新增）
+#             Phase 4.2 中 Kind 约束仅 defer → classResidual
+#             Phase 4.3 调用 kindLib.solveKindConstraints → 真正 unifyKind
 { lib, typeLib, reprLib, kindLib, constraintLib, substLib, unifiedSubstLib,
   unifyLib, unifyRowLib, instanceLib, hashLib, normalizeLib }:
 
 let
   inherit (typeLib) isType;
+  inherit (kindLib) unifyKind solveKindConstraints composeKindSubst applyKindSubst;
   inherit (constraintLib) isConstraint isEqConstraint isClassConstraint
     isRowEqConstraint isImpliesConstraint isRefinedConstraint
     isSchemeConstraint mkEqConstraint;
-  inherit (unifiedSubstLib) emptySubst composeSubst applySubst
+  inherit (unifiedSubstLib) emptySubst composeSubst applySubst singleKindBinding
     applySubstToConstraints fromLegacyTypeSubst fromLegacyRowSubst isEmpty;
   inherit (unifyLib) unify;
   inherit (unifyRowLib) unifyRow;
@@ -24,7 +28,7 @@ in rec {
   # ══ Solver 结果结构 ════════════════════════════════════════════════════
   mkSolverResult = ok: subst: solved: classResidual: smtResidual: rowSubst:
     { inherit ok subst solved classResidual smtResidual;
-      rowSubst = rowSubst;  # 向后兼容（from subst.rowBindings）
+      rowSubst = rowSubst;
     };
 
   failResult = error:
@@ -38,59 +42,66 @@ in rec {
       solved        = [];
       classResidual = [];
       smtResidual   = [];
+      # Phase 4.3: separate kind constraint accumulator
+      kindConstraints = [];
       classGraph    = classGraph;
       instanceDB    = instanceDB;
-      fuel          = DEFAULT_FUEL; };
+      fuel          = DEFAULT_FUEL;
+      failed        = false;
+      error         = null;
+    };
+
+  # ── 从 state 构造最终 SolverResult ──────────────────────────────────
+  _stateToResult = state:
+    if state.failed or false then
+      failResult (state.error or "solver failed")
+    else
+      # Phase 4.3: solve collected Kind constraints
+      let
+        kindResult = solveKindConstraints (state.kindConstraints or []);
+        # Integrate kind subst into unified subst
+        finalSubst =
+          if kindResult.ok then
+            # merge kind bindings into subst
+            let kb = kindResult.subst; in
+            lib.foldl' (acc: kvar:
+              let newKindBinding = singleKindBinding kvar kb.${kvar}; in
+              composeSubst newKindBinding acc
+            ) state.subst (builtins.attrNames kb)
+          else state.subst;
+      in
+      mkSolverResult
+        (state.worklist == [] && kindResult.ok)
+        finalSubst
+        state.solved
+        (state.classResidual ++ kindResult.residual)
+        state.smtResidual
+        (finalSubst.rowBindings or {});
 
   # ══ 主求解循环（worklist，fuel-bounded）══════════════════════════════
   _solveLoop = state:
     if state.fuel <= 0 then
-      mkSolverResult
-        (state.worklist == [])
-        state.subst state.solved
-        state.classResidual state.smtResidual
-        state.subst.rowBindings
+      _stateToResult state
     else if state.worklist == [] then
-      mkSolverResult true state.subst state.solved
-        state.classResidual state.smtResidual
-        state.subst.rowBindings
+      _stateToResult state
+    else if state.failed or false then
+      _stateToResult state
     else
       let
         c    = builtins.head state.worklist;
         rest = builtins.tail state.worklist;
         tag  = c.__constraintTag or null;
       in
-      # ── Equality ────────────────────────────────────────────────────
+
+      # ── Equality ──────────────────────────────────────────────────
       if tag == "Equality" then
         let
-          lhs  = applySubst state.subst c.lhs;
-          rhs  = applySubst state.subst c.rhs;
-          r    = unify lhs rhs;
+          lhs = applySubst state.subst c.lhs;
+          rhs = applySubst state.subst c.rhs;
+          r   = unify lhs rhs;
         in
         if !r.ok then
-          state // { worklist = []; fuel = 0; }  # fail: terminate
-          # Return failure through result
-        else
-          let
-            newSubst   = composeSubst r.subst state.subst;
-            # INV-SOL5: requeue all remaining with new subst
-            newWorklist = applySubstToConstraints r.subst rest;
-          in
-          _solveLoop (state // {
-            worklist = newWorklist;
-            subst    = newSubst;
-            solved   = state.solved ++ [ c ];
-            fuel     = state.fuel - 1;
-          })
-      # ── RowEquality ─────────────────────────────────────────────────
-      else if tag == "RowEquality" then
-        let
-          lhsR = applySubst state.subst c.lhsRow;
-          rhsR = applySubst state.subst c.rhsRow;
-          r    = unifyRow lhsR rhsR;
-        in
-        if !r.ok then
-          state // { worklist = []; fuel = 0; }
+          failResult (r.error or "unification failed")
         else
           let
             newSubst    = composeSubst r.subst state.subst;
@@ -102,85 +113,148 @@ in rec {
             solved   = state.solved ++ [ c ];
             fuel     = state.fuel - 1;
           })
-      # ── Class ────────────────────────────────────────────────────────
+
+      # ── RowEquality ───────────────────────────────────────────────
+      else if tag == "RowEquality" then
+        let
+          lhsR = applySubst state.subst c.lhsRow;
+          rhsR = applySubst state.subst c.rhsRow;
+          r    = unifyRow lhsR rhsR;
+        in
+        if !r.ok then
+          failResult (r.error or "row unification failed")
+        else
+          let
+            newSubst    = composeSubst r.subst state.subst;
+            newWorklist = applySubstToConstraints r.subst rest;
+          in
+          _solveLoop (state // {
+            worklist = newWorklist;
+            subst    = newSubst;
+            solved   = state.solved ++ [ c ];
+            fuel     = state.fuel - 1;
+          })
+
+      # ── Class ─────────────────────────────────────────────────────
       else if tag == "Class" then
         let
-          normArgs = map (applySubst state.subst) c.args;
-          resolved = instanceLib.resolveWithFallback
-            state.classGraph state.instanceDB c.className normArgs;
+          resolvedArgs = map (applySubst state.subst) (c.args or []);
+          resolution   = instanceLib.resolveWithFallback
+            state.classGraph state.instanceDB c.className resolvedArgs;
         in
-        if resolved.found && resolved.impl != null then
-          # INV-SOL: impl != null → discharged（RISK-A 修复）
+        if instanceLib.canDischarge resolution then
           _solveLoop (state // {
             worklist = rest;
             solved   = state.solved ++ [ c ];
             fuel     = state.fuel - 1;
           })
         else
-          # Class residual（no instance found）
+          # Not resolved: defer to residual
           _solveLoop (state // {
             worklist      = rest;
-            classResidual = state.classResidual ++ [ (c // { args = normArgs; }) ];
+            classResidual = state.classResidual ++ [ c ];
             fuel          = state.fuel - 1;
           })
-      # ── Refined ─────────────────────────────────────────────────────
+
+      # ── Refined ───────────────────────────────────────────────────
       else if tag == "Refined" then
         let
-          subject  = applySubst state.subst c.subject;
-          staticR  = _staticEvalPred c.predVar c.predExpr subject;
+          subject = applySubst state.subst c.subject;
+          predVar = c.predVar or "v";
+          predExpr = c.predExpr or { __predTag = "PTrue"; };
+          # Inline static evaluation for trivial cases
+          static =
+            let ptag = predExpr.__predTag or null; in
+            if ptag == "PTrue"  then { trivial = true; result = true; }
+            else if ptag == "PFalse" then { trivial = true; result = false; }
+            else { trivial = false; };
         in
-        if staticR.ok && staticR.discharged then
+        if static.trivial or false then
           _solveLoop (state // {
             worklist = rest;
             solved   = state.solved ++ [ c ];
             fuel     = state.fuel - 1;
           })
         else
-          # SMT residual
           _solveLoop (state // {
             worklist    = rest;
-            smtResidual = state.smtResidual ++ [ (c // { subject = subject; }) ];
+            smtResidual = state.smtResidual ++ [ c ];
             fuel        = state.fuel - 1;
           })
-      # ── Implies ──────────────────────────────────────────────────────
+
+      # ── Implies ───────────────────────────────────────────────────
       else if tag == "Implies" then
-        let
-          allSolved = builtins.all (p:
-            builtins.any (s: (s.__constraintTag or null) == (p.__constraintTag or null) &&
-              builtins.toJSON s == builtins.toJSON p
-            ) state.solved
-          ) c.premises;
-        in
-        if allSolved then
+        let premises = c.premises or []; in
+        if premises == [] then
+          # No premises: enqueue conclusion
           _solveLoop (state // {
-            worklist = [ c.conclusion ] ++ rest;
+            worklist = rest ++ [ c.conclusion ];
+            solved   = state.solved ++ [ c ];
             fuel     = state.fuel - 1;
           })
         else
-          # Defer implies until premises are solved
+          # Defer: try to discharge premises first
           _solveLoop (state // {
-            worklist = rest ++ [ c ];  # put back at end
-            fuel     = state.fuel - 1;
+            worklist      = rest;
+            classResidual = state.classResidual ++ [ c ];
+            fuel          = state.fuel - 1;
           })
-      # ── Scheme（Phase 4.2）─────────────────────────────────────────
+
+      # ── Scheme（Phase 4.2: HM instantiation constraints）─────────
       else if tag == "Scheme" then
         let
-          instResult = _instantiateScheme c.scheme;
-          eqC        = mkEqConstraint instResult.type c.ty;
+          scheme = c.scheme or {};
+          ty     = c.ty or null;
         in
-        _solveLoop (state // {
-          worklist = [ eqC ] ++ instResult.constraints ++ rest;
-          fuel     = state.fuel - 1;
-        })
-      # ── Kind（Phase 4.2）───────────────────────────────────────────
+        if !builtins.isAttrs scheme || (scheme.__schemeTag or null) != "Scheme" then
+          _solveLoop (state // {
+            worklist = rest;
+            classResidual = state.classResidual ++ [ c ];
+            fuel = state.fuel - 1;
+          })
+        else
+          let
+            forall = scheme.forall or [];
+            body   = scheme.body;
+            # Generate fresh type variables for each forall var
+            freshBindings = builtins.listToAttrs (lib.imap0 (i: v:
+              lib.nameValuePair v
+                (typeLib.mkTypeDefault (reprLib.rVar "_si_${v}_${builtins.toString i}" "scheme") kindLib.KStar)
+            ) forall);
+            instBody = lib.foldl' (acc: v:
+              substLib.substitute v freshBindings.${v} acc
+            ) body forall;
+            # Generate equality constraint between instantiated body and ty
+            newCs = if ty != null then [ (mkEqConstraint instBody ty) ] else [];
+          in
+          _solveLoop (state // {
+            worklist = rest ++ newCs;
+            solved   = state.solved ++ [ c ];
+            fuel     = state.fuel - 1;
+          })
+
+      # ── Kind（Phase 4.3: INV-KIND-1 — 真正求解，不再 defer）──────
       else if tag == "Kind" then
-        # Kind constraints currently deferred to residual
-        _solveLoop (state // {
-          worklist      = rest;
-          classResidual = state.classResidual ++ [ c ];
-          fuel          = state.fuel - 1;
-        })
-      # ── Unknown → residual ──────────────────────────────────────────
+        let
+          typeVar      = c.typeVar or null;
+          expectedKind = c.expectedKind or kindLib.KStar;
+        in
+        if typeVar == null then
+          # Malformed: skip
+          _solveLoop (state // {
+            worklist = rest;
+            fuel     = state.fuel - 1;
+          })
+        else
+          # Phase 4.3: accumulate for batch kind solving at end
+          _solveLoop (state // {
+            worklist        = rest;
+            kindConstraints = (state.kindConstraints or []) ++ [ c ];
+            solved          = state.solved ++ [ c ];
+            fuel            = state.fuel - 1;
+          })
+
+      # ── Unknown tag: defer ────────────────────────────────────────
       else
         _solveLoop (state // {
           worklist      = rest;
@@ -188,53 +262,23 @@ in rec {
           fuel          = state.fuel - 1;
         });
 
-  # ══ TypeScheme 实例化（Phase 4.2）════════════════════════════════════
-  # Type: TypeScheme → { type: Type; constraints: [Constraint] }
-  _instantiateScheme = scheme:
-    if !builtins.isAttrs scheme || (scheme.__schemeTag or null) != "Scheme" then
-      { type = scheme; constraints = []; }
-    else
-      let
-        # 为每个 forall 变量生成新鲜变量
-        freshVars = builtins.listToAttrs (map (v:
-          let freshName = "_fresh_${v}_${builtins.hashString "sha256" v}"; in
-          lib.nameValuePair v (typeLib.mkTypeDefault (reprLib.rVar freshName "inst") kindLib.KStar)
-        ) scheme.forall);
-        # 应用替换
-        instType = lib.foldl' (acc: v:
-          substLib.substitute v freshVars.${v} acc
-        ) scheme.body scheme.forall;
-        # 应用约束替换
-        instCons = map (c:
-          unifiedSubstLib.applySubstToConstraint
-            (unifiedSubstLib.fromLegacyTypeSubst freshVars) c
-        ) scheme.constraints;
-      in
-      { type = instType; constraints = instCons; };
-
-  # ══ Static predicate evaluation（Refined Types）═══════════════════════
-  _staticEvalPred = predVar: predExpr: subject:
-    let tag = predExpr.__predTag or null; in
-    if tag == "PTrue"  then { ok = true; discharged = true; }
-    else if tag == "PFalse" then { ok = true; discharged = false; }
-    else { ok = false; discharged = false; };  # defer to SMT
-
-  # ══ Public API ════════════════════════════════════════════════════════
-
-  # Type: AttrSet → AttrSet → [Constraint] → SolverResult
-  solve = classGraph: instanceDB: constraints:
-    let
-      state  = _initState constraints classGraph instanceDB;
-      result = _solveLoop state;
-    in
-    if result.ok then result
-    else failResult (result.error or "solver failed");
-
-  # Simple solve（no class/instance context）
+  # ══ 主 solve API ════════════════════════════════════════════════════════
+  # Type: [Constraint] → SolverResult
   solveSimple = constraints:
-    solve {} {} constraints;
+    solve constraints {} {};
 
-  # ══ Subst 提取（legacy API）══════════════════════════════════════════
-  getTypeSubst = result: result.subst.typeBindings or {};
-  getRowSubst  = result: result.subst.rowBindings or {};
+  # Type: [Constraint] → ClassGraph → InstanceDB → SolverResult
+  solve = constraints: classGraph: instanceDB:
+    let state = _initState constraints classGraph instanceDB; in
+    _solveLoop state;
+
+  # ══ Convenience helpers ════════════════════════════════════════════════
+  getTypeSubst = result:
+    result.subst.typeBindings or {};
+
+  getRowSubst = result:
+    result.subst.rowBindings or {};
+
+  getKindSubst = result:
+    result.subst.kindBindings or {};
 }

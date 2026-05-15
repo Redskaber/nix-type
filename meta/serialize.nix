@@ -1,7 +1,19 @@
-# meta/serialize.nix — Phase 4.2
+# meta/serialize.nix — Phase 4.3
 # 规范序列化：canonical + deterministic
-# 关键：Lambda 使用 de Bruijn index（alpha-等价 → 相同序列化）
-# INV-4 前置：serialize(NF(a)) == serialize(NF(b)) ⟺ typeEq(a, b)
+# INV-SER-1: serializeRepr 对任意 TypeRepr 产生纯字符串（无函数字段触碰）
+# INV-SER-2: 相同结构（alpha-等价）→ 相同字符串
+# INV-SER-3: 所有 builtins.toJSON fallback 都经过 isFunction 守卫
+#
+# Fix P4.3 (critical):
+#   builtins.toJSON on a Nix lambda throws an UNCATCHABLE abort — even
+#   builtins.tryEval cannot intercept it in all Nix versions.
+#   Every fallback path that previously called `builtins.toJSON r` on an
+#   arbitrary value now calls `_safeStr` which guards with `builtins.isFunction`.
+#
+# Fix P4.3b:
+#   serializeConstraint/serializePredExpr/serializeType fallbacks use _safeStr.
+#   The only remaining bare builtins.toJSON calls are on provably primitive
+#   Nix values (strings, ints, bools from pe.value, className strings, etc.).
 { lib, kindLib }:
 
 let
@@ -9,21 +21,46 @@ let
 
 in rec {
 
-  # ══ De Bruijn 环境（alpha-规范化）════════════════════════════════════
-  # env: attrset name → de Bruijn index (Int)
-  # depth: 当前 lambda 深度
+  # ══ ARCH-SER-SAFE: safe string conversion for unknown values ═══════════════
+  # Contract: NEVER calls builtins.toJSON on a function value.
+  # builtins.isFunction covers both lambda and builtin-function.
+  # builtins.isPath covers paths (toJSON-safe but toString gives cleaner output).
+  # For everything else (string/int/bool/null/list/plain-attrset):
+  #   builtins.toJSON is safe, but we use toString for simplicity.
+  # Exported so downstream modules (meta/hash.nix etc.) can import and use it.
+  _safeStr = v:
+    if builtins.isFunction v then "<fn>"
+    else if builtins.isNull v then "null"
+    else if builtins.isBool v then if v then "true" else "false"
+    else if builtins.isInt v then builtins.toString v
+    else if builtins.isFloat v then builtins.toString v
+    else if builtins.isString v then "\"${v}\""
+    else if builtins.isPath v then builtins.toString v
+    else if builtins.isList v then
+      "[${lib.concatStringsSep "," (map _safeStr v)}]"
+    else if builtins.isAttrs v then
+      # Only touch attrNames (safe), not values
+      "{${lib.concatStringsSep "," (lib.sort builtins.lessThan (builtins.attrNames v))}}"
+    else "?";
 
+  # ══ De Bruijn 序列化（alpha-等价规范化）══════════════════════════════
+  # INV-SER-1: all branches produce a string, never call toJSON on unknown value
   _serializeWithEnv = env: depth: r:
-    if !builtins.isAttrs r then builtins.toJSON r
+    # Guard 1: function values (e.g. partial application of normalizeWithFuel)
+    if builtins.isFunction r then "<fn>"
+    # Guard 2: non-attrset primitives (string/int/bool/null/list/path)
+    else if !builtins.isAttrs r then _safeStr r
     else
       let v = r.__variant or null; in
-      if v == null then builtins.toJSON r
+      # Guard 3: attrset with no __variant — not a TypeRepr, safe attrNames only
+      if v == null then
+        "{${lib.concatStringsSep "," (lib.sort builtins.lessThan (builtins.attrNames r))}}"
       else if v == "Primitive" then
         "Prim(${r.name})"
       else if v == "Var" then
         let
           idx   = env.${r.name} or null;
-          scope = if r ? scope then r.scope else "?";
+          scope = r.scope or "?";
         in
         if idx != null then "DB(${builtins.toString (depth - idx - 1)})"
         else "Free(${r.name}@${scope})"
@@ -56,9 +93,10 @@ in rec {
       else if v == "Constrained" then
         let
           baseStr = _serializeWithEnv env depth r.base.repr;
-          csStrs  = map (c: serializeConstraint c) (lib.sort (a: b:
-            builtins.toJSON a < builtins.toJSON b
-          ) r.constraints);
+          # INV-SER-1: serializeConstraint (not builtins.toJSON) for sorting
+          csStrs  = map serializeConstraint
+            (lib.sort (a: b: serializeConstraint a < serializeConstraint b)
+              r.constraints);
         in
         "Cs(${baseStr};${lib.concatStringsSep "," csStrs})"
       else if v == "Mu" then
@@ -87,7 +125,9 @@ in rec {
           varStrs = map (n:
             "${n}:${_serializeWithEnv env depth r.variants.${n}.repr}"
           ) sortedVars;
-          tailStr = if r.tail != null then "|${_serializeWithEnv env depth r.tail.repr}" else "";
+          tailStr =
+            let tailVal = r.tail or null; in
+            if tailVal != null then "|${_serializeWithEnv env depth tailVal.repr}" else "";
         in
         "VRow[${lib.concatStringsSep "," varStrs}${tailStr}]"
       else if v == "Effect" then
@@ -98,9 +138,8 @@ in rec {
         "Eff(${rowStr},${resStr})"
       else if v == "EffectMerge" then
         let
-          e1Str = _serializeWithEnv env depth r.e1.repr;
-          e2Str = _serializeWithEnv env depth r.e2.repr;
-          # canonical: sorted to ensure confluence
+          e1Str  = _serializeWithEnv env depth r.e1.repr;
+          e2Str  = _serializeWithEnv env depth r.e2.repr;
           sorted = lib.sort (a: b: a < b) [e1Str e2Str];
         in
         "EMerge(${lib.concatStringsSep "++" sorted})"
@@ -148,17 +187,41 @@ in rec {
           ptStr    = _serializeWithEnv env depth r.paramType.repr;
         in
         "Π(${ptStr}).${bodyStr}"
+      else if v == "Sigma" then
+        let
+          newDepth = depth + 1;
+          newEnv   = env // { ${r.param} = depth; };
+          bodyStr  = _serializeWithEnv newEnv newDepth r.body.repr;
+          ptStr    = _serializeWithEnv env depth r.paramType.repr;
+        in
+        "Σ(${ptStr}).${bodyStr}"
       else if v == "Constructor" then
         let
           paramStr = lib.concatStringsSep "," r.params;
           bodyStr  = _serializeWithEnv env depth r.body.repr;
         in
         "Con(${r.name},[${paramStr}],${bodyStr})"
+      # Phase 4.2 new variants
+      else if v == "ComposedFunctor" then
+        let
+          fStr = _serializeWithEnv env depth r.f.repr;
+          gStr = _serializeWithEnv env depth r.g.repr;
+        in
+        "CF(${fStr}∘${gStr})"
+      else if v == "TypeScheme" then
+        let
+          forallStr = lib.concatStringsSep "," (lib.sort builtins.lessThan (r.vars or []));
+          bodyStr   = _serializeWithEnv env depth r.body.repr;
+        in
+        "TS(∀[${forallStr}].${bodyStr})"
+      # Unknown variant — safe attrNames-only fallback
       else "Unknown(${v})";
 
-  # ══ Constraint 序列化 ══════════════════════════════════════════════════
+  # ══ Constraint 序列化（INV-SER-1: no toJSON on unknown values）══════════
   serializeConstraint = c:
-    if !builtins.isAttrs c then builtins.toJSON c
+    # Guard: function or non-attrset → _safeStr
+    if builtins.isFunction c then "<fn-constraint>"
+    else if !builtins.isAttrs c then _safeStr c
     else
       let tag = c.__constraintTag or null; in
       if tag == "Equality" then
@@ -178,16 +241,53 @@ in rec {
         "RowEq(${serializeRepr c.lhsRow.repr},${serializeRepr c.rhsRow.repr})"
       else if tag == "Refined" then
         "RefCons(${serializeRepr c.subject.repr},${c.predVar},${serializePredExpr c.predExpr})"
-      else builtins.toJSON c;
+      # Phase 4.2 tags
+      else if tag == "Scheme" then
+        let
+          s         = c.scheme or {};
+          forallStr =
+            let fl = s.forall or []; in
+            lib.concatStringsSep "," (lib.sort builtins.lessThan fl);
+          bodyStr   = if s ? body then serializeRepr s.body.repr else "?";
+          tyStr     = if c ? ty then serializeRepr c.ty.repr else "?";
+        in
+        "Scheme(∀[${forallStr}].${bodyStr}≥${tyStr})"
+      else if tag == "Kind" then
+        let
+          tvar = c.typeVar or "?";
+          knd  = c.expectedKind or { __kindTag = "?"; };
+          ks   = serializeKind knd;
+        in
+        "Kind(${tvar},${ks})"
+      else if tag == "Instance" then
+        let
+          argStrs = map (a: serializeRepr a.repr) (c.types or []);
+          cls     = if c ? className then c.className else "?";
+        in
+        "Instance(${cls},[${lib.concatStringsSep "," argStrs}])"
+      # Safe fallback: attrNames only, no value access
+      else
+        let
+          tagStr = if tag != null then tag else "Unknown";
+          keys   = lib.sort builtins.lessThan (builtins.attrNames c);
+        in
+        "${tagStr}(${lib.concatStringsSep "," keys})";
 
-  # ══ PredExpr 序列化（用于 Refined 类型）══════════════════════════════
+  # ══ PredExpr 序列化（INV-SER-1）══════════════════════════════════════════
   serializePredExpr = pe:
-    if !builtins.isAttrs pe then builtins.toJSON pe
+    if builtins.isFunction pe then "<fn-pred>"
+    else if !builtins.isAttrs pe then _safeStr pe
     else
       let tag = pe.__predTag or null; in
       if tag == "PTrue"  then "⊤"
       else if tag == "PFalse" then "⊥"
-      else if tag == "PLit"   then "Lit(${builtins.toJSON pe.value})"
+      else if tag == "PLit" then
+        # pe.value is always a primitive (int/string/bool) — toJSON is safe here
+        let
+          pv = pe.value or null;
+          pvStr = if builtins.isFunction pv then "<fn>" else builtins.toJSON pv;
+        in
+        "Lit(${pvStr})"
       else if tag == "PVar"   then "PVar(${pe.name})"
       else if tag == "PCmp"   then
         "Cmp(${pe.op},${serializePredExpr pe.lhs},${serializePredExpr pe.rhs})"
@@ -197,16 +297,26 @@ in rec {
         "Or(${serializePredExpr pe.lhs},${serializePredExpr pe.rhs})"
       else if tag == "PNot"   then
         "Not(${serializePredExpr pe.body})"
-      else builtins.toJSON pe;
+      # Unknown pred tag — safe attrNames fallback
+      else
+        let
+          tagStr = if tag != null then tag else "UnknownPred";
+          keys   = lib.sort builtins.lessThan (builtins.attrNames pe);
+        in
+        "${tagStr}(${lib.concatStringsSep "," keys})";
 
-  # ══ TypeRepr 序列化（public API）══════════════════════════════════════
-  # Type: TypeRepr → String（canonical，alpha-规范化）
-  serializeRepr = r:
-    _serializeWithEnv {} 0 r;
+  # ══ TypeRepr 序列化（public API）══════════════════════════════════════════
+  serializeRepr = r: _serializeWithEnv {} 0 r;
 
-  # Type: Type → String（完整 Type，含 kind）
+  # ══ Type 序列化 ════════════════════════════════════════════════════════════
+  # INV-SER-1: guard against function values in fallback
   serializeType = t:
-    if !builtins.isAttrs t || (t.tag or null) != "Type" then builtins.toJSON t
+    if builtins.isFunction t then "<fn-type>"
+    else if !builtins.isAttrs t then _safeStr t
+    else if (t.tag or null) != "Type" then
+      # Not a TypeIR — safe attrNames-only description
+      let keys = lib.sort builtins.lessThan (builtins.attrNames t); in
+      "NonType{${lib.concatStringsSep "," keys}}"
     else
       let
         reprStr = serializeRepr t.repr;
@@ -214,10 +324,7 @@ in rec {
       in
       "T(${reprStr}:${kindStr})";
 
-  # ══ canonical hash（供 hashLib 使用）══════════════════════════════════
-  canonicalHash = t:
-    builtins.hashString "sha256" (serializeType t);
-
-  canonicalHashRepr = r:
-    builtins.hashString "sha256" (serializeRepr r);
+  # ══ canonical hash ══════════════════════════════════════════════════════════
+  canonicalHash     = t: builtins.hashString "sha256" (serializeType t);
+  canonicalHashRepr = r: builtins.hashString "sha256" (serializeRepr r);
 }

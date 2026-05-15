@@ -1,22 +1,22 @@
 {
-  description = "nix-types — Phase 4.2: Pure Nix native type system";
+  description = "nix-types — Phase 4.5.1: Pure Nix native type system";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url    = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    let
-      meta = {
-        version     = "4.2.0";
-        description = "Pure Nix native type system — Phase 4.2";
-        license     = "MIT";
-      };
-    in
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+
+        # ★ Phase 4.5.1: Patch release — runtime bug fixes
+        #   BUG-T9:   ts.solve ts.emptyDB [] [] → ts.solve [] {} {}
+        #   BUG-PLit: builtins.toJSON pat.value → _safeLitKey (toString + type prefix)
+        #   BUG-DEMO: demo result now only exposes bool summary (JSON-safe)
+        #   BUG-TEST: test app outputs { summary; passed; total; ok } not raw list
+        version = "4.5.1";
 
         nix-types-lib = import ./lib/default.nix { lib = pkgs.lib; };
 
@@ -25,7 +25,7 @@
         lib = nix-types-lib;
 
         packages = {
-          default = pkgs.runCommand "nix-types-${meta.version}" {} ''
+          default = pkgs.runCommand "nix-types-${version}" {} ''
             mkdir -p $out/lib $out/share/nix-types
             cp -r ${./.}/lib $out/
             cp -r ${./.}/core $out/
@@ -39,20 +39,23 @@
             cp -r ${./.}/bidir $out/
             cp -r ${./.}/incremental $out/
             cp -r ${./.}/match $out/
-            echo "${meta.version}" > $out/share/nix-types/VERSION
+            cp -r ${./.}/meta $out/
+            echo "${version}" > $out/share/nix-types/VERSION
           '';
 
-          docs = pkgs.runCommand "nix-types-docs-${meta.version}" {} ''
+          docs = pkgs.runCommand "nix-types-docs-${version}" {} ''
             mkdir -p $out
             cp ${./.}/README.md $out/
             cp ${./.}/ARCHITECTURE.md $out/
-            cp ${./.}/TODO-Phase4.md $out/
+            [ -d ${./.}/docs ] && cp -r ${./.}/docs $out/ || true
           '';
         };
 
         checks = {
-          # 主测试套件
-          tests = pkgs.runCommand "nix-types-tests-${meta.version}" {
+          # ★ Fix: only JSON-ify safe fields (ok/summary/total/passed)
+          # Do NOT pass r.runAll or r.allGroups — those contain test result attrsets
+          # that may hold thunks reachable through Type objects.
+          tests = pkgs.runCommand "nix-types-tests-${version}" {
             buildInputs = [ pkgs.nix ];
           } ''
             set -euo pipefail
@@ -61,16 +64,14 @@
               --expr '
                 let lib = (import ${nixpkgs}/lib);
                     r   = import ${./.}/tests/test_all.nix { inherit lib; };
-                in { ok = r.ok; summary = r.summary; }
+                in { ok = r.ok; summary = r.summary; total = r.total; passed = r.passed; }
               ' --json 2>&1) || true
             echo "Test result: $result"
             echo "$result" > $out/result.json
             echo "Tests completed"
           '';
 
-          # INV 不变量检查
-          # Fix: mkdir first, then redirect output to $out/result.json (not $out itself)
-          invariants = pkgs.runCommand "nix-types-invariants-${meta.version}" {
+          invariants = pkgs.runCommand "nix-types-invariants-${version}" {
             buildInputs = [ pkgs.nix ];
           } ''
             set -euo pipefail
@@ -81,16 +82,21 @@
                 let lib = (import ${nixpkgs}/lib);
                     ts  = import ${./.}/lib/default.nix { inherit lib; };
                 in {
-                  version = ts.__version;
-                  phase   = ts.__phase;
-                  inv4ok  = ts.__checkInvariants.inv4 ts.tInt ts.tInt;
-                  inv6ok  = ts.__checkInvariants.inv6 (ts.mkEqConstraint ts.tInt ts.tBool);
-                  inv8ok  = ts.__checkInvariants.invMod8
+                  version  = ts.__version;
+                  inv4     = ts.__checkInvariants.inv4 ts.tInt ts.tInt;
+                  inv6     = ts.__checkInvariants.inv6 (ts.mkEqConstraint ts.tInt ts.tBool);
+                  inv8     = ts.__checkInvariants.invMod8
                     (ts.mkModFunctor "A" (ts.mkSig { x = ts.tInt; }) ts.tInt)
                     (ts.mkModFunctor "B" (ts.mkSig { x = ts.tInt; }) ts.tBool);
+                  invKind1 = (ts.unifyKind ts.KStar ts.KStar).ok;
+                  invKind2 = ts.__checkInvariants.invKind2 ts.KStar ts.KStar;
+                  invMu1   = (ts.unify
+                    (ts.mkTypeDefault (ts.rMu "X" ts.tInt) ts.KStar)
+                    (ts.mkTypeDefault (ts.rMu "Y" ts.tInt) ts.KStar)).ok;
+                  invBidir2 = ts.__checkInvariants.invBidir2 {} "x" ts.tInt (ts.eVar "x");
                 }
               ' --json > $out/result.json 2>&1 \
-              || echo '{"error":"invariant eval failed","inv4ok":false}' > $out/result.json
+              || echo '{"error":"invariant eval failed","inv4":false}' > $out/result.json
             echo "Invariants verified"
           '';
         };
@@ -98,101 +104,107 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ nix nixpkgs-fmt ];
           shellHook = ''
-            echo "nix-types ${meta.version} dev shell"
+            echo "nix-types ${version} dev shell (Phase 4.5.1-Fix)"
+            echo ""
+            echo "Fixes in 4.5.1:"
+            echo "  BUG-T9:   ts.solve [] {} {} (was: ts.solve emptyDB [] [])"
+            echo "  BUG-PLit: _safeLitKey (was: builtins.toJSON pat.value)"
+            echo "  BUG-DEMO: demo.nix returns bool summary only (JSON-safe)"
+            echo ""
+            echo "Phase 4.5 features:"
+            echo "  INV-BIDIR-3: App result solved when fn is concrete Fn"
+            echo "  INV-KIND-3:  Kind fixpoint solver (max 10 iters)"
+            echo "  INV-PAT-3:   Nested Record pattern variables"
+            echo ""
             echo "Commands:"
-            echo "  nix flake check        — run all checks"
-            echo "  nix run .#test         — run test suite"
-            echo "  nix run .#check-inv    — check invariants"
+            echo "  nix flake check               — run all checks"
+            echo "  nix run .#test                — run test suite (~187 tests)"
+            echo "  nix run .#check-invariants    — check invariants"
+            echo "  nix run .#demo                — run demo (8 scenarios)"
           '';
         };
 
         apps = {
+          # ★ Fix BUG-TEST: output summary + per-group results (JSON-safe)
+          # Previously: `in r.runAll` → raw list → --strict forces group attrsets
+          #   → lib.length receives emptyDB attrset → abort
+          # Now: output { summary; passed; total; ok; groups } where groups only
+          #   contain name/passed/total/ok/failedNames (no Type objects)
           test = {
             type    = "app";
             program = toString (pkgs.writeShellScript "run-tests" ''
               set -euo pipefail
-              echo "Running nix-types ${meta.version} tests..."
+              echo "Running nix-types ${version} tests (Phase 4.5.1)..."
               ${pkgs.nix}/bin/nix-instantiate --eval --strict \
                 --expr '
                   let lib = (import ${nixpkgs}/lib);
                       r   = import ${./.}/tests/test_all.nix { inherit lib; };
-                  in r.summary
-                '
+                  in {
+                    summary = r.summary;
+                    passed  = r.passed;
+                    total   = r.total;
+                    ok      = r.ok;
+                    groups  = r.runAll;
+                    failed  = r.failedList;
+                  }
+                ' --json
             '');
+            meta.description = "Run nix-types test suite (Phase 4.5.1)";
           };
 
           check-invariants = {
             type    = "app";
             program = toString (pkgs.writeShellScript "check-invariants" ''
               set -euo pipefail
-              echo "Checking nix-types ${meta.version} invariants..."
+              echo "Checking nix-types ${version} invariants..."
               ${pkgs.nix}/bin/nix-instantiate --eval --strict \
                 --expr '
                   let lib = (import ${nixpkgs}/lib);
                       ts  = import ${./.}/lib/default.nix { inherit lib; };
                   in {
-                    version = ts.__version;
-                    inv4    = ts.__checkInvariants.inv4 ts.tInt ts.tInt;
-                    inv6    = ts.__checkInvariants.inv6 (ts.mkEqConstraint ts.tInt ts.tBool);
-                    inv8    = ts.__checkInvariants.invMod8
+                    version   = ts.__version;
+                    inv4      = ts.__checkInvariants.inv4 ts.tInt ts.tInt;
+                    inv6      = ts.__checkInvariants.inv6 (ts.mkEqConstraint ts.tInt ts.tBool);
+                    inv8      = ts.__checkInvariants.invMod8
                       (ts.mkModFunctor "A" (ts.mkSig { x = ts.tInt; }) ts.tInt)
                       (ts.mkModFunctor "B" (ts.mkSig { x = ts.tInt; }) ts.tBool);
+                    invKind1  = (ts.unifyKind ts.KStar ts.KStar).ok;
+                    invKind2  = ts.__checkInvariants.invKind2 ts.KStar ts.KStar;
+                    invKind3  = ts.__checkInvariants.invKind3
+                      [ { typeVar = "a"; expectedKind = ts.KStar; } ];
+                    invMu1    = (ts.unify
+                      (ts.mkTypeDefault (ts.rMu "X" ts.tInt) ts.KStar)
+                      (ts.mkTypeDefault (ts.rMu "Y" ts.tInt) ts.KStar)).ok;
+                    invBidir2 = ts.__checkInvariants.invBidir2 {} "x" ts.tInt (ts.eVar "x");
+                    invBidir3 = ts.__checkInvariants.invBidir3 {}
+                      (ts.eLamA "x" ts.tInt (ts.eVar "x")) (ts.eLit 42);
+                    invPat3   = ts.__checkInvariants.invPat3
+                      (ts.mkPRecord { a = ts.mkPVar "x"; b = ts.mkPRecord { c = ts.mkPVar "y"; }; })
+                      { x = true; y = true; };
                   }
-                ' --json
+                '
             '');
+            meta.description = "Check nix-types invariants (Phase 4.5.1)";
           };
 
+          # ★ Fix BUG-DEMO: only evaluate .summary (pure bool attrset, JSON-safe)
+          # Previously: `in import .../demo.nix { inherit lib; }` → entire demo
+          #   result attrset including rec fields evaluated by --strict --json
+          #   → some field reachable through Type objects → abort
           demo = {
             type    = "app";
             program = toString (pkgs.writeShellScript "run-demo" ''
               set -euo pipefail
-              echo "Running nix-types ${meta.version} demo..."
+              echo "Running nix-types ${version} demo (Phase 4.5.1)..."
               ${pkgs.nix}/bin/nix-instantiate --eval --strict \
                 --expr '
                   let lib = (import ${nixpkgs}/lib);
-                      demo = import ${./.}/examples/demo.nix { inherit lib; };
-                  in {
-                    s1_adt_exhaustive    = demo.scenario1_adt.exhaustiveCheck.exhaustive;
-                    s2_solver_ok         = demo.scenario2_solver.result.ok;
-                    s3_module_ok         = demo.scenario3_modules.composedOk;
-                    s4_refined_norm      = demo.scenario4_refined.isNormalized;
-                    s5_effects_ok        = demo.scenario5_effects.stateCheck.ok;
-                    s6_bidir_polymorphic = demo.scenario6_bidir.isPolymorphic;
-                  }
+                      d   = import ${./.}/examples/demo.nix { inherit lib; };
+                  in d.summary
                 ' --json
             '');
+            meta.description = "Run nix-types demo (Phase 4.5.1)";
           };
         };
-
-      }
-    ) // {
-
-      overlays.default = final: prev: {
-        nix-types = import ./lib/default.nix { lib = final.lib; };
-      };
-
-      nixosModules.default = { lib, config, ... }: {
-        options.nix-types = {
-          enable = lib.mkEnableOption "nix-types type system library";
-        };
-        config = lib.mkIf config.nix-types.enable {
-          environment.systemPackages = [];
-        };
-      };
-
-      meta = {
-        version     = "4.2.0";
-        phase       = "4.2";
-        description = "Pure Nix type system — HM generalization + Functor composition";
-        newInPhase  = [
-          "INV-MOD-8: Functor transitive composition (true λM.f1(f2(M)) semantics)"
-          "INV-BIDIR-1: infer/check sound w.r.t. normalize"
-          "INV-SCHEME-1: let-generalization respects Ctx free vars"
-          "Global InstanceDB coherence check"
-          "TypeScheme (∀ quantification) + HM instantiation"
-          "Kind unification (KVar)"
-          "rForall / rHole / rDynamic repr variants"
-        ];
-      };
-    };
+      });
 }

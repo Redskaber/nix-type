@@ -1,6 +1,8 @@
-# constraint/ir.nix — Phase 4.2
+# constraint/ir.nix — Phase 4.3
 # Constraint IR：INV-6（Constraint ∈ TypeRepr，结构化 IR）
 # 所有 Constraint 是 attrset（可参与 normalize/hash/equality）
+# Fix P4.3: mkImpliesConstraint 排序改用 serializeConstraint（而非 builtins.toJSON）
+#           避免 Constraint 中内嵌 Type 对象触发 "cannot convert function to JSON"
 { lib, serialLib }:
 
 let
@@ -32,10 +34,12 @@ in rec {
   };
 
   # ④ Implies — premises ⊢ conclusion（premises canonical 排序）
+  # Fix P4.3: 使用 serializeConstraint 而非 builtins.toJSON 排序
+  #   builtins.toJSON 会递归碰触 Type 对象中的函数字段
   mkImpliesConstraint = premises: conclusion:
     let
       sorted = lib.sort (a: b:
-        builtins.toJSON a < builtins.toJSON b
+        serializeConstraint a < serializeConstraint b
       ) premises;
     in
     { __constraintTag = "Implies"; premises = sorted; conclusion = conclusion; };
