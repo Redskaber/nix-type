@@ -214,8 +214,7 @@
                     invBidir2 = ts.__checkInvariants.invBidir2 {} "x" ts.tInt (ts.eVar "x");
                     invBidir3 = ts.__checkInvariants.invBidir3 {}
                       (ts.eLamA "x" ts.tInt (ts.eVar "x")) (ts.eLit 42);
-                    invPat1   = ts.__checkInvariants.invPat1
-                      (ts.mkPCtor "Just" [ts.mkPVar "z"]) "Just" "z";
+                    invPat1   = ts.__checkInvariants.invPat1 "Just" "z";
                     invPat3   = ts.__checkInvariants.invPat3
                       (ts.mkPRecord { a = ts.mkPVar "x"; b = ts.mkPRecord { c = ts.mkPVar "y"; }; })
                       { x = true; y = true; };
