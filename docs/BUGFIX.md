@@ -430,21 +430,23 @@ Nix 评估器报不可捕获的 abort。
 
 ---
 
-## 不变式总览
+## 不变式总览（Phase 4.5.9 完整版）
 
-| 不变式        | 描述                                                        | 引入版本  |
-| ------------- | ----------------------------------------------------------- | --------- |
-| INV-SER-1     | `builtins.toJSON` 不碰 Type/Constraint/函数值               | 4.3       |
-| INV-NIX-1     | `or` 不在 `${}` 插值内                                      | 4.3       |
-| INV-NIX-2     | `lib.concatMap` 不用于 rec fn（改 `builtins.concatLists`）  | 4.5.2     |
-| **INV-NIX-3** | `rec{}` 内递归函数不裸传给 `builtins.map`；用 lambda 包装器 | **4.5.3** |
-| INV-TEST-1    | `builtins.tryEval` 隔离每个测试                             | 4.3       |
-| INV-TEST-2    | Pattern 测试使用 `patternLib.mkPVar`                        | 4.3.1     |
-| INV-TEST-3    | Unicode key 使用 `? "α"` 语法                               | 4.3.1     |
-| INV-TEST-4    | `runGroup` 防御性检查 tests 类型                            | 4.5.2     |
-| INV-TEST-5    | `failedList` 防御性检查 g.failed 字段                       | 4.5.2     |
-| INV-TEST-6    | `mkTestBool`/`mkTest` 携带 diag 字段                        | **4.5.3** |
-| INV-TEST-7    | 所有输出路径 JSON-safe（无 Type 对象，无函数值）            | **4.5.3** |
-| INV-I1-key    | `_instanceKey` 用纯字符串拼接                               | 4.3.1     |
-| INV-LET-1     | `let` 绑定不 shadow 函数参数                                | 4.3.1     |
-| INV-TOPO      | `topologicalSort` 统一返回 `{ ok; order; error }`           | 4.5.2     |
+| 不变式         | 描述                                                               | 引入版本  |
+| -------------- | ------------------------------------------------------------------ | --------- |
+| INV-SER-1      | `builtins.toJSON` 不碰 Type/Constraint/函数值                      | 4.3       |
+| INV-I1-key     | `_instanceKey` 用纯字符串拼接，不用 `toJSON`                       | 4.3.1     |
+| INV-NIX-1      | `or` 不在 `${}` 插值内；改用 `let val = ...; in "${val}"`          | 4.3       |
+| INV-NIX-2      | `lib.concatMap` 不用于 rec fn（改 `builtins.concatLists+map`）     | 4.5.2     |
+| **INV-NIX-3**  | `rec{}` 内递归函数不裸传给 `builtins.map`；用 lambda 包装器        | **4.5.3** |
+| **INV-NIX-4**  | letrec 上下文不用 `foldl'+` 拼接列表；改用 `concatLists(map f xs)` | **4.5.9** |
+| **INV-NIX-5**  | `patternVars` 用迭代 BFS（\_extractOne × 8），不用递归自引用       | **4.5.9** |
+| INV-LET-1      | `let` 绑定不 shadow 外层函数参数（避免 Nix let 互递归死循环）      | 4.3.1     |
+| INV-TEST-1     | `builtins.tryEval` 隔离每个测试，单失败不中断整个套件              | 4.3       |
+| INV-TEST-2     | Pattern 测试使用 `patternLib.mkPVar`（不用 refinedLib 版本）       | 4.3.1     |
+| INV-TEST-3     | Unicode attrset key 使用 `? "α"` 语法，不用 Nix 标识符             | 4.3.1     |
+| INV-TEST-4     | `testGroup` 防御性检查 tests 参数类型                              | 4.5.2     |
+| INV-TEST-5     | `failedList` 防御性检查 g.failed 字段                              | 4.5.2     |
+| **INV-TEST-6** | `mkTestBool`/`mkTest` 携带 diag 字段供调试                         | **4.5.3** |
+| **INV-TEST-7** | 所有输出路径 JSON-safe（无 Type 对象，无函数值）                   | **4.5.3** |
+| INV-TOPO       | `topologicalSort` 统一返回 `{ ok; order; error }`，从不返回裸列表  | 4.5.2     |
