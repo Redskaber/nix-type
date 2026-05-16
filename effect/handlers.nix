@@ -47,10 +47,16 @@ in rec {
       resumeBranch = mkBranchWithCont effectTag paramType contType
         (mkTypeDefault (rFn paramType returnType) KStar);
       # Final handler repr with continuation type embedded
+      # INV-EFF-11: contDomainOk = true iff contType is a Fn type whose .from == paramType
+      contV       = contType.repr.__variant or null;
+      contDomOk   = contV == "Fn" &&
+                    (hashLib.typeHash (contType.repr.from or null) ==
+                     hashLib.typeHash paramType);
       handlerRepr = (rHandler effectTag [ resumeBranch ] returnType) // {
-        hasCont   = true;
-        contType  = contType;
-        paramType = paramType;
+        hasCont      = true;
+        contType     = contType;
+        paramType    = paramType;
+        contDomainOk = contDomOk;
       };
     in
     mkTypeDefault handlerRepr KStar;
@@ -183,13 +189,18 @@ in rec {
         # contType should be a function type: param → ...
         let contV = contType.repr.__variant or null; in
         if contV == "Fn" then
+          let
+            contFrom     = contType.repr.from;
+            domainMatch  = hashLib.typeHash contFrom == hashLib.typeHash paramType;
+          in
           { ok           = true;
+            inv_eff_11   = domainMatch;
             paramType    = paramType;
             contType     = contType;
-            contDomain   = contType.repr.from;
+            contDomain   = contFrom;
             contCodomain = contType.repr.to; }
         else
-          { ok = false; error = "contType is not a function type: ${contV}"; };
+          { ok = false; inv_eff_11 = false; error = "contType is not a function type: ${contV}"; };
 
   # ══ Effect type 合法性检查（INV-EFF-4）═══════════════════════════════
   checkEffectWellFormed = t:
@@ -217,3 +228,4 @@ in rec {
       if !r1.ok then r1 else if !r2.ok then r2 else { ok = true; }
     else { ok = false; error = "invalid effect row: ${v}"; };
 }
+

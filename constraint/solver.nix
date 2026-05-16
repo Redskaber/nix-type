@@ -1,10 +1,14 @@
-# constraint/solver.nix — Phase 4.3
+# constraint/solver.nix — Phase 4.5.4
 # Worklist 约束 Solver（合并版）
 # INV-SOL1:   等价约束规范化（对称性 + NF-hash）
 # INV-SOL5:   worklist requeue（subst 传播完整）
 # INV-KIND-1: Kind constraints 真正求解（Phase 4.3 新增）
-#             Phase 4.2 中 Kind 约束仅 defer → classResidual
-#             Phase 4.3 调用 kindLib.solveKindConstraints → 真正 unifyKind
+#
+# Fix P4.5.4: Updated constraint tag patterns to short form
+#   "Equality"  → "Eq"
+#   "RowEquality" → "RowEq"
+#   Added handling for "Sub", "HasField" (defer to classResidual)
+#   Legacy long-form tags handled via compat branches
 { lib, typeLib, reprLib, kindLib, constraintLib, substLib, unifiedSubstLib,
   unifyLib, unifyRowLib, instanceLib, hashLib, normalizeLib }:
 
@@ -42,7 +46,6 @@ in rec {
       solved        = [];
       classResidual = [];
       smtResidual   = [];
-      # Phase 4.3: separate kind constraint accumulator
       kindConstraints = [];
       classGraph    = classGraph;
       instanceDB    = instanceDB;
@@ -56,13 +59,10 @@ in rec {
     if state.failed or false then
       failResult (state.error or "solver failed")
     else
-      # Phase 4.3: solve collected Kind constraints
       let
         kindResult = solveKindConstraints (state.kindConstraints or []);
-        # Integrate kind subst into unified subst
         finalSubst =
           if kindResult.ok then
-            # merge kind bindings into subst
             let kb = kindResult.subst; in
             lib.foldl' (acc: kvar:
               let newKindBinding = singleKindBinding kvar kb.${kvar}; in
@@ -93,8 +93,8 @@ in rec {
         tag  = c.__constraintTag or null;
       in
 
-      # ── Equality ──────────────────────────────────────────────────
-      if tag == "Equality" then
+      # ── Eq (short form) ───────────────────────────────────────────
+      if tag == "Eq" then
         let
           lhs = applySubst state.subst c.lhs;
           rhs = applySubst state.subst c.rhs;
@@ -114,7 +114,49 @@ in rec {
             fuel     = state.fuel - 1;
           })
 
-      # ── RowEquality ───────────────────────────────────────────────
+      # ── Equality (legacy compat) ─────────────────────────────────
+      else if tag == "Equality" then
+        let
+          lhs = applySubst state.subst c.lhs;
+          rhs = applySubst state.subst c.rhs;
+          r   = unify lhs rhs;
+        in
+        if !r.ok then
+          failResult (r.error or "unification failed")
+        else
+          let
+            newSubst    = composeSubst r.subst state.subst;
+            newWorklist = applySubstToConstraints r.subst rest;
+          in
+          _solveLoop (state // {
+            worklist = newWorklist;
+            subst    = newSubst;
+            solved   = state.solved ++ [ c ];
+            fuel     = state.fuel - 1;
+          })
+
+      # ── RowEq (short form) ────────────────────────────────────────
+      else if tag == "RowEq" then
+        let
+          lhsR = applySubst state.subst c.lhsRow;
+          rhsR = applySubst state.subst c.rhsRow;
+          r    = unifyRow lhsR rhsR;
+        in
+        if !r.ok then
+          failResult (r.error or "row unification failed")
+        else
+          let
+            newSubst    = composeSubst r.subst state.subst;
+            newWorklist = applySubstToConstraints r.subst rest;
+          in
+          _solveLoop (state // {
+            worklist = newWorklist;
+            subst    = newSubst;
+            solved   = state.solved ++ [ c ];
+            fuel     = state.fuel - 1;
+          })
+
+      # ── RowEquality (legacy compat) ────────────────────────────────
       else if tag == "RowEquality" then
         let
           lhsR = applySubst state.subst c.lhsRow;
@@ -149,7 +191,6 @@ in rec {
             fuel     = state.fuel - 1;
           })
         else
-          # Not resolved: defer to residual
           _solveLoop (state // {
             worklist      = rest;
             classResidual = state.classResidual ++ [ c ];
@@ -162,7 +203,6 @@ in rec {
           subject = applySubst state.subst c.subject;
           predVar = c.predVar or "v";
           predExpr = c.predExpr or { __predTag = "PTrue"; };
-          # Inline static evaluation for trivial cases
           static =
             let ptag = predExpr.__predTag or null; in
             if ptag == "PTrue"  then { trivial = true; result = true; }
@@ -186,14 +226,12 @@ in rec {
       else if tag == "Implies" then
         let premises = c.premises or []; in
         if premises == [] then
-          # No premises: enqueue conclusion
           _solveLoop (state // {
             worklist = rest ++ [ c.conclusion ];
             solved   = state.solved ++ [ c ];
             fuel     = state.fuel - 1;
           })
         else
-          # Defer: try to discharge premises first
           _solveLoop (state // {
             worklist      = rest;
             classResidual = state.classResidual ++ [ c ];
@@ -216,7 +254,6 @@ in rec {
           let
             forall = scheme.forall or [];
             body   = scheme.body;
-            # Generate fresh type variables for each forall var
             freshBindings = builtins.listToAttrs (lib.imap0 (i: v:
               lib.nameValuePair v
                 (typeLib.mkTypeDefault (reprLib.rVar "_si_${v}_${builtins.toString i}" "scheme") kindLib.KStar)
@@ -224,7 +261,6 @@ in rec {
             instBody = lib.foldl' (acc: v:
               substLib.substitute v freshBindings.${v} acc
             ) body forall;
-            # Generate equality constraint between instantiated body and ty
             newCs = if ty != null then [ (mkEqConstraint instBody ty) ] else [];
           in
           _solveLoop (state // {
@@ -233,26 +269,32 @@ in rec {
             fuel     = state.fuel - 1;
           })
 
-      # ── Kind（Phase 4.3: INV-KIND-1 — 真正求解，不再 defer）──────
+      # ── Kind（Phase 4.3: INV-KIND-1）──────────────────────────────
       else if tag == "Kind" then
         let
           typeVar      = c.typeVar or null;
           expectedKind = c.expectedKind or kindLib.KStar;
         in
         if typeVar == null then
-          # Malformed: skip
           _solveLoop (state // {
             worklist = rest;
             fuel     = state.fuel - 1;
           })
         else
-          # Phase 4.3: accumulate for batch kind solving at end
           _solveLoop (state // {
             worklist        = rest;
             kindConstraints = (state.kindConstraints or []) ++ [ c ];
             solved          = state.solved ++ [ c ];
             fuel            = state.fuel - 1;
           })
+
+      # ── Sub / HasField（Phase 4.5.4: defer to residual）──────────
+      else if tag == "Sub" || tag == "HasField" then
+        _solveLoop (state // {
+          worklist      = rest;
+          classResidual = state.classResidual ++ [ c ];
+          fuel          = state.fuel - 1;
+        })
 
       # ── Unknown tag: defer ────────────────────────────────────────
       else

@@ -1,4 +1,4 @@
-# normalize/rewrite.nix — Phase 4.3
+# normalize/rewrite.nix — Phase 4.5.4
 # TRS 主引擎（fuel-based，保证终止）
 # INV-2:  所有计算 = Rewrite(TypeIR)，fuel 保证终止
 # INV-3:  结果 = NormalForm（无可归约子项）
@@ -10,6 +10,9 @@
 #            改用 serialLib._safeStr（isFunction 守卫，必定安全）。
 # Fix P4.3c: _constraintKey/predExpr fallback 改用 serializePredExpr + _safeStr
 #            确保所有 key 生成路径对函数值安全
+# Fix P4.5.4: Updated constraint tag patterns to short form
+#   "Equality"  → "Eq"    (also handles legacy "Equality" for compat)
+#   "RowEquality" → "RowEq" (also handles legacy "RowEquality" for compat)
 { lib, typeLib, reprLib, kindLib, substLib, rulesLib, serialLib }:
 
 let
@@ -18,7 +21,6 @@ let
   inherit (serialLib) serializeRepr serializePredExpr _safeStr;
 
   # ── repr-only key（P4.3 Fix: serializeRepr — never builtins.toJSON）────
-  # INV-NRM2: memo keys must use NF-hash / repr-based key, not raw type id
   _reprKey = t:
     if builtins.isFunction t then "<fn>"
     else if builtins.isAttrs t && t ? repr
@@ -28,7 +30,6 @@ let
     else _safeStr t;
 
   # ── 约束结构 key（仅依赖 repr，不触碰 kind/meta/函数字段）────────────────
-  # INV-NIX-1: no `or` inside ${}, all branches use let bindings
   _constraintKey = c:
     if builtins.isFunction c then "<fn>"
     else if !builtins.isAttrs c then _safeStr c
@@ -36,7 +37,8 @@ let
       let
         tag = if c ? __constraintTag then c.__constraintTag else "unknown";
       in
-      if tag == "Equality" then
+      # Phase 4.5.4: short tags, with legacy compat
+      if tag == "Eq" || tag == "Equality" then
         let
           lk = _reprKey (if c ? lhs then c.lhs else {});
           rk = _reprKey (if c ? rhs then c.rhs else {});
@@ -46,7 +48,7 @@ let
           cls     = if c ? className then c.className else "?";
           argKeys = lib.concatStringsSep "," (map _reprKey (if c ? args then c.args else []));
         in "Class:${cls}:[${argKeys}]"
-      else if tag == "RowEquality" then
+      else if tag == "RowEq" || tag == "RowEquality" then
         let
           lk = _reprKey (if c ? lhsRow then c.lhsRow else {});
           rk = _reprKey (if c ? rhsRow then c.rhsRow else {});
@@ -93,6 +95,17 @@ let
           cls     = if c ? className then c.className else "?";
           argKeys = lib.concatStringsSep "," (map _reprKey (if c ? types then c.types else []));
         in "Instance:${cls}:[${argKeys}]"
+      else if tag == "Sub" then
+        let
+          sk = _reprKey (if c ? sub then c.sub else {});
+          pk = _reprKey (if c ? sup then c.sup else {});
+        in "Sub:${sk}:${pk}"
+      else if tag == "HasField" then
+        let
+          f  = if c ? field then c.field else "?";
+          ft = _reprKey (if c ? fieldType then c.fieldType else {});
+          rt = _reprKey (if c ? recType then c.recType else {});
+        in "HasField:${f}:${ft}:${rt}"
       else
         let attrHash = builtins.hashString "sha256" (lib.concatStringsSep "," (builtins.attrNames c)); in
         "${tag}:${attrHash}";
@@ -154,6 +167,8 @@ in rec {
               paramSig = go t.repr.paramSig; body = go t.repr.body; }
       else if v == "Forall" then
         goR { __variant = "Forall"; vars = t.repr.vars; body = go t.repr.body; }
+      else if v == "ForAll" then
+        goR { __variant = "ForAll"; name = t.repr.name; kind = t.repr.kind; body = go t.repr.body; }
       else if v == "Pi" then
         goR { __variant = "Pi"; param = t.repr.param;
               paramType = go t.repr.paramType; body = go t.repr.body; }
@@ -173,7 +188,8 @@ in rec {
     if !builtins.isAttrs c then c
     else
       let tag = c.__constraintTag or null; in
-      if tag == "Equality" then
+      # Phase 4.5.4: short tags + legacy compat
+      if tag == "Eq" || tag == "Equality" then
         let
           lhsN = normalize' c.lhs;
           rhsN = normalize' c.rhs;
@@ -184,7 +200,7 @@ in rec {
         else c // { lhs = rhsN; rhs = lhsN; }
       else if tag == "Class" then
         c // { args = map normalize' c.args; }
-      else if tag == "RowEquality" then
+      else if tag == "RowEq" || tag == "RowEquality" then
         c // { lhsRow = normalize' c.lhsRow; rhsRow = normalize' c.rhsRow; }
       else if tag == "Refined" then
         c // { subject = normalize' c.subject; }

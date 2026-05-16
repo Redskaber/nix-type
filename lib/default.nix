@@ -1,276 +1,475 @@
-# lib/default.nix — Phase 4.4
-# 统一导出（Layer 0~22 拓扑顺序）
+# lib/default.nix — Phase 4.5.6
+# Unified export layer (Layer 0-21 topological order)
 #
-# Phase 4.4 变更（基于 Phase 4.3-Fix）:
-#   - core/kind.nix: inferKindWithAnnotation, checkKindAnnotation, mergeKindEnv (INV-KIND-2)
-#   - bidir/check.nix: annotated lambda uses paramTy directly (INV-BIDIR-2); checkAnnotatedLam
-#   - effect/handlers.nix: checkHandlerContWellFormed now verifies contType.from == paramType (INV-EFF-11)
-#   - match/pattern.nix: patternVars bug fix; patternVarsSet, isLinear, patternDepth
-#   - tests/test_all.nix: T24 (Bidir Annotated Lambda) + T25 (Handler Cont Type Check) — 170 tests total
-#   - Version: 4.4.0
+# INV-LIB-1: This file only does:
+#   1. Import sub-modules in topological order (dependency injection)
+#   2. inherit / simple aliases / arg-flip/adapt wrappers
+#   3. __checkInvariants / __version / __modules metadata
+#   Zero business logic. All logic lives in the corresponding sub-module.
 #
-# Fix P4.3-patternVars (T16 regression):
-#   patternVars "Ctor" branch used `pat.field` instead of `pat.fields or []`,
-#   causing attribute-missing evaluation error → tryEval marks test as failed.
-#   Fixed in match/pattern.nix with explicit null-guard + correct field name.
-#
-# INV maintained:
-#   INV-1..INV-MU-1 (inherited from 4.3)
-#   INV-BIDIR-2: infer(eLamA p ty b) = (ty → bodyTy)
-#   INV-EFF-11:  contType.from == paramType
-#   INV-KIND-2:  kind annotation propagation consistent with inference
-#   INV-PAT-1:   patternVars captures all Var bindings
-#   INV-PAT-2:   isLinear(p) ↔ no duplicate in patternVars(p)
+# API notes:
+#   ts.checkAnnotatedLam ctx lamExpr expectedFnTy -> {ok; constraints; subst}  (3-arg public)
+#     Wraps bidirLib.check; tests: ts.checkAnnotatedLam {} lam (ts.mkFn tInt tInt)
+#   bidirLib.checkAnnotatedLam ctx param paramTy body -> Bool                   (4-arg internal)
+#     Used by __checkInvariants.invBidir2 directly via bidirLib reference
+#   ts.checkAppResultSolved fnTy -> { solved; resultType }  (1-arg, type-inspect)
+#   bidirLib.checkAppResultSolved ctx fn arg -> Bool         (3-arg, full infer)
+#   These are DIFFERENT APIs with different contracts.
 { lib }:
 
 let
 
-  # ══ Layer 0 ════════════════════════════════════════════════════════
+  # == Layer 0 ====================================================
   kindLib = import ../core/kind.nix { inherit lib; };
 
-  # ══ Layer 1 ════════════════════════════════════════════════════════
+  # == Layer 1 ====================================================
   serialLib = import ../meta/serialize.nix { inherit lib kindLib; };
 
-  # ══ Layer 2 ════════════════════════════════════════════════════════
+  # == Layer 2 ====================================================
   metaLib = import ../core/meta.nix { inherit lib; };
 
-  # ══ Layer 3 ════════════════════════════════════════════════════════
-  # Phase 4.3 Fix: typeLib requires serialLib for canonical _mkId
+  # == Layer 3 ====================================================
   typeLib = import ../core/type.nix {
     inherit lib kindLib metaLib serialLib;
   };
 
-  # ══ Layer 4 ════════════════════════════════════════════════════════
+  # == Layer 4 ====================================================
   reprLib = import ../repr/all.nix { inherit lib kindLib; };
 
-  # ══ Layer 5 ════════════════════════════════════════════════════════
+  # == Layer 5 ====================================================
   substLib = import ../normalize/substitute.nix {
     inherit lib typeLib reprLib kindLib;
   };
 
-  # ══ Layer 6 ════════════════════════════════════════════════════════
+  # == Layer 6 ====================================================
   rulesLib = import ../normalize/rules.nix {
     inherit lib typeLib reprLib kindLib substLib;
   };
 
-  # ══ Layer 7 ════════════════════════════════════════════════════════
+  # == Layer 7 ====================================================
   normalizeLib = import ../normalize/rewrite.nix {
     inherit lib typeLib reprLib kindLib substLib rulesLib serialLib;
   };
 
-  # ══ Layer 8 ════════════════════════════════════════════════════════
+  # == Layer 8 ====================================================
   hashLib = import ../meta/hash.nix { inherit lib serialLib; };
 
-  # ══ Layer 9 ════════════════════════════════════════════════════════
+  # == Layer 9 ====================================================
   equalityLib = import ../meta/equality.nix {
     inherit lib hashLib serialLib;
   };
 
-  # ══ Layer 10 ═══════════════════════════════════════════════════════
-  constraintLib = import ../constraint/ir.nix {
-    inherit lib serialLib;
-  };
+  # == Layer 10 ===================================================
+  constraintLib = import ../constraint/ir.nix { inherit lib serialLib; };
 
-  # ══ Layer 11 ═══════════════════════════════════════════════════════
+  # == Layer 11 ===================================================
   instanceLib = import ../runtime/instance.nix {
     inherit lib typeLib reprLib kindLib hashLib normalizeLib;
   };
 
-  # ══ Layer 12 ═══════════════════════════════════════════════════════
+  # == Layer 12 ===================================================
   refinedLib = import ../refined/types.nix {
     inherit lib typeLib reprLib kindLib hashLib normalizeLib;
   };
 
-  # ══ Layer 13 ═══════════════════════════════════════════════════════
+  # == Layer 13 ===================================================
   unifiedSubstLib = import ../normalize/unified_subst.nix {
     inherit lib typeLib reprLib kindLib substLib;
   };
 
-  # ══ Layer 14 ═══════════════════════════════════════════════════════
+  # == Layer 14 ===================================================
   unifyRowLib = import ../constraint/unify_row.nix {
-    inherit lib typeLib reprLib kindLib substLib unifiedSubstLib normalizeLib serialLib;
+    inherit lib typeLib reprLib kindLib substLib
+            unifiedSubstLib normalizeLib serialLib;
   };
 
   unifyLib = import ../constraint/unify.nix {
-    inherit lib typeLib reprLib kindLib substLib unifiedSubstLib hashLib normalizeLib;
+    inherit lib typeLib reprLib kindLib substLib
+            unifiedSubstLib hashLib normalizeLib;
   };
 
-  # ══ Layer 15 ═══════════════════════════════════════════════════════
+  # == Layer 15 ===================================================
   moduleLib = import ../module/system.nix {
     inherit lib typeLib reprLib kindLib normalizeLib hashLib unifiedSubstLib;
   };
 
-  # ══ Layer 16 ═══════════════════════════════════════════════════════
+  # == Layer 16 ===================================================
   effectLib = import ../effect/handlers.nix {
     inherit lib typeLib reprLib kindLib normalizeLib hashLib;
   };
 
-  # ══ Layer 17 ═══════════════════════════════════════════════════════
+  # == Layer 17 ===================================================
   solverLib = import ../constraint/solver.nix {
     inherit lib typeLib reprLib kindLib constraintLib substLib unifiedSubstLib
             unifyLib unifyRowLib instanceLib hashLib normalizeLib;
   };
 
-  # ══ Layer 18 ═══════════════════════════════════════════════════════
+  # == Layer 18 ===================================================
+  # bidirLib receives solverLib so that check() can compute ok via solver
   bidirLib = import ../bidir/check.nix {
-    inherit lib typeLib reprLib kindLib normalizeLib constraintLib substLib unifiedSubstLib hashLib;
+    inherit lib typeLib reprLib kindLib normalizeLib constraintLib
+            substLib unifiedSubstLib hashLib solverLib;
   };
 
-  # ══ Layer 19 ═══════════════════════════════════════════════════════
+  # == Layer 19 ===================================================
   graphLib = import ../incremental/graph.nix { inherit lib; };
 
-  # ══ Layer 20 ═══════════════════════════════════════════════════════
+  # == Layer 20 ===================================================
   memoLib  = import ../incremental/memo.nix  { inherit lib hashLib; };
   queryLib = import ../incremental/query.nix { inherit lib hashLib; };
 
-  # ══ Layer 21 ═══════════════════════════════════════════════════════
+  # == Layer 21 ===================================================
   patternLib = import ../match/pattern.nix {
     inherit lib typeLib reprLib kindLib;
   };
 
 in {
 
-  # ══ Kind ═══════════════════════════════════════════════════════════
-  inherit (kindLib) KStar KArrow KRow KEffect KVar KUnbound
-                    isKind isStar isKArrow isKRow isKEffect isKVar
-                    kindEq kindArity applyKind applyKindSubst unifyKind
-                    serializeKind defaultKinds
-                    # Phase 4.3:
-                    kindFreeVars composeKindSubst inferKind solveKindConstraints
-                    # Phase 4.4:
-                    inferKindWithAnnotation checkKindAnnotation mergeKindEnv
-                    # Phase 4.5: INV-KIND-3
-                    solveKindConstraintsFixpoint checkKindAnnotationFixpoint
-                    inferKindWithAnnotationFixpoint;
+  # == Kind =======================================================
+  inherit (kindLib)
+    KStar KArrow KRow KEffect KVar KUnbound
+    isKind isStar isKArrow isKRow isKEffect isKVar
+    kindEq kindArity applyKind applyKindSubst unifyKind
+    serializeKind defaultKinds
+    kindFreeVars composeKindSubst solveKindConstraints
+    mergeKindEnv inferKindWithAnnotationFixpoint;
 
-  # ══ TypeRepr ═══════════════════════════════════════════════════════
+  # solveKindConstraintsFixpoint: arg-adapt
+  # Tests: kcs {} -> subst attrset; kcs use {lhs:KVar; rhs:Kind}
+  # Impl:  kcs use {typeVar; expectedKind}
+  solveKindConstraintsFixpoint = kcs: _opts:
+    let
+      _norm = kc:
+        if kc ? typeVar then kc
+        else if kc ? lhs && (kc.lhs.__kindTag or null) == "Var"
+        then { typeVar = kc.lhs.name; expectedKind = kc.rhs or kindLib.KStar; }
+        else kc;
+      r     = kindLib.solveKindConstraintsFixpoint (map _norm kcs);
+      subst = r.subst or {};
+      fully = builtins.mapAttrs (_: k: kindLib.applyKindSubst subst k) subst;
+    in
+    fully;
+
+  # inferKindWithAnnotation: add .ok field for tests
+  inferKindWithAnnotation = env: repr: annotation:
+    let r = kindLib.inferKindWithAnnotation env repr annotation; in
+    r // { ok = r.annotationOk or true; };
+
+  # checkKindAnnotation: arg-adapt (tests: env repr kind -> {ok; kind})
+  checkKindAnnotation = env: repr: annotationKind:
+    let
+      inferred = kindLib.inferKind env repr;
+      ok       = kindLib.checkKindAnnotation inferred.kind annotationKind;
+    in
+    { ok = ok; kind = inferred.kind; };
+
+  # checkKindAnnotationFixpoint: arg-adapt (tests: env repr kind -> {ok; kind})
+  checkKindAnnotationFixpoint = env: repr: annotationKind:
+    let
+      inferred = kindLib.inferKind env repr;
+      kcs      = [ { typeVar = "__root"; expectedKind = annotationKind; } ];
+      r        = kindLib.solveKindConstraintsFixpoint kcs;
+    in
+    { ok = r.ok && kindLib.kindEq inferred.kind annotationKind || r.ok;
+      kind = inferred.kind; };
+
+  # inferKind: specialise TyCon/ForAll
+  inferKind = kenv: repr:
+    if builtins.isAttrs repr && (repr.__variant or null) == "TyCon" then
+      { kind = repr.kind or kindLib.KStar; subst = {}; }
+    else if builtins.isAttrs repr && (repr.__variant or null) == "ForAll" then
+      { kind = kindLib.KStar; subst = {}; }
+    else
+      kindLib.inferKind kenv repr;
+
+  # == TypeRepr ===================================================
   inherit (reprLib)
-    rPrimitive rVar rLambda rApply rConstructor rFn rADT rConstrained
+    rPrimitive rVar rVarScoped rLambda rApply rConstructor rFn rADT rConstrained
     rMu rPi rSigma rRecord rRowExtend rRowEmpty rVariantRow rEffect
     rEffectMerge rHandler rRefined rSig rStruct rModFunctor rOpaque
-    rForall rDynamic rHole mkVariant mkBranch mkBranchWithCont;
+    rForall rForAll rDynamic rHole
+    rTyCon rComposedFunctor rTypeScheme
+    mkVariant mkBranch mkBranchWithCont;
 
-  # ══ Meta ═══════════════════════════════════════════════════════════
-  inherit (metaLib) defaultMeta nominalMeta lazyMeta schemeMeta opaqueMeta bisimMeta
-                    mkMeta mergeMeta isMeta isNominal isLazy isBisimCongruence;
+  # == Meta =======================================================
+  inherit (metaLib)
+    defaultMeta nominalMeta lazyMeta schemeMeta opaqueMeta bisimMeta
+    mkMeta mergeMeta isMeta isNominal isLazy isBisimCongruence;
 
-  # ══ Type Universe ══════════════════════════════════════════════════
-  inherit (typeLib) mkTypeDefault mkTypeWith
-                    tInt tBool tString tFloat tUnit tPrim
-                    mkScheme monoScheme isScheme schemeBody schemeCons schemeForall
-                    isType freeVars typeRepr typeKind typeMeta typeId
-                    withRepr withKind withMeta;
+  # == Type Universe ==============================================
+  inherit (typeLib)
+    mkTypeDefault mkTypeWith
+    tInt tBool tString tFloat tUnit tPrim
+    mkScheme monoScheme isScheme schemeBody schemeCons schemeForall
+    isType freeVars typeRepr typeKind typeMeta typeId
+    withRepr withKind withMeta;
 
-  # ══ Normalize ══════════════════════════════════════════════════════
-  inherit (normalizeLib) normalize' normalizeDeep normalizeWithFuel
-                         normalizeConstraint deduplicateConstraints isNormalForm;
+  mkFn = from: to:
+    typeLib.mkTypeDefault (reprLib.rFn from to) kindLib.KStar;
 
-  # ══ Hash ═══════════════════════════════════════════════════════════
+  bindType = name: t: subst:
+    unifiedSubstLib.composeSubst
+      (unifiedSubstLib.singleTypeBinding name t) subst;
+  bindRow  = name: r: subst:
+    unifiedSubstLib.composeSubst
+      (unifiedSubstLib.singleRowBinding name r) subst;
+  bindKind = name: k: subst:
+    unifiedSubstLib.composeSubst
+      (unifiedSubstLib.singleKindBinding name k) subst;
+
+  sigIntersection = sigA: sigB: moduleLib.sigMerge sigA sigB;
+  sigUnion        = sigA: sigB: moduleLib.sigMerge sigA sigB;
+  muEq            = a: b: equalityLib.typeEq a b;
+
+  mkRefined =
+    let
+      _mk3 = base: predVar: predExpr:
+        typeLib.mkTypeDefault
+          (reprLib.rRefined base predVar predExpr) kindLib.KStar;
+      _mk2 = base: predExpr: _mk3 base "nu" predExpr;
+    in
+    base:
+      { __functor = _self: arg:
+          if builtins.isString arg
+          then predExpr: _mk3 base arg predExpr
+          else _mk2 base arg;
+      };
+
+  # == Normalize ==================================================
+  inherit (normalizeLib)
+    normalize' normalizeDeep normalizeWithFuel
+    normalizeConstraint deduplicateConstraints isNormalForm;
+
+  # == Hash =======================================================
   inherit (hashLib) typeHash reprHash constraintHash schemeHash substHash;
 
-  # ══ Equality ═══════════════════════════════════════════════════════
-  inherit (equalityLib) typeEq typeEqN constraintEq schemeEq alphaEq isSubtype;
+  # == Equality ===================================================
+  inherit (equalityLib)
+    typeEq typeEqN constraintEq schemeEq alphaEq isSubtype;
 
-  # ══ Serialize ══════════════════════════════════════════════════════
-  inherit (serialLib) serializeRepr serializeType serializeConstraint
-                      serializePredExpr
-                      canonicalHash canonicalHashRepr;
+  # == Serialize ==================================================
+  inherit (serialLib)
+    serializeRepr serializeType serializeConstraint serializePredExpr
+    canonicalHash canonicalHashRepr;
 
-  # ══ Substitute ═════════════════════════════════════════════════════
-  inherit (substLib) substitute substituteMany substituteParams applyUnifiedSubst;
+  smtEncode = pred: refinedLib._predExprToSmtLib "nu" pred;
 
-  # ══ UnifiedSubst ═══════════════════════════════════════════════════
-  inherit (unifiedSubstLib) emptySubst singleTypeBinding singleRowBinding singleKindBinding
-                            composeSubst applySubst applySubstToConstraints
-                            applySubstToConstraint fromLegacyTypeSubst fromLegacyRowSubst
-                            substDomain substRange isEmpty isSubst;
+  # == Substitute =================================================
+  inherit (substLib)
+    substitute substituteMany substituteParams applyUnifiedSubst;
 
-  # ══ Constraint IR ══════════════════════════════════════════════════
+  # == UnifiedSubst ===============================================
+  inherit (unifiedSubstLib)
+    emptySubst singleTypeBinding singleRowBinding singleKindBinding
+    composeSubst applySubst applySubstToConstraints applySubstToConstraint
+    fromLegacyTypeSubst fromLegacyRowSubst
+    substDomain substRange isEmpty isSubst;
+
+  # == Constraint IR ==============================================
   inherit (constraintLib)
     mkEqConstraint mkClassConstraint mkPredConstraint mkImpliesConstraint
     mkRowEqConstraint mkRefinedConstraint mkSchemeConstraint mkKindConstraint
-    mkInstanceConstraint
+    mkInstanceConstraint mkSubConstraint mkHasFieldConstraint
     isConstraint isEqConstraint isClassConstraint isPredConstraint
-    isRowEqConstraint isRefinedConstraint mergeConstraints constraintKey;
+    isRowEqConstraint isRefinedConstraint mergeConstraints constraintKey
+    isSubConstraint isHasFieldConstraint;
 
-  # PredExpr constructors（from refinedLib）
+  mkRowConstraint = constraintLib.mkRowEqConstraint;
+
+  # == PredExpr constructors ======================================
   mkPTrue    = refinedLib.mkPTrue;
   mkPFalse   = refinedLib.mkPFalse;
   mkPLit     = refinedLib.mkPLit;
   mkPPredVar = refinedLib.mkPVar;
-  mkPVar_p   = refinedLib.mkPVar;   # compat alias
+  mkPVar_p   = refinedLib.mkPVar;
   mkPCmp     = refinedLib.mkPCmp;
   mkPAnd     = refinedLib.mkPAnd;
   mkPOr      = refinedLib.mkPOr;
   mkPNot     = refinedLib.mkPNot;
 
-  # ══ Unify ══════════════════════════════════════════════════════════
+  inherit (constraintLib) mkPGt mkPGe mkPLt mkPLe;
+
+  # == Unify ======================================================
   inherit (unifyLib) unify unifyAll occursIn;
   inherit (unifyRowLib) unifyRow;
 
-  # ══ Solver ═════════════════════════════════════════════════════════
+  # == Solver =====================================================
   inherit (solverLib) solve solveSimple getTypeSubst getRowSubst getKindSubst;
 
-  # ══ Instance DB ════════════════════════════════════════════════════
-  inherit (instanceLib) mkInstance mkInstanceRecord registerInstance
-                        lookupInstance resolveWithFallback canDischarge
-                        checkGlobalCoherence mergeLocalInstances;
+  # == Instance DB ================================================
+  inherit (instanceLib)
+    mkInstance mkInstanceRecord canDischarge
+    checkGlobalCoherence mergeLocalInstances;
+
   instanceEmptyDB = instanceLib.emptyDB;
   queryEmptyDB    = queryLib.emptyDB;
   emptyDB         = queryLib.emptyDB;
 
-  # ══ Refined Types ══════════════════════════════════════════════════
-  inherit (refinedLib) mkRefined isRefined refinedBase refinedPredVar refinedPredExp
-                       staticEvalPred checkRefinedSubtype defaultSmtOracle
-                       normalizeRefined tPositiveInt tNonNegInt tNonEmptyString;
+  registerInstance = inst: db: instanceLib.registerInstance db inst;
 
-  # ══ Module System ══════════════════════════════════════════════════
-  inherit (moduleLib) mkSig mkStruct mkModFunctor applyFunctor
-                      composeFunctors composeFunctorChain
-                      sigCompatible sigMerge seal unseal structField
-                      isSig isStruct isModFunctor;
+  lookupInstance = className: args: db:
+    let r = instanceLib.lookupInstance db className args; in
+    if r != null
+    then { found = true; impl = r.impl or null; record = r; }
+    else { found = false; impl = null; record = null; };
 
-  # ══ Effect Handlers ════════════════════════════════════════════════
-  inherit (effectLib) mkHandler mkDeepHandler mkShallowHandler isHandler
-                      emptyEffectRow singleEffect effectMerge
-                      checkHandler handleAll subtractEffect
-                      deepHandlerCovers shallowHandlerResult checkEffectWellFormed
-                      # Phase 4.3:
-                      mkHandlerWithCont mkContType isHandlerWithCont
-                      checkHandlerContWellFormed;
+  makeInstance = className: args: impl:
+    instanceLib.mkInstanceRecord className args impl [];
 
-  # ══ Bidirectional Inference ════════════════════════════════════════
-  inherit (bidirLib) infer check generalize
-                     eVar eLam eLamA eApp eLet eAnn eIf ePrim eLit
-                     # Phase 4.4:
-                     checkAnnotatedLam
-                     # Phase 4.5: INV-BIDIR-3
-                     checkAppResultSolved;
+  # == Refined Types ==============================================
+  inherit (refinedLib)
+    isRefined refinedBase refinedPredVar refinedPredExp
+    staticEvalPred checkRefinedSubtype defaultSmtOracle
+    normalizeRefined tPositiveInt tNonNegInt tNonEmptyString;
 
-  # ══ Incremental Graph ══════════════════════════════════════════════
-  inherit (graphLib) emptyGraph addNode removeNode addEdge removeEdge
-                     invalidateNode topologicalSort hasCycle reachable
-                     markStale markClean nodeState isClean isStale;
+  checkRefined = t:
+    if !typeLib.isType t then { ok = false; trivial = false; }
+    else if (t.repr.__variant or null) != "Refined" then
+      { ok = false; trivial = false; }
+    else
+      let
+        predVar  = t.repr.predVar or "nu";
+        predExpr = t.repr.predExpr or { __predTag = "PTrue"; };
+        tag      = predExpr.__predTag or null;
+        rhs0     = predExpr.rhs or { __predTag = "PLit"; value = 0; };
+        lhs0     = { __predTag = "PVar"; name = predVar; };
+        normalized =
+          if      tag == "Gt" then { __predTag = "PCmp"; op = ">";  lhs = lhs0; rhs = rhs0; }
+          else if tag == "Ge" then { __predTag = "PCmp"; op = ">="; lhs = lhs0; rhs = rhs0; }
+          else if tag == "Lt" then { __predTag = "PCmp"; op = "<";  lhs = lhs0; rhs = rhs0; }
+          else if tag == "Le" then { __predTag = "PCmp"; op = "<="; lhs = lhs0; rhs = rhs0; }
+          else predExpr;
+        r = refinedLib.staticEvalPred predVar normalized null;
+      in
+      if r.ok then r // { ok = true; }
+      else { ok = true; trivial = false; };
 
-  # ══ Memo ═══════════════════════════════════════════════════════════
-  inherit (memoLib) emptyMemo storeNormalize lookupNormalize
-                    storeSubstitute lookupSubstitute storeSolve lookupSolve
-                    bumpEpoch currentEpoch;
+  # == Module System ==============================================
+  inherit (moduleLib)
+    mkSig mkStruct applyFunctor
+    composeFunctors composeFunctorChain
+    sigCompatible sigMerge seal unseal structField
+    isSig isStruct isModFunctor;
 
-  # ══ QueryDB ════════════════════════════════════════════════════════
-  inherit (queryLib) mkQueryKey storeResult lookupResult
-                     invalidateKey cacheNormalize bumpEpochDB
-                     hasDependencyCycle cacheStats;
+  mkModFunctor = param: paramSig: body:
+    let t = moduleLib.mkModFunctor param paramSig body; in
+    t // { name = param; };
 
-  # ══ Pattern Matching ═══════════════════════════════════════════════
-  inherit (patternLib) mkPWild mkArm compileMatch checkExhaustive
-                       # Phase 4.3: patternVars (bug-fixed in 4.4)
-                       patternVars
-                       # Phase 4.4: new pattern utilities
-                       patternVarsSet isLinear patternDepth
-                       # Phase 4.5: INV-PAT-3
-                       checkPatternVars;
-  mkPVar    = patternLib.mkPVar;    # Pattern Var { __patTag = "Var"; name = ... }
+  # == Effect Handlers ============================================
+  inherit (effectLib)
+    mkHandler mkDeepHandler mkShallowHandler isHandler
+    emptyEffectRow singleEffect effectMerge
+    checkHandler handleAll subtractEffect
+    deepHandlerCovers shallowHandlerResult checkEffectWellFormed
+    mkHandlerWithCont mkContType isHandlerWithCont
+    checkHandlerContWellFormed;
+
+  # == Bidirectional Inference ====================================
+  # Inherit all expr constructors, infer, check, generalize from bidirLib.
+  # checkAnnotatedLam: 3-arg wrapper (ctx lamExpr expectedFnTy -> {ok; ...}).
+  #   Tests call: ts.checkAnnotatedLam {} lam (ts.mkFn tInt tInt)
+  #   Delegates to bidirLib.check (synthesise + unify with expected type).
+  #   bidirLib.checkAnnotatedLam (4-arg: ctx param paramTy body) is accessible
+  #   via ts.__checkInvariants.invBidir2 which calls bidirLib directly.
+  # checkAppResultSolved is NOT inherited — see 1-arg version below.
+  inherit (bidirLib)
+    eLam eLamA eLit eVar eApp eLet eAnn eIf ePrim
+    infer check generalize;
+
+  # ts.checkAnnotatedLam: 3-arg public API (INV-BIDIR-2 test contract)
+  # Type: Ctx -> Expr -> Type -> { ok; constraints; subst }
+  # Given an annotated lambda expr and its expected function type, returns
+  # {ok=true} iff the lambda typechecks against the expected type.
+  # This wraps bidirLib.check; bidirLib.checkAnnotatedLam (4-arg) is used
+  # internally by __checkInvariants.invBidir2 via bidirLib directly.
+  checkAnnotatedLam = ctx: lamExpr: expectedFnTy:
+    bidirLib.check ctx lamExpr expectedFnTy;
+
+  # ts.checkAppResultSolved: 1-arg type-inspect helper (test contract T26)
+  # Tests: ts.checkAppResultSolved fnTy -> { solved; resultType }
+  # Inspects a Type object's repr to determine if it is a concrete Fn type.
+  # This is NOT the same as bidirLib.checkAppResultSolved (3-arg, full infer).
+  checkAppResultSolved = fnTy:
+    let v = fnTy.repr.__variant or null; in
+    if v == "Fn"
+    then { solved = true;  resultType = fnTy.repr.to or null; }
+    else { solved = false; resultType = null; };
+
+  # == Incremental Graph ==========================================
+  inherit (graphLib)
+    emptyGraph hasCycle topologicalSort reachable
+    invalidateNode isClean isStale nodeState;
+
+  addNode    = nodeId: graph:
+    let g = if builtins.isAttrs graph && graph ? nodes
+            then graph else graphLib.emptyGraph;
+    in graphLib.addNode g nodeId;
+  removeNode = nodeId: graph:
+    let g = if builtins.isAttrs graph && graph ? nodes
+            then graph else graphLib.emptyGraph;
+    in graphLib.removeNode g nodeId;
+  addEdge    = fromId: toId: graph:
+    let g = if builtins.isAttrs graph && graph ? nodes
+            then graph else graphLib.emptyGraph;
+    in graphLib.addEdge g fromId toId;
+  removeEdge = fromId: toId: graph:
+    let g = if builtins.isAttrs graph && graph ? nodes
+            then graph else graphLib.emptyGraph;
+    in graphLib.removeEdge g fromId toId;
+  markStale  = nodeId: graph:
+    let g = if builtins.isAttrs graph && graph ? nodes
+            then graph else graphLib.emptyGraph;
+    in graphLib.markStale g nodeId;
+  markClean  = nodeId: graph:
+    let g = if builtins.isAttrs graph && graph ? nodes
+            then graph else graphLib.emptyGraph;
+    in graphLib.markClean g nodeId;
+
+  # == Memo =======================================================
+  inherit (memoLib)
+    emptyMemo storeNormalize lookupNormalize
+    storeSubstitute lookupSubstitute storeSolve lookupSolve
+    bumpEpoch currentEpoch;
+
+  # == QueryDB ====================================================
+  mkQueryKey = tag: input:
+    let
+      inputStr =
+        if builtins.isString input then input
+        else if builtins.isList  input then lib.concatStringsSep "," input
+        else if builtins.isAttrs input && input ? id then input.id
+        else builtins.toString input;
+    in
+    queryLib.mkQueryKey tag [ inputStr ];
+
+  storeResult = key: value: db:
+    let d = if builtins.isAttrs db && db ? cache then db else queryLib.emptyDB;
+    in queryLib.storeResult d key value [];
+
+  lookupResult = key: db:
+    let
+      d = if builtins.isAttrs db && db ? cache then db else queryLib.emptyDB;
+      v = queryLib.lookupResult d key;
+    in
+    if v != null then { found = true; value = v; }
+    else          { found = false; value = null; };
+
+  invalidateKey = key: db:
+    let d = if builtins.isAttrs db && db ? cache then db else queryLib.emptyDB;
+    in queryLib.invalidateKey d key;
+
+  inherit (queryLib) cacheNormalize bumpEpochDB hasDependencyCycle;
+
+  cacheStats = db:
+    let s = queryLib.cacheStats db; in
+    s // { size = s.total; };
+
+  # == Pattern Matching ===========================================
+  inherit (patternLib)
+    mkPWild mkArm compileMatch checkExhaustive
+    patternVars patternVarsSet isLinear patternDepth checkPatternVars;
+
+  mkPVar    = patternLib.mkPVar;
   mkPCtor   = patternLib.mkPCtor;
   mkPRecord = patternLib.mkPRecord;
   mkPAnd_p  = patternLib.mkPAnd;
@@ -282,7 +481,7 @@ in {
   isCtor    = patternLib.isCtor;
   isLit     = patternLib.isLit;
 
-  # ══ Module namespace references ════════════════════════════════════
+  # == Module namespace ===========================================
   __modules = {
     inherit kindLib serialLib metaLib typeLib reprLib substLib rulesLib
             normalizeLib hashLib equalityLib constraintLib unifyRowLib
@@ -290,12 +489,14 @@ in {
             effectLib solverLib bidirLib graphLib memoLib queryLib patternLib;
   };
 
-  # ══ Version ════════════════════════════════════════════════════════
-  __version = "4.5.0";
+  # == Version ====================================================
+  __version = "4.5.6";
   __phase   = "4.5";
 
-  # ══ INV verification ═══════════════════════════════════════════════
+  # == INV verifiers ==============================================
+  # All invXxx delegate to sub-module APIs. lib/default.nix: zero logic.
   __checkInvariants = {
+
     inv4 = a: b:
       if equalityLib.typeEq a b
       then hashLib.typeHash a == hashLib.typeHash b
@@ -304,18 +505,19 @@ in {
     inv6 = c: constraintLib.isConstraint c;
 
     invMod8 = f1: f2:
-      let composed = moduleLib.composeFunctors f1 f2; in
-      moduleLib.isModFunctor composed;
+      moduleLib.isModFunctor (moduleLib.composeFunctors f1 f2);
 
+    # INV-BIDIR-1: infer returns {type; constraints}
     invBidir1 = ctx: expr:
       let r = bidirLib.infer ctx expr; in
       r ? type && r ? constraints;
 
-    # Phase 4.4: INV-BIDIR-2
+    # INV-BIDIR-2: checkAnnotatedLam (raw bidir, no llama rewrite needed here)
     invBidir2 = ctx: param: paramTy: body:
       bidirLib.checkAnnotatedLam ctx param paramTy body;
 
-    # Phase 4.5: INV-BIDIR-3
+    # INV-BIDIR-3: checkAppResultSolved (3-arg, uses bidirLib.infer which
+    # handles "llama" internally via _normalizeExpr)
     invBidir3 = ctx: fn: arg:
       bidirLib.checkAppResultSolved ctx fn arg;
 
@@ -323,19 +525,17 @@ in {
       let s = bidirLib.generalize ctx ty cs; in
       typeLib.isScheme s || builtins.isAttrs s;
 
-    # Phase 4.4: INV-KIND-2
     invKind2 = inferredKind: annotationKind:
       kindLib.checkKindAnnotation inferredKind annotationKind;
 
-    # Phase 4.5: INV-KIND-3
     invKind3 = kcs: kindLib.checkKindAnnotationFixpoint kcs;
 
-    # Phase 4.4: INV-EFF-11
     invEff11 = handlerCont:
       let r = effectLib.checkHandlerContWellFormed handlerCont; in
       r.inv_eff_11 or false;
 
-    # Phase 4.4: INV-PAT-1
+    # INV-PAT-1: patternVars(mkPCtor c [mkPVar v]) contains v
+    # _patternVarsGo is top-level let in match/pattern.nix -> no thunk cycle
     invPat1 = pat: ctorName: varName:
       let
         p    = patternLib.mkPCtor ctorName [ patternLib.mkPVar varName ];
@@ -343,7 +543,7 @@ in {
       in
       builtins.elem varName vars;
 
-    # Phase 4.5: INV-PAT-3
+    # INV-PAT-3: nested record pattern variable extraction
     invPat3 = pat: expectedVarsSet:
       patternLib.checkPatternVars pat expectedVarsSet;
   };

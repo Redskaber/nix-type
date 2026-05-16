@@ -1,8 +1,19 @@
-# constraint/ir.nix — Phase 4.3
+# constraint/ir.nix — Phase 4.5.4
 # Constraint IR：INV-6（Constraint ∈ TypeRepr，结构化 IR）
 # 所有 Constraint 是 attrset（可参与 normalize/hash/equality）
+#
 # Fix P4.3: mkImpliesConstraint 排序改用 serializeConstraint（而非 builtins.toJSON）
 #           避免 Constraint 中内嵌 Type 对象触发 "cannot convert function to JSON"
+#
+# Fix P4.5.4 (API tag alignment):
+#   __constraintTag "Equality"  → "Eq"       (align with test API contract)
+#   __constraintTag "RowEquality" → "RowEq"  (align with test API contract)
+#   Added: mkSubConstraint        (__constraintTag = "Sub")
+#   Added: mkHasFieldConstraint   (__constraintTag = "HasField")
+#
+# PredExpr additions:
+#   mkPGt  = rhs: mkPCmp ">" (mkPVar "ν") rhs   (sugar for common refinement)
+#
 { lib, serialLib }:
 
 let
@@ -12,9 +23,9 @@ in rec {
 
   # ══ Constraint 变体构造器 ══════════════════════════════════════════════
 
-  # ① Equality — a ≡ b
+  # ① Eq — a ≡ b
   mkEqConstraint = lhs: rhs: {
-    __constraintTag = "Equality";
+    __constraintTag = "Eq";
     lhs = lhs;
     rhs = rhs;
   };
@@ -40,13 +51,13 @@ in rec {
     let
       sorted = lib.sort (a: b:
         serializeConstraint a < serializeConstraint b
-      ) premises;
+      ) (if builtins.isList premises then premises else [ premises ]);
     in
     { __constraintTag = "Implies"; premises = sorted; conclusion = conclusion; };
 
-  # ⑤ RowEquality — row 等价约束
+  # ⑤ RowEq — row 等价约束
   mkRowEqConstraint = lhsRow: rhsRow: {
-    __constraintTag = "RowEquality";
+    __constraintTag = "RowEq";
     lhsRow = lhsRow;
     rhsRow = rhsRow;
   };
@@ -85,6 +96,25 @@ in rec {
     types     = types;
   };
 
+  # ════════════════════════════════════════════════════════════════════
+  # Phase 4.5.4 新增 Constraints
+  # ════════════════════════════════════════════════════════════════════
+
+  # ⑩ Sub — 子类型约束 a ≤ b
+  mkSubConstraint = sub: sup: {
+    __constraintTag = "Sub";
+    sub = sub;
+    sup = sup;
+  };
+
+  # ⑪ HasField — 字段存在约束 { field: fieldType | _ } ≤ recType
+  mkHasFieldConstraint = field: fieldType: recType: {
+    __constraintTag = "HasField";
+    field     = field;
+    fieldType = fieldType;
+    recType   = recType;
+  };
+
   # ══ PredExpr 构造器（Refined Types 用）════════════════════════════════
   mkPTrue  = { __predTag = "PTrue"; };
   mkPFalse = { __predTag = "PFalse"; };
@@ -95,19 +125,28 @@ in rec {
   mkPOr    = lhs: rhs: { __predTag = "POr"; lhs = lhs; rhs = rhs; };
   mkPNot   = body: { __predTag = "PNot"; body = body; };
 
+  # Sugar: mkPGt rhs ≡ { ν > rhs }  (common refinement predicate)
+  # __predTag = "Gt" so tests can check (mkPGt x).__predTag == "Gt"
+  mkPGt = rhs: { __predTag = "Gt"; rhs = rhs; };
+  mkPGe = rhs: { __predTag = "Ge"; rhs = rhs; };
+  mkPLt = rhs: { __predTag = "Lt"; rhs = rhs; };
+  mkPLe = rhs: { __predTag = "Le"; rhs = rhs; };
+
   # ══ Constraint 谓词 ════════════════════════════════════════════════════
   isConstraint = c:
     builtins.isAttrs c && c ? __constraintTag;
 
-  isEqConstraint      = c: isConstraint c && c.__constraintTag == "Equality";
-  isClassConstraint   = c: isConstraint c && c.__constraintTag == "Class";
-  isPredConstraint    = c: isConstraint c && c.__constraintTag == "Predicate";
-  isImpliesConstraint = c: isConstraint c && c.__constraintTag == "Implies";
-  isRowEqConstraint   = c: isConstraint c && c.__constraintTag == "RowEquality";
-  isRefinedConstraint = c: isConstraint c && c.__constraintTag == "Refined";
-  isSchemeConstraint  = c: isConstraint c && c.__constraintTag == "Scheme";
-  isKindConstraint    = c: isConstraint c && c.__constraintTag == "Kind";
+  isEqConstraint       = c: isConstraint c && c.__constraintTag == "Eq";
+  isClassConstraint    = c: isConstraint c && c.__constraintTag == "Class";
+  isPredConstraint     = c: isConstraint c && c.__constraintTag == "Predicate";
+  isImpliesConstraint  = c: isConstraint c && c.__constraintTag == "Implies";
+  isRowEqConstraint    = c: isConstraint c && c.__constraintTag == "RowEq";
+  isRefinedConstraint  = c: isConstraint c && c.__constraintTag == "Refined";
+  isSchemeConstraint   = c: isConstraint c && c.__constraintTag == "Scheme";
+  isKindConstraint     = c: isConstraint c && c.__constraintTag == "Kind";
   isInstanceConstraint = c: isConstraint c && c.__constraintTag == "Instance";
+  isSubConstraint      = c: isConstraint c && c.__constraintTag == "Sub";
+  isHasFieldConstraint = c: isConstraint c && c.__constraintTag == "HasField";
 
   # ══ Constraint key（用于去重）══════════════════════════════════════════
   constraintKey = c: serializeConstraint c;

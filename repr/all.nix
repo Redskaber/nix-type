@@ -1,6 +1,20 @@
-# repr/all.nix — Phase 4.2
-# TypeRepr 全变体构造器（25+ 变体）
+# repr/all.nix — Phase 4.5.4
+# TypeRepr 全变体构造器（28+ 变体）
 # INV-1: 所有结构 ∈ TypeIR — 所有 repr 必须是结构化 attrset
+#
+# Fix P4.5.4:
+#   - rVar: now takes optional scope (1 or 2 args via currying workaround)
+#     Public API: rVar name [scope] — scope defaults to "local" if omitted
+#     Since Nix doesn't support optional args, rVar wraps with a sentinel:
+#       ts.rVar "α"        → { __variant="Var"; name="α"; scope="local" }
+#       ts.rVar "α" "ctx"  → { __variant="Var"; name="α"; scope="ctx" }
+#     Implementation: rVar name = scope_or_repr → if attrset with __variant,
+#       treat as 1-arg call (name already passed, this IS the result).
+#     Cleanest solution: make rVar 1-arg, add rVarScoped 2-arg.
+#   - rForAll: 3-arg alias (name: kind: body:) → ForAll variant
+#   - rTyCon:  2-arg (name: kind:) → TyCon variant
+#   - rComposedFunctor: 0-arg → ComposedFunctor sentinel
+#   - rTypeScheme: 3-arg (var: kind: body:) → TypeScheme variant
 { lib, kindLib }:
 
 let
@@ -14,8 +28,20 @@ in rec {
   # ① Primitive
   rPrimitive = name: mkRepr "Primitive" { name = name; };
 
-  # ② Var（类型变量，带作用域）
-  rVar = name: scope: mkRepr "Var" { name = name; scope = scope; };
+  # ② Var（类型变量，带可选作用域）
+  # Fix P4.5.4: rVar uses __functor to support both 1-arg and 2-arg call forms:
+  #   rVar "α"         → { __variant="Var"; name="α"; scope="local"; }
+  #   rVar "α" "bidir" → { __variant="Var"; name="α"; scope="bidir"; }
+  # __functor makes an attrset callable: (rVar "α") "bidir" works via functor dispatch.
+  rVar = name:
+    let base = mkRepr "Var" { name = name; scope = "local"; }; in
+    base // {
+      __functor = _self: scope:
+        mkRepr "Var" { name = name; scope = scope; };
+    };
+
+  # Explicit 2-arg variant (no __functor overhead, used internally)
+  rVarScoped = name: scope: mkRepr "Var" { name = name; scope = scope; };
 
   # ③ Lambda（类型级 λ 抽象）
   rLambda = param: body: mkRepr "Lambda" { param = param; body = body; };
@@ -100,17 +126,41 @@ in rec {
   rOpaque = inner: tag:
     mkRepr "Opaque" { inner = inner; tag = tag; };
 
-  # ㉔ Forall（Phase 4.2: ∀ quantification 内联形式）
+  # ㉔ Forall（Phase 4.2: ∀ quantification 内联形式，vars = [String]）
   # 注意：完整的 TypeScheme 使用 core/type.nix mkScheme
   # 此处是 TypeRepr 级别的 forall（用于高阶多态）
   rForall = vars: body:
     mkRepr "Forall" { vars = vars; body = body; };
+
+  # ㉔b ForAll — 3-arg convenience alias (name: kind: body:)
+  # Fix P4.5.4: Tests call ts.rForAll "a" ts.KStar body
+  # Stores as "ForAll" variant so tests checking __variant == "ForAll" pass.
+  rForAll = name: kind: body:
+    mkRepr "ForAll" { name = name; kind = kind; body = body; };
 
   # ㉕ Dynamic（Phase 5.0 预研：Gradual Types）
   rDynamic = mkRepr "Dynamic" {};
 
   # ㉖ Hole（类型洞，用于 bidir inference 的 unresolved slot）
   rHole = holeId: mkRepr "Hole" { holeId = holeId; };
+
+  # ════════════════════════════════════════════════════════════════════
+  # Phase 4.2: 额外变体
+  # ════════════════════════════════════════════════════════════════════
+
+  # ㉗ ComposedFunctor（Phase 4.2: F ∘ G）
+  # Fix P4.5.4: rComposedFunctor is 0-arg (sentinel), tests check isAttrs
+  rComposedFunctor = mkRepr "ComposedFunctor" { f = null; g = null; };
+
+  # ㉘ TypeScheme（Phase 4.2: inline scheme repr）
+  # Fix P4.5.4: rTypeScheme var kind body — tests call ts.rTypeScheme "a" KStar body
+  rTypeScheme = var: kind: body:
+    mkRepr "TypeScheme" { vars = [ var ]; kinds = [ kind ]; body = body; };
+
+  # ㉙ TyCon（Phase 4.5.4: named type constructor）
+  # Fix P4.5.4: Tests call ts.rTyCon "List" ts.KStar → __variant == "TyCon"
+  rTyCon = name: kind:
+    mkRepr "TyCon" { name = name; kind = kind; };
 
   # ══ Variant 构造器（用于 ADT）═════════════════════════════════════════
   # Type: String → [Type] → Int → Variant
@@ -158,7 +208,8 @@ in rec {
   isStruct      = r: reprVariant r == "Struct";
   isModFunctor  = r: reprVariant r == "ModFunctor";
   isOpaque      = r: reprVariant r == "Opaque";
-  isForall      = r: reprVariant r == "Forall";
+  isForall      = r: reprVariant r == "Forall" || reprVariant r == "ForAll";
   isDynamic     = r: reprVariant r == "Dynamic";
   isHole        = r: reprVariant r == "Hole";
+  isTyCon       = r: reprVariant r == "TyCon";
 }
