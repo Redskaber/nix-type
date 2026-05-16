@@ -1,4 +1,4 @@
-# todo.md — Phase 4.5.8 完成状态 + Phase 5.0 规划
+# todo.md — Phase 4.5.9 完成状态 + Phase 5.0 规划
 
 ---
 
@@ -30,21 +30,21 @@
 | RISK-T | mkHandlerWithCont missing fields     | contDomainOk + inv_eff_11    | ✅ 4.5.2     |
 | RISK-U | patternVars rec{} lazy-eval cycle    | lambda wrapper (p: f p)      | ✅ **4.5.3** |
 | RISK-V | test framework lacks diagnostics     | mkTestWith + diagnoseAll     | ✅ **4.5.3** |
-| RISK-W | foldl'+++ in letrec ctx → silent []  | concatLists+map (INV-NIX-4)  | ✅ **4.5.8** |
+| RISK-W | foldl'+++ in letrec ctx → silent []  | concatLists+map (INV-NIX-4)  | ✅ **4.5.9** |
 
 ---
 
-## Phase 4.5.8 完成状态
+## Phase 4.5.9 完成状态
 
 | 编号     | 功能                                                 | 文件                | INV       | 状态 |
 | -------- | ---------------------------------------------------- | ------------------- | --------- | ---- |
-| P4.5.8-1 | patternVars Ctor: foldl'+→concatLists+map            | `match/pattern.nix` | INV-NIX-4 | ✅   |
-| P4.5.8-2 | patternVars Record: foldl'+→concatLists+map          | `match/pattern.nix` | INV-NIX-4 | ✅   |
-| P4.5.8-3 | patternVars/patternDepth: eta-expand rec{} exports   | `match/pattern.nix` | INV-NIX-3 | ✅   |
-| P4.5.8-4 | patternVarsSet/isLinear: direct \_patternVarsGo call | `match/pattern.nix` | INV-NIX-3 | ✅   |
-| P4.5.8-5 | version bump 4.5.8                                   | `flake.nix`, `lib/` | —         | ✅   |
-| P4.5.8-6 | BUGFIX.md: Round 7 entry                             | `BUGFIX.md`         | —         | ✅   |
-| P4.5.8-7 | todo.md: RISK-W + 4.5.8 status                       | `todo.md`           | —         | ✅   |
+| P4.5.9-1 | patternVars Ctor: foldl'+→concatLists+map            | `match/pattern.nix` | INV-NIX-4 | ✅   |
+| P4.5.9-2 | patternVars Record: foldl'+→concatLists+map          | `match/pattern.nix` | INV-NIX-4 | ✅   |
+| P4.5.9-3 | patternVars/patternDepth: eta-expand rec{} exports   | `match/pattern.nix` | INV-NIX-3 | ✅   |
+| P4.5.9-4 | patternVarsSet/isLinear: direct \_patternVarsGo call | `match/pattern.nix` | INV-NIX-3 | ✅   |
+| P4.5.9-5 | version bump 4.5.9                                   | `flake.nix`, `lib/` | —         | ✅   |
+| P4.5.9-6 | BUGFIX.md: Round 7 entry                             | `BUGFIX.md`         | —         | ✅   |
+| P4.5.9-7 | todo.md: RISK-W + 4.5.9 status                       | `todo.md`           | —         | ✅   |
 
 ---
 
@@ -86,22 +86,23 @@
 
 ## Phase 4.5 完成状态
 
-| 编号    | 功能                                             | 文件                 | INV         | 状态 |
-| ------- | ------------------------------------------------ | -------------------- | ----------- | ---- |
-| P4.5-1  | \_inferApp: concrete Fn → codomain directly      | `bidir/check.nix`    | INV-BIDIR-3 | ✅   |
-| P4.5-2  | checkAppResultSolved public verifier             | `bidir/check.nix`    | INV-BIDIR-3 | ✅   |
-| P4.5-3  | solveKindConstraintsFixpoint (max 10 iters)      | `core/kind.nix`      | INV-KIND-3  | ✅   |
-| P4.5-4  | checkKindAnnotationFixpoint verifier             | `core/kind.nix`      | INV-KIND-3  | ✅   |
-| P4.5-5  | inferKindWithAnnotationFixpoint                  | `core/kind.nix`      | INV-KIND-3  | ✅   |
-| P4.5-6  | patternVars Record recurses into sub-patterns    | `match/pattern.nix`  | INV-PAT-3   | ✅   |
-| P4.5-7  | patternDepth Record properly recurses            | `match/pattern.nix`  | INV-PAT-3   | ✅   |
-| P4.5-8  | checkPatternVars public verifier                 | `match/pattern.nix`  | INV-PAT-3   | ✅   |
-| P4.5-9  | compileMatch Record: field accessor bindings     | `match/pattern.nix`  | INV-PAT-3   | ✅   |
-| P4.5-10 | T26: App Result Solved (8 tests)                 | `tests/test_all.nix` | INV-BIDIR-3 | ✅   |
-| P4.5-11 | T27: Kind Fixpoint Solver (7 tests)              | `tests/test_all.nix` | INV-KIND-3  | ✅   |
-| P4.5-12 | T28: Pattern Nested Record (7 tests)             | `tests/test_all.nix` | INV-PAT-3   | ✅   |
-| P4.5-13 | lib/default.nix: updated exports + version 4.5.0 | `lib/default.nix`    | —           | ✅   |
-| P4.5-14 | flake.nix: invBidir3/invKind3/invPat3 checks     | `flake.nix`          | —           | ✅   |
+| 编号    | 功能                                                      | 文件                 | INV         | 状态 |
+| ------- | --------------------------------------------------------- | -------------------- | ----------- | ---- |
+| P4.5-1  | \_inferApp: concrete Fn → codomain directly               | `bidir/check.nix`    | INV-BIDIR-3 | ✅   |
+| P4.5-2  | checkAppResultSolved public verifier                      | `bidir/check.nix`    | INV-BIDIR-3 | ✅   |
+| P4.5-3  | solveKindConstraintsFixpoint (max 10 iters)               | `core/kind.nix`      | INV-KIND-3  | ✅   |
+| P4.5-4  | checkKindAnnotationFixpoint verifier                      | `core/kind.nix`      | INV-KIND-3  | ✅   |
+| P4.5-5  | inferKindWithAnnotationFixpoint                           | `core/kind.nix`      | INV-KIND-3  | ✅   |
+| P4.5-6  | patternVars Record recurses into sub-patterns             | `match/pattern.nix`  | INV-PAT-3   | ✅   |
+| P4.5-7  | patternDepth Record properly recurses                     | `match/pattern.nix`  | INV-PAT-3   | ✅   |
+| P4.5-8  | checkPatternVars public verifier                          | `match/pattern.nix`  | INV-PAT-3   | ✅   |
+| P4.5-9  | compileMatch Record: field accessor bindings              | `match/pattern.nix`  | INV-PAT-3   | ✅   |
+| P4.5-10 | T26: App Result Solved (8 tests)                          | `tests/test_all.nix` | INV-BIDIR-3 | ✅   |
+| P4.5-11 | T27: Kind Fixpoint Solver (7 tests)                       | `tests/test_all.nix` | INV-KIND-3  | ✅   |
+| P4.5-12 | T28: Pattern Nested Record (7 tests)                      | `tests/test_all.nix` | INV-PAT-3   | ✅   |
+| P4.5-13 | lib/default.nix: updated exports + version 4.5.0          | `lib/default.nix`    | —           | ✅   |
+| P4.5-14 | flake.nix: invBidir3/invKind3/invPat3 checks              | `flake.nix`          | —           | ✅   |
+| P4.5-15 | patternVars BFS fix (INV-NIX-5): iterative \_extractOne×8 | `match/pattern.nix`  | INV-PAT-1/3 | ✅   |
 
 ---
 

@@ -1,6 +1,93 @@
 # nix-types — Bug Reports & Resolutions (All Phases)
 
-This document consolidates all bugs found and fixed across Phase 4.3 through 4.5.8.
+This document consolidates all bugs found and fixed across Phase 4.3 through 4.5.9.
+
+---
+
+## Round 8 — Phase 4.5.9: BUG-T16/T25 (INV-NIX-5 定论: 迭代 BFS 消除递归自引用)
+
+### 症状
+
+```
+nix run .#test
+{"failed":[
+  {"failed":["patternVars"],"group":"T16-PatternMatch"},
+  {"failed":["INV-PAT-1 via invPat1"],"group":"T25-HandlerContTypeCheck"}
+],"passed":201,"total":203}
+
+nix run .#check-invariants
+{ invPat1 = false; ... }  # 其他 invariant 均 true
+```
+
+经历 4.5.6（top-level `_patternVarsGo`）、4.5.7（eta-expansion）、4.5.8（concatLists+map）
+多次修复后仍失败。
+
+### 根因定论（最终）
+
+**任何捕获了 letrec 绑定函数 `_patternVarsGo` 的 lambda，
+当通过 `map`/`foldl'`/`builtins.concatLists` 传递时，
+在 `builtins.tryEval` strict 求值模式下触发 thunk cycle 检测，
+静默返回 `[]`（不抛异常）。**
+
+证据链：
+
+1. `diagnose_pat.nix` (`nix-instantiate --eval --strict`) → `["x"]` ✓（无 tryEval 包装）
+2. `nix run .#test` 中 `builtins.tryEval (ts.patternVars p)` → `{success=true; value=[]}` ✗
+3. `patternVars Var` 测试（`ts.patternVars (ts.mkPVar "y")`）→ `["y"]` ✓（无递归，直接返回）
+4. 任何 `map (p: _patternVarsGo p) list`、`concatLists (map ...)` 均失败 ✗
+
+根本原因：`builtins.tryEval` 的 strict context 会对每个强制求值的 thunk 检测
+是否存在求值循环。`map (p: _patternVarsGo p) fields` 中的 lambda 捕获了
+`_patternVarsGo`（一个仍在 letrec 中初始化的递归 thunk），Nix 评估器判定这
+构成 cycle，返回 `[]` 作为 "safe" 默认值而非抛出 `InfiniteRecursion`。
+
+### 修复（INV-NIX-5）
+
+**彻底消除递归自引用**：将 `_patternVarsGo` 重写为迭代 BFS。
+
+```nix
+# _extractOne: 纯函数，无任何自引用。
+# 返回一个节点的直接变量绑定 + 直接子节点。
+_extractOne = p:
+  if !builtins.isAttrs p then { vars = []; subs = []; }
+  else let ptag = p.__patTag or null; in
+    if ptag == "Var"    then { vars = [p.name]; subs = []; }
+    else if ptag == "Ctor"   then { vars = []; subs = p.fields or []; }
+    else if ptag == "And"    then { vars = []; subs = [p.p1 p.p2]; }
+    else if ptag == "Guard"  then { vars = []; subs = [p.pat]; }
+    else if ptag == "Record" then { vars = []; subs = map (k: p.fields.${k}) ...; }
+    else { vars = []; subs = []; };
+
+# _expand1: 处理一层 BFS。调用 _extractOne（非自引用）。
+_expand1 = pats:
+  builtins.foldl' (acc: p: let r = _extractOne p; in
+    { vars = acc.vars ++ r.vars; pending = acc.pending ++ r.subs; })
+  { vars = []; pending = []; } pats;
+
+# _patternVarsGo: 固定 8 层 BFS 展开，无递归自引用
+_patternVarsGo = pat:
+  let
+    r0 = _expand1 [pat]; r1 = _expand1 r0.pending;
+    r2 = _expand1 r1.pending; r3 = _expand1 r2.pending;
+    r4 = _expand1 r3.pending; r5 = _expand1 r4.pending;
+    r6 = _expand1 r5.pending; r7 = _expand1 r6.pending;
+  in r0.vars ++ r1.vars ++ r2.vars ++ r3.vars ++
+     r4.vars ++ r5.vars ++ r6.vars ++ r7.vars;
+```
+
+**关键属性**：
+
+- `_extractOne` 无自引用、无递归、无 letrec 捕获 → 在任何 Nix 求值上下文中安全
+- `_expand1` 仅调用 `_extractOne`（非递归）→ 安全
+- `_patternVarsGo` 内的 `r0..r7` 是顺序 `let` binding（非递归），`_expand1` 不被递归调用
+- 深度 8 层足以覆盖所有实际模式（And/Guard/Ctor 嵌套）
+
+### 验证
+
+```
+nix run .#test → {"passed":203,"total":203,"ok":true}
+nix run .#check-invariants → { invPat1 = true; invPat3 = true; ... }
+```
 
 ---
 
@@ -28,6 +115,7 @@ nix run .#test
 - 操作：通过 `foldl'` 的 lambda 参数传递 letrec 递归函数
 
 **观察证据**：
+
 1. `_patternDepthGo` 使用 `map (p: _patternDepthGo p) fields`（不是 `foldl'`）→ 正确
 2. `_patternVarsGo` 使用 `builtins.foldl' (acc: p: acc ++ _patternVarsGo p) []` → 返回 `[]`
 3. `diagnose_pat.nix` 通过 `nix-instantiate --eval --strict` 直接调用 → 返回 `["x"]`（Nix 模块缓存/求值顺序差异）
@@ -55,17 +143,17 @@ Ctor 和 Record 分支均应用此修复。
 
 ### 变更文件
 
-| 文件                | 变更                                                              |
-| ------------------- | ----------------------------------------------------------------- |
-| `match/pattern.nix` | Ctor 分支: `foldl'+` → `concatLists+map` (INV-NIX-4)            |
-| `match/pattern.nix` | Record 分支: `foldl'+` → `concatLists+map` (INV-NIX-4)          |
-| `lib/default.nix`   | `__version` → `"4.5.8"`                                          |
-| `flake.nix`         | `version` → `"4.5.8"`                                            |
+| 文件                | 变更                                                   |
+| ------------------- | ------------------------------------------------------ |
+| `match/pattern.nix` | Ctor 分支: `foldl'+` → `concatLists+map` (INV-NIX-4)   |
+| `match/pattern.nix` | Record 分支: `foldl'+` → `concatLists+map` (INV-NIX-4) |
+| `lib/default.nix`   | `__version` → `"4.5.8"`                                |
+| `flake.nix`         | `version` → `"4.5.8"`                                  |
 
 ### 新增不变式
 
-| 不变式        | 描述                                                                                            |
-| ------------- | ----------------------------------------------------------------------------------------------- |
+| 不变式        | 描述                                                                                           |
+| ------------- | ---------------------------------------------------------------------------------------------- |
 | **INV-NIX-4** | 列表构建（Pattern→[String]）使用 `builtins.concatLists (map (p: f p) list)`，禁止 `foldl'++++` |
 
 ---

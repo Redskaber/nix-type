@@ -1,4 +1,4 @@
-# lib/default.nix — Phase 4.5.6
+# lib/default.nix — Phase 4.5.9
 # Unified export layer (Layer 0-21 topological order)
 #
 # INV-LIB-1: This file only does:
@@ -122,6 +122,9 @@ let
   patternLib = import ../match/pattern.nix {
     inherit lib typeLib reprLib kindLib;
   };
+
+  # == Layer 22 ===================================================
+  testLib = import ../testlib/default.nix { inherit lib; };
 
 in {
 
@@ -277,15 +280,9 @@ in {
   mkRowConstraint = constraintLib.mkRowEqConstraint;
 
   # == PredExpr constructors ======================================
-  mkPTrue    = refinedLib.mkPTrue;
-  mkPFalse   = refinedLib.mkPFalse;
-  mkPLit     = refinedLib.mkPLit;
+  inherit (refinedLib) mkPTrue mkPFalse mkPLit mkPCmp mkPAnd mkPOr mkPNot;
   mkPPredVar = refinedLib.mkPVar;
   mkPVar_p   = refinedLib.mkPVar;
-  mkPCmp     = refinedLib.mkPCmp;
-  mkPAnd     = refinedLib.mkPAnd;
-  mkPOr      = refinedLib.mkPOr;
-  mkPNot     = refinedLib.mkPNot;
 
   inherit (constraintLib) mkPGt mkPGe mkPLt mkPLe;
 
@@ -467,19 +464,16 @@ in {
   # == Pattern Matching ===========================================
   inherit (patternLib)
     mkPWild mkArm compileMatch checkExhaustive
+    mkPVar mkPCtor mkPRecord mkPGuard
+    isPattern isWild isVar isCtor isLit
     patternVars patternVarsSet isLinear patternDepth checkPatternVars;
+    mkPAnd_p  = patternLib.mkPAnd;
+    mkPLit_p  = patternLib.mkPLit;
 
-  mkPVar    = patternLib.mkPVar;
-  mkPCtor   = patternLib.mkPCtor;
-  mkPRecord = patternLib.mkPRecord;
-  mkPAnd_p  = patternLib.mkPAnd;
-  mkPLit_p  = patternLib.mkPLit;
-  mkPGuard  = patternLib.mkPGuard;
-  isPattern = patternLib.isPattern;
-  isWild    = patternLib.isWild;
-  isVar     = patternLib.isVar;
-  isCtor    = patternLib.isCtor;
-  isLit     = patternLib.isLit;
+  # == TestLib ====================================================
+  inherit (testLib)
+    safeShow mkTestBool mkTestEq mkTestEval mkTestError mkTestWith
+    testGroup runGroups failedGroups failedList diagnoseAll;
 
   # == Module namespace ===========================================
   __modules = {
@@ -490,8 +484,8 @@ in {
   };
 
   # == Version ====================================================
-  __version = "4.5.8";
-  __phase   = "4.5";
+  __version = "4.5.9";
+  __phase   = "4.5.9";
 
   # == INV verifiers ==============================================
   # All invXxx delegate to sub-module APIs. lib/default.nix: zero logic.
@@ -534,11 +528,11 @@ in {
       let r = effectLib.checkHandlerContWellFormed handlerCont; in
       r.inv_eff_11 or false;
 
-    # INV-PAT-1: patternVars(mkPCtor c [mkPVar v]) contains v
+    # INV-PAT-1: patternVars(mkPCtor c [(mkPVar v)]) contains v
     # _patternVarsGo is top-level let in match/pattern.nix -> no thunk cycle
     invPat1 = pat: ctorName: varName:
       let
-        p    = patternLib.mkPCtor ctorName [ patternLib.mkPVar varName ];
+        p    = patternLib.mkPCtor ctorName [ (patternLib.mkPVar varName) ];
         vars = patternLib.patternVars p;
       in
       builtins.elem varName vars;
