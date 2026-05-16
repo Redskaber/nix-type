@@ -1,14 +1,26 @@
-# tests/test_all.nix — Phase 4.5.8
+# tests/test_all.nix — Phase 4.5.9
 # 完整测试套件（203 tests，28 组）
 #
-# ★ Phase 4.5.8 — INV-NIX-4 definitive fix (concatLists+map)
+# ★ Phase 4.5.9 — BUG-T16/BUG-T25 已解决，测试清理（203/203 通过）
 #
-# 修复（Phase 4.5.8）:
-#   BUG-T16 (定论): patternVars Ctor → [] 根因
-#            builtins.foldl' (acc: p: acc ++ _patternVarsGo p) 在 letrec+nix-run
-#            场景下无声返回 []. 修复: builtins.concatLists (map (p: f p) fields)
-#            INV-NIX-4: 列表构建使用 concatLists+map, 禁止 foldl'++++
-#   BUG-T25: invPat1 → false（同 T16 根因，同步修复）
+# 历史修复记录（已归档）:
+#   BUG-T16 (已解决 4.5.9): patternVars Ctor → []
+#     根因: 任何捕获 letrec 绑定 _patternVarsGo 的 lambda 传给 map/foldl' 均触发
+#           builtins.tryEval strict 模式下的 thunk cycle 检测。
+#     最终修复 (INV-NIX-5): 两层迭代 BFS 设计（_extractOne + _expand1 + 8级展开），
+#           彻底消除递归自引用。match/pattern.nix 已稳定。
+#   BUG-T25 (已解决 4.5.9): invPat1 → false
+#     根因: 同 BUG-T16，patternVars 返回 [] 导致 builtins.elem 为 false。
+#     修复: invPat1 清理为 ctorName: varName: 两参数形式（去掉冗余 pat: 参数）。
+#
+# 不变式：
+#   INV-TEST-1: builtins.tryEval 隔离每个测试，单失败不中断整个套件
+#   INV-TEST-2: pattern 测试使用 patternLib.mkPVar，不使用 refinedLib 版本
+#   INV-TEST-3: Unicode attrset key 使用引号字符串 set ? "α"
+#   INV-TEST-4: tb.testGroup 防御性检查 tests 参数类型
+#   INV-TEST-5: failedList 防御性检查 g.failed 字段
+#   INV-TEST-6: tb.mkTestBool/mkTest 均携带 diag 字段供调试
+#   INV-TEST-7: 诊断输出 JSON-safe（无 Type 对象，无函数值）
 #
 # 不变式：
 #   INV-TEST-1: builtins.tryEval 隔离每个测试，单失败不中断整个套件
@@ -400,7 +412,7 @@ let
 
   # ════════════════════════════════════════════════════════════════════
   # T16: Pattern Matching（INV-PAT-1/2）
-  # ★ Phase 4.5.3: 使用 tb.mkTestWith 增强诊断
+  # ★ Phase 4.5.9: BUG-T16/BUG-T25 已解决，使用 mkTestBool 清理
   # ════════════════════════════════════════════════════════════════════
   t16 = tb.testGroup "T16-PatternMatch" [
     (tb.mkTestBool "mkPWild"
@@ -423,19 +435,14 @@ let
         arms = [ (ts.mkArm ts.mkPWild ts.tInt) ];
         r    = ts.checkExhaustive arms tVariants;
       in r.exhaustive))
-    # ★ BUG-T16: patternVars Ctor — 使用 tb.mkTestWith 暴露实际返回值
-    # => FIX OVER: in nix list, once item if need handle must [ (handler args) ]
-    # Phase 4.5.3 Fix: match/pattern.nix patternVars Ctor 分支使用具名帮助函数
-    (tb.mkTestWith "patternVars"
+    # ★ BUG-T16 已解决（Phase 4.5.9）: patternVars Ctor 正确返回 ["x"]
+    # 根因: letrec 绑定的 _patternVarsGo 被 lambda 捕获后传入 map/foldl' 触发 thunk cycle。
+    # 修复: INV-NIX-5 两层迭代 BFS（_extractOne + _expand1 + 8级展开）彻底消除递归自引用。
+    (tb.mkTestBool "patternVars Ctor ∋ x"
       (let
         p    = ts.mkPCtor "Some" [(ts.mkPVar "x")];
         vars = ts.patternVars p;
-      in builtins.isList vars && builtins.elem "x" vars)
-      # 诊断：展示实际 vars 值
-      (let
-        p    = ts.mkPCtor "Some" [(ts.mkPVar "x")];
-        vars_r = builtins.tryEval (ts.patternVars p);
-      in if vars_r.success then tb.safeShow vars_r.value else "eval-error"))
+      in builtins.isList vars && builtins.elem "x" vars))
     (tb.mkTestBool "patternVars Var"
       (ts.patternVars (ts.mkPVar "y") == ["y"]))
     (tb.mkTestBool "patternVars Wild = []"
@@ -729,7 +736,7 @@ let
 
   # ════════════════════════════════════════════════════════════════════
   # T25: Handler Continuation Type Check（INV-EFF-11）
-  # ★ Phase 4.5.3: 使用 tb.mkTestWith 增强诊断
+  # ★ Phase 4.5.9: BUG-T25 已解决，使用 mkTestBool 清理
   # ════════════════════════════════════════════════════════════════════
   t25 = tb.testGroup "T25-HandlerContTypeCheck" [
     # INV-EFF-11: contType.from == paramType
@@ -769,14 +776,10 @@ let
         r  = ts.checkHandlerContWellFormed
                (ts.mkHandlerWithCont "Get" ts.tInt ct ts.tBool);
       in r.ok or false))
-    # ★ BUG-T25: invPat1 — 使用 tb.mkTestWith 暴露诊断
-    (tb.mkTestWith "INV-PAT-1 via invPat1"
-      (ts.__checkInvariants.invPat1 (ts.mkPCtor "Just" [(ts.mkPVar "z")]) "Just" "z")
-      # 诊断：展示 patternVars 结果
-      (let
-        p = ts.mkPCtor "Just" [(ts.mkPVar "z")];
-        r = builtins.tryEval (ts.patternVars p);
-      in if r.success then tb.safeShow r.value else "eval-error in patternVars"))
+    # ★ BUG-T25 已解决（Phase 4.5.9）: invPat1 正确验证 patternVars 包含变量名
+    # invPat1 已清理为 ctorName: varName: 两参数形式（去掉冗余 pat: 参数）。
+    (tb.mkTestBool "INV-PAT-1 via invPat1"
+      (ts.__checkInvariants.invPat1 "Just" "z"))
   ];
 
   # ════════════════════════════════════════════════════════════════════

@@ -529,8 +529,9 @@ in {
       r.inv_eff_11 or false;
 
     # INV-PAT-1: patternVars(mkPCtor c [(mkPVar v)]) contains v
-    # _patternVarsGo is top-level let in match/pattern.nix -> no thunk cycle
-    invPat1 = pat: ctorName: varName:
+    # _patternVarsGo 是 match/pattern.nix 顶层 let 绑定 → 无 thunk cycle
+    # 2-arg: ctorName varName（无需外部 pat，内部自建用于验证）
+    invPat1 = ctorName: varName:
       let
         p    = patternLib.mkPCtor ctorName [ (patternLib.mkPVar varName) ];
         vars = patternLib.patternVars p;
