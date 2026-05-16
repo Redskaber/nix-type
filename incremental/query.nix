@@ -5,10 +5,8 @@
 # INV-QK5: 循环检测 DFS
 # INV-QK-SCHEMA: key 格式验证
 { lib, hashLib }:
-
-let inherit (hashLib) typeHash; in
-
-rec {
+let
+  inherit (hashLib) typeHash;
 
   # ══ QueryKey 构造（INV-QK1 + INV-QK-SCHEMA）══════════════════════════
   # 所有 key 必须通过 mkQueryKey 构造
@@ -119,4 +117,28 @@ rec {
     { total = builtins.length entries;
       valid = builtins.length valid;
       invalid = builtins.length invalid; };
+in
+{
+  inherit
+  # ══ QueryKey 构造（INV-QK1 + INV-QK-SCHEMA）══════════════════════════
+  mkQueryKey
+  _validateKey
+  # ══ QueryDB 结构 ═══════════════════════════════════════════════════════
+  emptyDB
+  # ══ storeResult（INV-QK-SCHEMA 验证）═════════════════════════════════
+  storeResult
+  lookupResult
+  # ══ BFS 失效（INV-QK2 精确失效）══════════════════════════════════════
+  invalidateKey
+  _bfsInvalidate
+  _markInvalid
+  # ══ RISK-D 修复: cacheNormalize（双缓存统一入口）══════════════════════
+  cacheNormalize
+  bumpEpochDB
+  # ══ INV-QK5: 循环检测 ══════════════════════════════════════════════════
+  hasDependencyCycle
+  _dfsCycle
+  # ══ 查询统计 ══════════════════════════════════════════════════════════
+  cacheStats
+  ;
 }

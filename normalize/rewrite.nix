@@ -110,7 +110,6 @@ let
         let attrHash = builtins.hashString "sha256" (lib.concatStringsSep "," (builtins.attrNames c)); in
         "${tag}:${attrHash}";
 
-in rec {
 
   DEFAULT_FUEL = 1000;
   DEEP_FUEL    = 3000;
@@ -216,5 +215,17 @@ in rec {
       ) { seen = []; result = []; } withKeys;
     in
     uniq.result;
-
+in
+{
+  inherit
+  DEFAULT_FUEL
+  DEEP_FUEL
+  normalizeWithFuel
+  _normalizeChildren
+  normalize'
+  normalizeDeep
+  isNormalForm
+  normalizeConstraint
+  deduplicateConstraints
+  ;
 }

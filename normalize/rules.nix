@@ -12,7 +12,6 @@ let
   inherit (kindLib) KStar KRow KEffect applyKind;
   inherit (substLib) substitute substituteParams applyUnifiedSubst;
 
-in rec {
 
   # ══ RULE P1: β-reduction (Apply + Lambda) ════════════════════════════
   # Apply(Lambda(x, body), arg)  →  substitute(x → arg, body)
@@ -285,4 +284,34 @@ in rec {
       if acc != null then acc
       else rule t
     ) null allRules;
+in
+{
+  inherit
+  # ══ RULE P1: β-reduction (Apply + Lambda) ════════════════════════════
+  ruleBetaReduce
+  # ══ RULE P2: Constructor partial application ══════════════════════════
+  ruleConstructorPartial
+  # ══ RULE P3: Constraint merge (nested Constrained) ═══════════════════
+  ruleConstraintMerge
+  # ══ RULE P4: Constraint float (Apply + Constrained) ══════════════════
+  ruleConstraintFloat
+  # ══ RULE P5: Row canonical (RowExtend spine sort) ════════════════════
+  ruleRowCanonical
+  # ══ RULE P6: VariantRow canonical ════════════════════════════════════
+  ruleVariantRowCanonical
+  # ══ RULE P7: EffectMerge flatten + dedup + sort ══════════════════════
+  ruleEffectMerge
+  # ══ RULE P8: Refined trivial cases ════════════════════════════════════
+  ruleRefined
+  # ══ RULE P9: Sig fields alphabetical ════════════════════════════════
+  ruleSig
+  # ══ RULE P10: Record null field cleanup ═══════════════════════════════
+  ruleRecordCanonical
+  # ══ RULE P11: Effect normalize (VariantRow alphabetical) ═════════════
+  ruleEffectNormalize
+  # ══ 规则集（按优先级排列）═════════════════════════════════════════════
+  allRules
+  # ══ 应用第一个匹配规则 ════════════════════════════════════════════════
+  applyFirstRule
+  ;
 }

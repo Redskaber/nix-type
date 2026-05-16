@@ -92,7 +92,6 @@ let
       if typeLib.isScheme v then v else typeLib.monoScheme v
     ) ctx;
 
-in rec {
 
   # ══════════════════════════════════════════════════════════════════════
   # Expr constructors (INV-EXPR-1)
@@ -324,4 +323,52 @@ in rec {
   checkAppResultSolved = ctx: fn: arg:
     let r = infer ctx (eApp fn arg); in
     r.resultSolved or false;
+
+in
+{
+  inherit
+  # ══════════════════════════════════════════════════════════════════════
+  # Expr constructors (INV-EXPR-1)
+  # ══════════════════════════════════════════════════════════════════════
+  eLam
+  eLamA
+  eLit
+  eVar
+  eApp
+  eLet
+  eAnn
+  eIf
+  ePrim
+  # ══════════════════════════════════════════════════════════════════════
+  # infer — synthesise mode
+  # Type: Ctx -> Expr -> { type; constraints; subst; resultSolved? }
+  # ══════════════════════════════════════════════════════════════════════
+  infer
+  # ══════════════════════════════════════════════════════════════════════
+  # check — checking mode (INV-BIDIR-4)
+  # Type: Ctx -> Expr -> Type -> { ok: Bool; constraints; subst }
+  # ok = true iff solver(inferred.constraints ++ [Eq(inferred,expected)]).ok
+  # ══════════════════════════════════════════════════════════════════════
+  check
+  # ══════════════════════════════════════════════════════════════════════
+  # Internal inference helpers (all top-level let — no rec{} thunk risk)
+  # ══════════════════════════════════════════════════════════════════════
+  _inferVar
+  _instantiateScheme
+  _inferLam
+  _inferApp
+  _inferLet
+  _inferIf
+  # ══════════════════════════════════════════════════════════════════════
+  # Generalisation (INV-SCHEME-1)
+  # generalize(Ctx, T, cs) = forall(fv(T) \ fv(Ctx)).T
+  # ══════════════════════════════════════════════════════════════════════
+  generalize
+  _ctxFreeVars
+  # ══════════════════════════════════════════════════════════════════════
+  # Public verifiers
+  # ══════════════════════════════════════════════════════════════════════
+  checkAnnotatedLam
+  checkAppResultSolved
+  ;
 }

@@ -1,4 +1,4 @@
-# match/pattern.nix — Phase 4.5.6
+# match/pattern.nix — Phase 4.5.8
 # Pattern Matching + Decision Tree compiler
 # Pattern → Decision Tree (ordinal O(1) dispatch)
 #
@@ -7,41 +7,29 @@
 # ★ INV-PAT-3: patternVars(mkPRecord {f:p,…}) = ⋃ patternVars(pᵢ)
 # ★ INV-NIX-2: _patternVarsGo and _patternDepthGo MUST be defined in the
 #              TOP-LEVEL `let` block (before `in rec {`), never inside rec{}.
+# ★ INV-NIX-4: _patternVarsGo MUST use `builtins.concatLists (map (p: f p) list)`
+#              NOT `builtins.foldl' (acc: p: acc ++ f p) [] list`.
+#              Reason: builtins.foldl' with a letrec-recursive lambda silently
+#              returns [] in certain Nix evaluation contexts (nix run --strict
+#              combined with large let scopes and letrec-bound functions).
+#              builtins.concatLists (map ...) is observably correct in all contexts.
 #
-# ══ Root Cause of INV-PAT-1 Failure ══════════════════════════════════════
+# ══ Root Cause History ════════════════════════════════════════════════════
 #
-#   BUGGY pattern (DO NOT USE):
-#
-#     in rec {
-#       patternVars = pat:
-#         let go = pat: ...
-#                  "Ctor" → builtins.foldl' (acc: p: acc ++ go p) [] fields;
-#         in go pat;
-#     }
-#
-#   When Nix evaluates `builtins.foldl' f [] fields`, it forces the thunk
-#   `f`. The thunk `(acc: p: acc ++ go p)` closes over `go`. But `go` is a
-#   `let` binding *inside* the `patternVars` thunk body. Because `patternVars`
-#   is a `rec{}` self-reference, forcing it re-enters its own thunk → Nix
-#   black-hole (the thunk evaluates to its own unevaluated state) → returns []
-#   silently instead of the correct variable list.
-#
-#   CORRECT pattern (this file):
-#
-#     let
-#       _patternVarsGo = pat: ...  # ← plain let binding, top-level
-#         "Ctor" → builtins.foldl' (acc: p: acc ++ _patternVarsGo p) [] fields;
-#     in rec {
-#       patternVars = _patternVarsGo;  # ← alias only, no re-entry
-#     }
-#
-#   At the top-level `let`, self-recursion is standard Nix letrec semantics
-#   (safe). The thunk for `_patternVarsGo` is NOT inside `rec{}`, so no
-#   rec-self-reference cycle can form. Passing it to `builtins.foldl'` is safe.
+# Round 3 (4.5.2): `builtins.map patternVars fields` — bare rec-fn to map → []
+# Round 4 (4.5.3): _patternVarsGo at top-level; patternVars = _patternVarsGo
+# Round 5 (4.5.6): bare alias → still []; tried: _patternVarsGo at top-level
+# Round 6 (4.5.7): eta-expansion `pat: _patternVarsGo pat` → still []
+# Round 7 (4.5.8): DEFINITIVE — use builtins.concatLists(map) instead of foldl'+
+#   Root cause: builtins.foldl' (acc: p: acc ++ _patternVarsGo p) silently returns []
+#   when _patternVarsGo is a letrec-bound recursive function in certain Nix contexts.
+#   builtins.concatLists (map (p: _patternVarsGo p) fields) is observably correct.
+#   Evidence: _patternDepthGo uses map (p: _patternDepthGo p) (not foldl') → works.
 #
 # ══ Invariants ════════════════════════════════════════════════════════════
 #
 #   INV-NIX-2  _patternVarsGo/_patternDepthGo defined at top-level let
+#   INV-NIX-4  list building uses builtins.concatLists+map (never foldl'+++)
 #   INV-PAT-1  patternVars(mkPCtor c [mkPVar v]) ∋ v
 #   INV-PAT-2  isLinear pat ↔ no duplicate bindings in patternVars pat
 #   INV-PAT-3  patternVars(mkPRecord {f:p}) = ⋃ patternVars(p_f)
@@ -53,7 +41,6 @@ let
   inherit (typeLib) isType;
 
   # ── Safe literal key ──────────────────────────────────────────────────
-  # builtins.toString is total; prefix prevents int/string collision.
   _safeLitKey = v:
     if      builtins.isString v then "s:${v}"
     else if builtins.isInt    v then "i:${builtins.toString v}"
@@ -62,13 +49,14 @@ let
     else                             "v:${builtins.toString v}";
 
   # ══════════════════════════════════════════════════════════════════════
-  # _patternVarsGo — TOP-LEVEL let (INV-NIX-2 ★ INV-PAT-1/3 definitive fix)
+  # _patternVarsGo — TOP-LEVEL let (INV-NIX-2, INV-NIX-4)
   #
   # Type: Pattern → [String]
   #
-  # This is the ONLY correct location for a recursive pattern-variable
-  # extractor. Defined here, self-recursion is standard letrec, and there
-  # is no rec{} thunk cycle.  All public exports are simple aliases below.
+  # ★ INV-NIX-4: Ctor and Record branches use builtins.concatLists + map.
+  #   builtins.foldl' (acc: p: acc ++ _patternVarsGo p) silently returns []
+  #   in certain Nix evaluation contexts due to letrec+foldl' interaction.
+  #   builtins.concatLists (map (p: _patternVarsGo p) fields) works correctly.
   # ══════════════════════════════════════════════════════════════════════
   _patternVarsGo = pat:
     if !builtins.isAttrs pat then []
@@ -81,15 +69,11 @@ let
         (if pat ? name then [ pat.name ] else [])
 
       # Ctor: recurse into each field (INV-PAT-1)
-      # builtins.foldl' is safe here because _patternVarsGo is a plain
-      # let-binding (not a rec{} thunk) — no re-entry risk.
+      # ★ INV-NIX-4: concatLists+map (NOT foldl'+++)
       else if tag == "Ctor" then
         let fields = if pat ? fields && builtins.isList pat.fields
                      then pat.fields else [];
-        in builtins.foldl'
-             (acc: p: acc ++ _patternVarsGo p)
-             []
-             fields
+        in builtins.concatLists (map (p: _patternVarsGo p) fields)
 
       # And: union of both sub-patterns
       else if tag == "And" then
@@ -101,20 +85,21 @@ let
         (if pat ? pat then _patternVarsGo pat.pat else [])
 
       # Record: recurse into every field sub-pattern (INV-PAT-3)
+      # ★ INV-NIX-4: concatLists+map (NOT foldl'+++)
       else if tag == "Record" then
         if pat ? fields && builtins.isAttrs pat.fields
-        then builtins.foldl'
-               (acc: k: acc ++ _patternVarsGo pat.fields.${k})
-               []
-               (builtins.attrNames pat.fields)
+        then builtins.concatLists
+               (map (k: _patternVarsGo pat.fields.${k})
+                    (builtins.attrNames pat.fields))
         else []
 
       # Wild / Lit / unknown: no bindings
       else [];
 
   # ══════════════════════════════════════════════════════════════════════
-  # _patternDepthGo — TOP-LEVEL let (INV-NIX-2, same rationale)
+  # _patternDepthGo — TOP-LEVEL let (INV-NIX-2)
   # Type: Pattern → Int
+  # Uses map+lib.foldl' for Int-max accumulation (not list building — safe).
   # ══════════════════════════════════════════════════════════════════════
   _patternDepthGo = pat:
     if !builtins.isAttrs pat then 0
@@ -150,10 +135,8 @@ let
 
       else 0;
 
-in rec {
 
   # ══ Pattern IR ════════════════════════════════════════════════════════
-  # Constructors: pure attr-set records, no functions embedded → INV-SER-1 safe
   mkPWild   = { __patTag = "Wild"; };
   mkPVar    = name:   { __patTag = "Var";    name   = name;   };
   mkPCtor   = name: fields:
@@ -186,10 +169,6 @@ in rec {
     { __dtTag = "Guard"; guard = guard; yes = yes; no = no; };
 
   # ══ Pattern compiler (Pattern → Decision Tree) ════════════════════════
-  #
-  # Compiles a list of match arms + ADT variant descriptors into a decision
-  # tree for O(1) ordinal dispatch.  The `adtVariants` list has elements of
-  # the form `{ name = "CtorName"; ordinal = N; }`.
   compileMatch = arms: adtVariants:
     if arms == [] then mkDTFail
     else
@@ -199,21 +178,15 @@ in rec {
         pat      = firstArm.pat;
         tag      = pat.__patTag or null;
       in
-
-      # Wild / Var → unconditional leaf
       if tag == "Wild" || tag == "Var" then
         let bindings = if tag == "Var"
                        then { ${pat.name} = "__scrutinee"; } else {};
         in mkDTLeaf bindings firstArm.body
-
-      # Lit → switch on serialised literal key
       else if tag == "Lit" then
         let litKey = _safeLitKey (pat.value or null); in
         mkDTSwitch "__scrutinee"
           { ${litKey} = mkDTLeaf {} firstArm.body; }
           (compileMatch restArms adtVariants)
-
-      # Ctor → switch on constructor ordinal
       else if tag == "Ctor" then
         let
           ctorOrdinal = _lookupOrdinal adtVariants pat.name;
@@ -226,29 +199,20 @@ in rec {
           restDT  = compileMatch restArms  adtVariants;
         in
         mkDTSwitch "__scrutinee" { ${ctorKey} = innerDT; } restDT
-
-      # Guard → conditional branch
       else if tag == "Guard" then
         let
           matchPat = mkArm pat.pat firstArm.body;
           innerDT  = compileMatch ([ matchPat ] ++ restArms) adtVariants;
         in
         mkDTGuard pat.guard innerDT (compileMatch restArms adtVariants)
-
-      # And → nested arm
       else if tag == "And" then
-        let
-          innerArm = mkArm pat.p1 (mkArm pat.p2 firstArm.body);
-        in
-        compileMatch ([ innerArm ] ++ restArms) adtVariants
-
-      # Record → build field-accessor binding map
+        let innerArm = mkArm pat.p1 (mkArm pat.p2 firstArm.body);
+        in compileMatch ([ innerArm ] ++ restArms) adtVariants
       else if tag == "Record" then
         let
           subPats = if builtins.isAttrs (pat.fields or null)
                     then pat.fields else {};
-          # _patternVarsGo is the top-level helper — safe to call from rec{}
-          fieldBindings = builtins.foldl'
+          fieldBindings = lib.foldl'
             (acc: fieldName:
               let
                 subPat  = subPats.${fieldName} or mkPWild;
@@ -263,15 +227,12 @@ in rec {
             (builtins.attrNames subPats);
         in
         mkDTLeaf fieldBindings firstArm.body
-
       else mkDTFail;
 
-  # ── Ordinal lookup ────────────────────────────────────────────────────
   _lookupOrdinal = adtVariants: ctorName:
     let v = lib.findFirst (v: v.name == ctorName) null adtVariants; in
     if v != null then v.ordinal else -1;
 
-  # ══ Exhaustiveness check ══════════════════════════════════════════════
   checkExhaustive = arms: adtVariants:
     let
       ctorsCovered = lib.concatMap (arm:
@@ -288,27 +249,25 @@ in rec {
     { exhaustive = missing == []; missing = missing; };
 
   # ══ Pattern variable extraction (INV-PAT-1/3) ════════════════════════
-  # Public alias to the top-level helper.  This is just an alias — no logic.
-  # ★ DO NOT inline a `let go = …; in go` here; that recreates the thunk cycle.
-  patternVars = _patternVarsGo;
+  # eta-expanded for extra safety; real fix is concatLists+map in _patternVarsGo
+  patternVars = pat: _patternVarsGo pat;
 
-  # ══ Pattern variable set (deduplicated attr-set) ═══════════════════════
+  # ══ Pattern variable set — uses _patternVarsGo directly ════════════════
   patternVarsSet = pat:
-    lib.foldl' (acc: v: acc // { ${v} = true; }) {} (patternVars pat);
+    lib.foldl' (acc: v: acc // { ${v} = true; }) {} (_patternVarsGo pat);
 
-  # ══ INV-PAT-2: linearity check ════════════════════════════════════════
+  # ══ INV-PAT-2: linearity — uses _patternVarsGo directly ════════════════
   isLinear = pat:
     let
-      vars = patternVars pat;
+      vars = _patternVarsGo pat;
       uniq = lib.unique vars;
     in
     builtins.length vars == builtins.length uniq;
 
   # ══ Pattern depth ══════════════════════════════════════════════════════
-  patternDepth = _patternDepthGo;
+  patternDepth = pat: _patternDepthGo pat;
 
   # ══ INV-PAT-3 verifier ════════════════════════════════════════════════
-  # Type: Pattern → {String → Bool} → Bool
   checkPatternVars = pat: expectedVarsSet:
     let
       actual       = patternVarsSet pat;
@@ -317,4 +276,43 @@ in rec {
     in
     builtins.length actualKeys == builtins.length expectedKeys &&
     lib.all (k: actual ? ${k}) expectedKeys;
+in
+{
+  inherit
+  # ══ Pattern IR ════════════════════════════════════════════════════════
+  mkPWild
+  mkPVar
+  mkPCtor
+  mkPLit
+  mkPAnd
+  mkPGuard
+  mkPRecord
+  isPattern
+  isWild
+  isVar
+  isCtor
+  isLit
+  isRecord
+  # ══ Match Arm ══════════════════════════════════════════════════════════
+  mkArm
+  # ══ Decision Tree IR ══════════════════════════════════════════════════
+  mkDTLeaf
+  mkDTFail
+  mkDTSwitch
+  mkDTGuard
+  # ══ Pattern compiler (Pattern → Decision Tree) ════════════════════════
+  compileMatch
+  _lookupOrdinal
+  checkExhaustive
+  # ══ Pattern variable extraction (INV-PAT-1/3) ════════════════════════
+  patternVars
+  # ══ Pattern variable set — uses _patternVarsGo directly ════════════════
+  patternVarsSet
+  # ══ INV-PAT-2: linearity — uses _patternVarsGo directly ════════════════
+  isLinear
+  # ══ Pattern depth ══════════════════════════════════════════════════════
+  patternDepth
+  # ══ INV-PAT-3 verifier ════════════════════════════════════════════════
+  checkPatternVars
+  ;
 }

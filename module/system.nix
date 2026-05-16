@@ -16,7 +16,6 @@ let
   inherit (hashLib) typeHash;
   inherit (unifiedSubstLib) emptySubst composeSubst singleTypeBinding applySubst;
 
-in rec {
 
   # ══ Sig 构造器 ═════════════════════════════════════════════════════════
   # Type: {name → Type} → Type(Sig)
@@ -211,4 +210,31 @@ in rec {
     if (sealed.repr.__variant or null) == "Opaque" && sealed.repr.tag == sealTag
     then { ok = true; inner = sealed.repr.inner; }
     else { ok = false; error = "seal tag mismatch"; };
+in
+{
+  inherit
+  # ══ Sig 构造器 ═════════════════════════════════════════════════════════
+  mkSig
+  isSig
+  # ══ Struct 构造器 ══════════════════════════════════════════════════════
+  mkStruct
+  isStruct
+  # ══ Struct 字段访问 ════════════════════════════════════════════════════
+  structField
+  # ══ ModFunctor 构造器 ══════════════════════════════════════════════════
+  mkModFunctor
+  isModFunctor
+  applyFunctor
+  # ══ Functor Composition（Phase 4.2: 真正 λM.f1(f2(M)) 语义）══════════
+  composeFunctors
+  # ══ 传递性 Functor Composition（列表，INV-MOD-8）═══════════════════════
+  composeFunctorChain
+  # ══ Sig 兼容性检查（结构子类型）═════════════════════════════════════
+  sigCompatible
+  # ══ Sig 合并（交集 + 联集）══════════════════════════════════════════
+  sigMerge
+  # ══ sealing / unsealing（抽象类型）══════════════════════════════════
+  seal
+  unseal
+  ;
 }

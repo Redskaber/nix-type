@@ -398,7 +398,7 @@ in {
   # == Incremental Graph ==========================================
   inherit (graphLib)
     emptyGraph hasCycle topologicalSort reachable
-    invalidateNode isClean isStale nodeState;
+    invalidate isClean isStale nodeState;
 
   addNode    = nodeId: graph:
     let g = if builtins.isAttrs graph && graph ? nodes
@@ -490,7 +490,7 @@ in {
   };
 
   # == Version ====================================================
-  __version = "4.5.6";
+  __version = "4.5.8";
   __phase   = "4.5";
 
   # == INV verifiers ==============================================

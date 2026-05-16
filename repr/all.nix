@@ -21,7 +21,6 @@ let
   inherit (kindLib) KStar KArrow KRow KEffect;
   mkRepr = variant: fields: { __variant = variant; } // fields;
 
-in rec {
 
   # ══ 基础变体 ═══════════════════════════════════════════════════════════
 
@@ -212,4 +211,76 @@ in rec {
   isDynamic     = r: reprVariant r == "Dynamic";
   isHole        = r: reprVariant r == "Hole";
   isTyCon       = r: reprVariant r == "TyCon";
+in {
+  inherit
+  # ══ 基础变体 ═══════════════════════════════════════════════════════════
+  rPrimitive
+  rVar
+  rVarScoped
+  rLambda
+  rApply
+  rConstructor
+  rFn
+  rADT
+  rConstrained
+  # ══ 高级变体 ═══════════════════════════════════════════════════════════
+  rMu
+  rPi
+  rSigma
+  rRecord
+  rRowExtend
+  rRowEmpty
+  rVariantRow
+  rEffect
+  rEffectMerge
+  rHandler
+  rRefined
+  rSig
+  rStruct
+  rModFunctor
+  rOpaque
+  rForall
+  rForAll
+  rDynamic
+  rHole
+  # ════════════════════════════════════════════════════════════════════
+  # Phase 4.2: 额外变体
+  # ════════════════════════════════════════════════════════════════════
+  rComposedFunctor
+  rTypeScheme
+  rTyCon
+  mkVariant
+  mkBranch
+  mkBranchWithCont
+  # ══ TypeRepr 判断工具 ══════════════════════════════════════════════════
+  isRepr
+  reprVariant
+  isPrimitive
+  isVar
+  isLambda
+  isApply
+  isConstructor
+  isFn
+  isADT
+  isConstrained
+  isMu
+  isPi
+  isSigma
+  isRecord
+  isRowExtend
+  isRowEmpty
+  isVariantRow
+  isEffect
+  isEffectMerge
+  isHandler
+  isRefined
+  isSig
+  isStruct
+  isModFunctor
+  isOpaque
+  isForall
+  isDynamic
+  isHole
+  isTyCon
+  ;
 }

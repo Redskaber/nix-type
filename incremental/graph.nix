@@ -18,9 +18,7 @@
 #
 # INV-TOPO: topologicalSort 始终返回 { ok: Bool; order: [String]; error: Null|String }
 { lib }:
-
-rec {
-
+let
   # ══ 图结构 ════════════════════════════════════════════════════════════
   # { nodes: {id → NodeState}; edges: {id → [id]}; revEdges: {id → [id]} }
   # NodeState: "clean" | "stale" | "computing"
@@ -112,7 +110,7 @@ rec {
   # BFS from changed node, following revEdges
 
   # Type: Graph → String → Graph
-  invalidateNode = graph: nodeId:
+  invalidate = graph: nodeId:
     _bfsInvalidate graph [ nodeId ] [ nodeId ];
 
   _bfsInvalidate = graph: queue: visited:
@@ -199,4 +197,33 @@ rec {
         newDeps = lib.filter (d: !(builtins.elem d visited)) deps;
       in
       _bfsReachable graph (rest ++ newDeps) (visited ++ newDeps);
+in
+{
+  inherit
+  # ══ 图结构 ════════════════════════════════════════════════════════════
+  emptyGraph
+  # ══ 节点操作 ══════════════════════════════════════════════════════════
+  addNode
+  removeNode
+  # ══ 边操作 ════════════════════════════════════════════════════════════
+  addEdge
+  removeEdge
+  # ══ 节点状态操作（INV-G2: clean/stale FSM）═══════════════════════════
+  markStale
+  markClean
+  nodeState
+  isStale
+  isClean
+  # ══ INV-G1: BFS 失效传播（正确方向）════════════════════════════════
+  invalidate
+  _bfsInvalidate
+  # ══ 拓扑排序（INV-G5, INV-TOPO）══════════════════════════════════════
+  topologicalSort
+  _topoLoop
+  # ══ 循环检测（INV-QK5）══════════════════════════════════════════════
+  hasCycle
+  # ══ 可达性（BFS）════════════════════════════════════════════════════
+  reachable
+  _bfsReachable
+  ;
 }

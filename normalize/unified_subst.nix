@@ -13,7 +13,6 @@ let
   inherit (kindLib) applyKindSubst;
   inherit (substLib) substitute applyUnifiedSubst;
 
-in rec {
 
   # ══ UnifiedSubst 构造器 ════════════════════════════════════════════════
   emptySubst = {
@@ -142,4 +141,29 @@ in rec {
     let typeVars = lib.concatMap (typeLib.freeVars) (builtins.attrValues s.typeBindings);
         rowVars  = lib.concatMap (typeLib.freeVars) (builtins.attrValues s.rowBindings);
     in lib.unique (typeVars ++ rowVars);
+in
+{
+  inherit
+  # ══ UnifiedSubst 构造器 ════════════════════════════════════════════════
+  emptySubst
+  singleTypeBinding
+  singleRowBinding
+  singleKindBinding
+  # ══ Subst 判断 ═════════════════════════════════════════════════════════
+  isSubst
+  isEmpty
+  # ══ Subst 组合（INV-US1: compose law）════════════════════════════════
+  composeSubst
+  # ══ Subst 应用（主 API）═══════════════════════════════════════════════
+  applySubst
+  # ══ Constraint 上的 Subst 应用 ════════════════════════════════════════
+  applySubstToConstraint
+  applySubstToConstraints
+  # ══ Legacy compat（Phase 4.0 API）════════════════════════════════════
+  fromLegacyTypeSubst
+  fromLegacyRowSubst
+  # ══ Subst 域（用于 occurs check）═════════════════════════════════════
+  substDomain
+  substRange
+  ;
 }

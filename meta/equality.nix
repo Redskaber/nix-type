@@ -7,7 +7,6 @@ let
   inherit (hashLib) typeHash;
   inherit (serialLib) serializeConstraint serializeRepr;
 
-in rec {
 
   # ══ 主比较函数（NF-hash equality）════════════════════════════════════
   # Type: Type → Type → Bool
@@ -66,4 +65,21 @@ in rec {
   # ══ Α-等价（变量名不影响）════════════════════════════════════════════
   # 因为 serialize 已经做了 de Bruijn 转换，typeEq 已蕴含 α-等价
   alphaEq = typeEq;
+in
+{
+  inherit
+  # ══ 主比较函数（NF-hash equality）════════════════════════════════════
+  typeEq
+  typeEqN
+  # ══ Kind Equality ══════════════════════════════════════════════════════
+  kindEq
+  # ══ Constraint Equality ════════════════════════════════════════════════
+  constraintEq
+  # ══ TypeScheme Equality ════════════════════════════════════════════════
+  schemeEq
+  # ══ Subtype（结构近似，非完整 subtype）════════════════════════════════
+  isSubtype
+  # ══ Α-等价（变量名不影响）════════════════════════════════════════════
+  alphaEq
+  ;
 }

@@ -1,6 +1,72 @@
 # nix-types — Bug Reports & Resolutions (All Phases)
 
-This document consolidates all bugs found and fixed across Phase 4.3 through 4.5.6.
+This document consolidates all bugs found and fixed across Phase 4.3 through 4.5.8.
+
+---
+
+## Round 7 — Phase 4.5.8: BUG-T16/T25 (INV-NIX-4 定论: foldl'+++ vs concatLists+map)
+
+### 症状
+
+```
+nix run .#test
+{"failed":[
+  {"failed":["patternVars"],"group":"T16-PatternMatch"},
+  {"failed":["INV-PAT-1 via invPat1"],"group":"T25-HandlerContTypeCheck"}
+],"passed":201,"total":203}
+```
+
+经历 4.5.6（top-level `_patternVarsGo`）、4.5.7（eta-expansion）多次修复后仍失败。
+
+### 根因定论
+
+**`builtins.foldl' (acc: p: acc ++ _patternVarsGo p) [] fields` 在以下组合条件下
+无声返回 `[]`（不是 eval-error，是错误的空列表）：**
+
+- Nix 执行方式：`nix run` / `nix-instantiate --eval --strict`
+- 函数类型：`_patternVarsGo` 是 letrec 绑定的递归函数（同一 `let` 块自引用）
+- 操作：通过 `foldl'` 的 lambda 参数传递 letrec 递归函数
+
+**观察证据**：
+1. `_patternDepthGo` 使用 `map (p: _patternDepthGo p) fields`（不是 `foldl'`）→ 正确
+2. `_patternVarsGo` 使用 `builtins.foldl' (acc: p: acc ++ _patternVarsGo p) []` → 返回 `[]`
+3. `diagnose_pat.nix` 通过 `nix-instantiate --eval --strict` 直接调用 → 返回 `["x"]`（Nix 模块缓存/求值顺序差异）
+4. `nix run .#check-invariants` 中 `invPat1 = false` → 同一 `patternLib`，失败
+
+**关键差异**：`foldl'` 和 `map+concatLists` 在数学上等价，但在 Nix 的 letrec
+求值模型中，`foldl' (acc: p: acc ++ f p) [] xs` 对 letrec 绑定的 `f` 存在
+**求值顺序问题**：foldl' 的 lambda 需要在 `f` 的 thunk 初始化完成前被强制求值，
+某些情况下得到 `[]`（thunk 未完成时的默认值）而非正确结果。
+
+### 修复（INV-NIX-4）
+
+将 `_patternVarsGo` 中所有 `foldl' (acc: p: acc ++ _patternVarsGo p) []` 替换为
+`builtins.concatLists (map (p: _patternVarsGo p) ...)`：
+
+```nix
+# ❌ 在 letrec+nix-run 组合下无声返回 []
+builtins.foldl' (acc: p: acc ++ _patternVarsGo p) [] fields
+
+# ✅ 正确（与 _patternDepthGo 的 map 模式一致）
+builtins.concatLists (map (p: _patternVarsGo p) fields)
+```
+
+Ctor 和 Record 分支均应用此修复。
+
+### 变更文件
+
+| 文件                | 变更                                                              |
+| ------------------- | ----------------------------------------------------------------- |
+| `match/pattern.nix` | Ctor 分支: `foldl'+` → `concatLists+map` (INV-NIX-4)            |
+| `match/pattern.nix` | Record 分支: `foldl'+` → `concatLists+map` (INV-NIX-4)          |
+| `lib/default.nix`   | `__version` → `"4.5.8"`                                          |
+| `flake.nix`         | `version` → `"4.5.8"`                                            |
+
+### 新增不变式
+
+| 不变式        | 描述                                                                                            |
+| ------------- | ----------------------------------------------------------------------------------------------- |
+| **INV-NIX-4** | 列表构建（Pattern→[String]）使用 `builtins.concatLists (map (p: f p) list)`，禁止 `foldl'++++` |
 
 ---
 

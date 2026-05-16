@@ -27,9 +27,8 @@ let
 
   DEFAULT_FUEL = 2000;
 
-in rec {
 
-  # ══ Solver 结果结构 ════════════════════════════════════════════════════
+ # ══ Solver 结果结构 ════════════════════════════════════════════════════
   mkSolverResult = ok: subst: solved: classResidual: smtResidual: rowSubst:
     { inherit ok subst solved classResidual smtResidual;
       rowSubst = rowSubst;
@@ -323,4 +322,23 @@ in rec {
 
   getKindSubst = result:
     result.subst.kindBindings or {};
+
+in
+{
+  inherit
+  # ══ Solver 结果结构 ════════════════════════════════════════════════════
+  mkSolverResult
+  failResult
+  # ══ Worklist 初始化 ════════════════════════════════════════════════════
+  _initState
+  _stateToResult
+  # ══ 主求解循环（worklist，fuel-bounded）══════════════════════════════
+  _solveLoop
+  # ══ 主 solve API ════════════════════════════════════════════════════════
+  solveSimple
+  solve
+  getTypeSubst
+  getRowSubst
+  getKindSubst
+  ;
 }

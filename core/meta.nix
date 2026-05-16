@@ -1,8 +1,7 @@
 # core/meta.nix — Phase 4.3
 # MetaType：语义控制层（不只是 metadata，控制 normalize/equality/hash 行为）
 { lib }:
-
-rec {
+let
   # ══ MetaType 默认值 ════════════════════════════════════════════════════
   defaultMeta = {
     eqStrategy   = "structural";  # "structural" | "nominal" | "alpha"
@@ -44,4 +43,26 @@ rec {
       mergedConstraints = m1.constraints ++ m2.constraints;
     in
     base // { constraints = mergedConstraints; };
+in
+{
+  inherit
+  # ══ MetaType 默认值 ════════════════════════════════════════════════════
+  defaultMeta
+  # ══ MetaType 构造器 ════════════════════════════════════════════════════
+  mkMeta
+  nominalMeta
+  lazyMeta
+  schemeMeta
+  opaqueMeta
+  bisimMeta
+  # ══ MetaType 谓词 ══════════════════════════════════════════════════════
+  isMeta
+  isNominal
+  isStructural
+  isLazy
+  isScheme
+  isBisimCongruence
+  # ══ MetaType 合并 ══════════════════════════════════════════════════════
+  mergeMeta
+  ;
 }

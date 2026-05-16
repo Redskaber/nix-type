@@ -27,7 +27,6 @@ let
     in
     "{${labelStr}|${tailStr}}";
 
-in rec {
 
   # ══ Row 結构分析 ═══════════════════════════════════════════════════════
   _rowSpine = row:
@@ -141,4 +140,16 @@ in rec {
       if va == "Var" then { ok = true; subst = singleRowBinding a.repr.name b; }
       else if vb == "Var" then { ok = true; subst = singleRowBinding b.repr.name a; }
       else { ok = false; error = "type mismatch in row field"; };
+in
+{
+  inherit
+    _spineKey
+  # ══ Row 結构分析 ═══════════════════════════════════════════════════════
+  _rowSpine
+  # ══ Row 重建（从 labels + tail）══════════════════════════════════════
+  _rebuildRow
+  # ══ Row Unification ═══════════════════════════════════════════════════
+  unifyRow
+  _unifyTypes
+  ;
 }

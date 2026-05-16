@@ -15,8 +15,6 @@ let
   inherit (serialLib) serializeType serializeRepr canonicalHash canonicalHashRepr
                       serializeConstraint _safeStr;
 
-in rec {
-
   # ══ 主 hash 函数（通过 NF）════════════════════════════════════════════════
   # Type: NormalizedType → String
   # 注意：调用者负责先 normalize，hash 不做 normalize（避免循环）
@@ -73,4 +71,19 @@ in rec {
       ) allKeys;
     in
     builtins.hashString "sha256" "Subst(${lib.concatStringsSep ";" pairStrs})";
+in
+{
+  inherit
+  # ══ 主 hash 函数（通过 NF）════════════════════════════════════════════════
+  typeHash
+  reprHash
+  # ══ Constraint hash（用于去重）══════════════════════════════════════════
+  constraintHash
+  # ══ TypeScheme hash ══════════════════════════════════════════════════════
+  schemeHash
+  # ══ Hash-consing（Phase 4.2: 结构共享）══════════════════════════════════
+  hashConsEq
+  # ══ Substitution hash（用于 memo key）════════════════════════════════════
+  substHash
+  ;
 }

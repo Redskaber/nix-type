@@ -1,10 +1,10 @@
 # incremental/memo.nix — Phase 4.2
 # Memo 层（epoch-based 失效）
 { lib, hashLib }:
-
-let inherit (hashLib) typeHash; in
-
-rec {
+let
+  inherit (hashLib) typeHash;
+in
+{
 
   # ══ Memo 结构 ══════════════════════════════════════════════════════════
   # { normalize: {typeId → NF}; substitute: {key → result}; solve: {key → result} }

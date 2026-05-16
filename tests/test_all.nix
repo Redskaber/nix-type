@@ -1,18 +1,14 @@
-# tests/test_all.nix — Phase 4.5.6
+# tests/test_all.nix — Phase 4.5.8
 # 完整测试套件（203 tests，28 组）
 #
-# ★ Phase 4.5.6 — Bug fixes
+# ★ Phase 4.5.8 — INV-NIX-4 definitive fix (concatLists+map)
 #
-# 修复（Phase 4.5.6）:
-#   BUG-T16: patternVars Ctor 分支返回 [] — match/pattern.nix 中 _patternVarsGo
-#            必须在 top-level let 中定义（已在 4.5.5 修复，此版确认部署）
-#            INV-NIX-2: rec{} 内不能直接将递归函数引用传给 builtins.map/foldl'
-#   BUG-T24: checkAnnotatedLam API 不匹配
-#            bidirLib.checkAnnotatedLam 是 4-arg (ctx param paramTy body -> Bool)
-#            但测试调用 ts.checkAnnotatedLam {} lam expectedFnTy（3-arg）
-#            Fix: lib/default.nix 提供 3-arg wrapper: ctx lamExpr expectedFnTy
-#                 -> bidirLib.check ctx lamExpr expectedFnTy -> {ok; ...}
-#   BUG-T25: invPat1 依赖 patternLib.patternVars（同 T16 根因）
+# 修复（Phase 4.5.8）:
+#   BUG-T16 (定论): patternVars Ctor → [] 根因
+#            builtins.foldl' (acc: p: acc ++ _patternVarsGo p) 在 letrec+nix-run
+#            场景下无声返回 []. 修复: builtins.concatLists (map (p: f p) fields)
+#            INV-NIX-4: 列表构建使用 concatLists+map, 禁止 foldl'++++
+#   BUG-T25: invPat1 → false（同 T16 根因，同步修复）
 #
 # 测试框架新增能力：
 #   mkTestBool  - 布尔断言（带错误上下文，INV-TEST-1）
@@ -1137,12 +1133,6 @@ let
   failedGroups = lib.filter (g: builtins.isAttrs g && !(g.ok or true)) allGroups;
   allPassed    = failedGroups == [];
 
-in {
-  inherit allGroups totalPassed totalTests allPassed failedGroups;
-  passed  = totalPassed;
-  total   = totalTests;
-  ok      = allPassed;
-
   # ── runAll: JSON-safe group summary（INV-TEST-7）─────────────────
   runAll = map (g: {
     name        = g.name;
@@ -1157,8 +1147,6 @@ in {
         else builtins.toString t
       ) gf;
   }) allGroups;
-
-  summary = "Passed: ${builtins.toString totalPassed} / ${builtins.toString totalTests}";
 
   # ── failedList: INV-TEST-5 防御性────────────────────────────────
   failedList =
@@ -1209,4 +1197,11 @@ in {
         };
     in
     map diagGroup failedGroups;
+in {
+  inherit allGroups totalPassed totalTests allPassed failedGroups runAll failedList diagnoseAll;
+  passed  = totalPassed;
+  total   = totalTests;
+  ok      = allPassed;
+
+  summary = "Passed: ${builtins.toString totalPassed} / ${builtins.toString totalTests}";
 }

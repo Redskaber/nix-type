@@ -15,7 +15,6 @@ let
   inherit (normalizeLib) normalize';
   inherit (hashLib) typeHash;
 
-in rec {
 
   # ══ Handler 类型构造器 ════════════════════════════════════════════════
 
@@ -227,5 +226,38 @@ in rec {
       in
       if !r1.ok then r1 else if !r2.ok then r2 else { ok = true; }
     else { ok = false; error = "invalid effect row: ${v}"; };
+in
+{
+  inherit
+  # ══ Handler 类型构造器 ════════════════════════════════════════════════
+  mkHandler
+  mkDeepHandler
+  mkShallowHandler
+  mkHandlerWithCont
+  mkContType
+  isHandler
+  isHandlerWithCont
+  # ══ Effect Row 构造器 ═════════════════════════════════════════════════
+  emptyEffectRow
+  singleEffect
+  effectMerge
+  # ══ checkHandler（INV-EFF-5）══════════════════════════════════════════
+  _collectEffectLabels
+  checkHandler
+  # ══ handleAll（INV-EFF-5）════════════════════════════════════════════
+  handleAll
+  # ══ subtractEffect（INV-EFF-7）════════════════════════════════════════
+  subtractEffect
+  # ══ INV-EFF-8: Deep handler semantics ════════════════════════════════
+  deepHandlerCovers
+  _effectOccursDeep
+  # ══ INV-EFF-9: Shallow handler semantics ═════════════════════════════
+  shallowHandlerResult
+  # ══ INV-EFF-10: Handler with continuation semantics（Phase 4.3）══════
+  checkHandlerContWellFormed
+  # ══ Effect type 合法性检查（INV-EFF-4）═══════════════════════════════
+  checkEffectWellFormed
+  _checkRowWellFormed
+  ;
 }
 

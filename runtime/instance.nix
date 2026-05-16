@@ -40,7 +40,6 @@ let
     in
     builtins.hashString "sha256" "Instance(${className},[${argHashStr}])";
 
-in rec {
 
   # ══ Instance 结构 ══════════════════════════════════════════════════════
   # Type: Type → String → Any → Instance
@@ -214,4 +213,28 @@ in rec {
         ) global localClasses;
       in
       { ok = true; conflicts = []; db = merged; };
+in
+{
+  inherit
+  # ══ Instance 结构 ══════════════════════════════════════════════════════
+  mkInstance
+  isInstance
+  instanceEq
+  instanceData
+  instanceType
+  # ══ Typeclass Instance 注册结构 ════════════════════════════════════════
+  mkInstanceRecord
+  isInstanceRecord
+  # ══ Instance DB ════════════════════════════════════════════════════════
+  emptyDB
+  registerInstance
+  lookupInstance
+  # ══ resolveWithFallback（RISK-A 修复）════════════════════════════════
+  resolveWithFallback
+  canDischarge
+  # ══ Phase 4.2: Global Coherence Check ════════════════════════════════
+  checkGlobalCoherence
+  # ══ mergeLocalInstances（INV-MOD-7, Phase 4.2 升级）═════════════════
+  mergeLocalInstances
+  ;
 }

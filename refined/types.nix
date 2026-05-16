@@ -10,8 +10,6 @@ let
   inherit (normalizeLib) normalize';
   inherit (hashLib) typeHash;
 
-in rec {
-
   # ══ PredExpr 构造器 ════════════════════════════════════════════════════
   mkPTrue  = { __predTag = "PTrue"; };
   mkPFalse = { __predTag = "PFalse"; };
@@ -72,7 +70,7 @@ in rec {
       # PCmp, PVar → non-trivial, defer to SMT
       { ok = false; trivial = false; };
 
-  # ══ SMT Oracle 接口（INV-SMT-5/6）══════════════════════════════════════
+  # ══ SMT Oracle API（INV-SMT-5/6）══════════════════════════════════════
   # 当 staticEvalPred 无法判定时，调用外部 SMT solver
   # 在纯 Nix 中，smtOracle 是用户提供的函数（或 stub）
   # INV-SMT-5: checkRefinedSubtype sound（当 SMT 返回 true 时正确）
@@ -164,4 +162,37 @@ in rec {
       (mkTypeDefault (rPrimitive "String") KStar)
       "s"
       (mkPCmp "!=" (mkPVar "s") (mkPLit ""));
+
+in {
+  inherit
+  # ══ PredExpr 构造器 ════════════════════════════════════════════════════
+  mkPTrue
+  mkPFalse
+  mkPLit
+  mkPVar
+  mkPCmp
+  mkPAnd
+  mkPOr
+  mkPNot
+  isPredExpr
+  # ══ Refined 类型构造器 ════════════════════════════════════════════════
+  mkRefined
+  isRefined
+  refinedBase
+  refinedPredVar
+  refinedPredExp
+  # ══ Static PredExpr Evaluation ════════════════════════════════════════
+  staticEvalPred
+  # ══ SMT Oracle API（INV-SMT-5/6）══════════════════════════════════════
+  defaultSmtOracle
+  checkRefinedSubtype
+  # ══ PredExpr → SMT-LIB2 转换（供外部 oracle 使用）════════════════════
+  _predExprToSmtLib
+  # ══ Refined 类型规范化（INV-SMT-2）════════════════════════════════════
+  normalizeRefined
+  # ══ 常用精化类型 ══════════════════════════════════════════════════════
+  tPositiveInt
+  tNonNegInt
+  tNonEmptyString
+  ;
 }

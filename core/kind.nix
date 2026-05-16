@@ -17,8 +17,7 @@
 #     uses the fixpoint solver for the unification step.
 #   - checkKindAnnotationFixpoint: INV-KIND-3 verifier.
 { lib }:
-
-rec {
+let
   # ══ Kind Repr 标记（不依赖 typeLib，避免循环）══════════════════════════
 
   KStar    = { __kindTag = "Star";   };
@@ -389,4 +388,59 @@ rec {
     "Map"    = KArrow KStar (KArrow KStar KStar);
     "IO"     = KArrow KStar KStar;
   };
+in
+{
+  inherit
+  # ══ Kind Repr 标记（不依赖 typeLib，避免循环）══════════════════════════
+  KStar
+  KRow
+  KEffect
+  KUnbound
+  KArrow
+  KVar
+  # ══ Kind 谓词 ══════════════════════════════════════════════════════════
+  isKind
+  isStar
+  isKArrow
+  isKRow
+  isKEffect
+  isKVar
+  isKUnbound
+  # ══ Kind 序列化（canonical，用于 hash）════════════════════════════════
+  serializeKind
+  # ══ Kind Equality ══════════════════════════════════════════════════════
+  kindEq
+  # ══ Kind Arity（类型构造器参数数量）══════════════════════════════════
+  kindArity
+  # ══ Kind Application（应用后的结果 kind）══════════════════════════════
+  applyKind
+  # ══ Kind Substitution（kind-level substitution）══════════════════════
+  applyKindSubst
+  # ══ Kind Unification（Phase 4.2/4.3: HM kind inference）═════════════
+  unifyKind
+  # ══ Kind Occurs Check（Phase 4.3）════════════════════════════════════
+  _occursKind
+  # ══ Kind Free Variables（Phase 4.3：用于 kind generalization）════════
+  kindFreeVars
+  # ══ Kind Compose Substitution ════════════════════════════════════════
+  composeKindSubst
+  # ══ Kind Environment Merge（Phase 4.4）════════════════════════════════
+  mergeKindEnv
+  # ══ Kind Inference（Phase 4.3）════════════════════════════════════════
+  inferKind
+  # ══ Phase 4.4: inferKind with Annotation Propagation（INV-KIND-2）════
+  inferKindWithAnnotation
+  # ══ Phase 4.4: INV-KIND-2 post-hoc verifier ═══════════════════════════
+  checkKindAnnotation
+  # ══ Kind Constraint Solve（Phase 4.3: INV-KIND-1）════════════════════
+  solveKindConstraints
+  # ══ Phase 4.5: Fixpoint Kind Constraint Solver（INV-KIND-3）══════════
+  solveKindConstraintsFixpoint
+  # ══ Phase 4.5: INV-KIND-3 fixpoint verifier ═══════════════════════════
+  checkKindAnnotationFixpoint
+  # ══ Phase 4.5: inferKindWithAnnotation using fixpoint ══════════════════
+  inferKindWithAnnotationFixpoint
+  # ══ Built-in Type Kind Annotations ════════════════════════════════════
+  defaultKinds
+  ;
 }

@@ -16,8 +16,6 @@ let
   inherit (hashLib) typeHash;
   inherit (normalizeLib) normalize';
 
-in rec {
-
   # ══ Occurs Check（防止无限类型）══════════════════════════════════════
   occursIn = varName: t:
     if !isType t then false
@@ -229,4 +227,20 @@ in rec {
         if !r.ok then r
         else { ok = true; subst = composeSubst r.subst acc.subst; }
     ) { ok = true; subst = emptySubst; } pairs;
+in
+{
+  inherit
+  # ══ Occurs Check（防止无限类型）══════════════════════════════════════
+  occursIn
+  # ══ Unify Var ════════════════════════════════════════════════════════
+  _unifyVar
+  # ══ Mu bisimulation up-to congruence（Phase 4.3: INV-MU-1）══════════
+  _unifyMu
+  # ══ Congruence Closure Check (Phase 4.3 auxiliary) ═══════════════════
+  _unify
+  # ══ Public API ════════════════════════════════════════════════════════
+  unify
+  # ══ 批量 unify ════════════════════════════════════════════════════════
+  unifyAll
+  ;
 }

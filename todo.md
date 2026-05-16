@@ -1,4 +1,4 @@
-# todo.md — Phase 4.5.3 完成状态 + Phase 5.0 规划
+# todo.md — Phase 4.5.8 完成状态 + Phase 5.0 规划
 
 ---
 
@@ -30,6 +30,21 @@
 | RISK-T | mkHandlerWithCont missing fields     | contDomainOk + inv_eff_11    | ✅ 4.5.2     |
 | RISK-U | patternVars rec{} lazy-eval cycle    | lambda wrapper (p: f p)      | ✅ **4.5.3** |
 | RISK-V | test framework lacks diagnostics     | mkTestWith + diagnoseAll     | ✅ **4.5.3** |
+| RISK-W | foldl'+++ in letrec ctx → silent []  | concatLists+map (INV-NIX-4)  | ✅ **4.5.8** |
+
+---
+
+## Phase 4.5.8 完成状态
+
+| 编号     | 功能                                                 | 文件                | INV       | 状态 |
+| -------- | ---------------------------------------------------- | ------------------- | --------- | ---- |
+| P4.5.8-1 | patternVars Ctor: foldl'+→concatLists+map            | `match/pattern.nix` | INV-NIX-4 | ✅   |
+| P4.5.8-2 | patternVars Record: foldl'+→concatLists+map          | `match/pattern.nix` | INV-NIX-4 | ✅   |
+| P4.5.8-3 | patternVars/patternDepth: eta-expand rec{} exports   | `match/pattern.nix` | INV-NIX-3 | ✅   |
+| P4.5.8-4 | patternVarsSet/isLinear: direct \_patternVarsGo call | `match/pattern.nix` | INV-NIX-3 | ✅   |
+| P4.5.8-5 | version bump 4.5.8                                   | `flake.nix`, `lib/` | —         | ✅   |
+| P4.5.8-6 | BUGFIX.md: Round 7 entry                             | `BUGFIX.md`         | —         | ✅   |
+| P4.5.8-7 | todo.md: RISK-W + 4.5.8 status                       | `todo.md`           | —         | ✅   |
 
 ---
 

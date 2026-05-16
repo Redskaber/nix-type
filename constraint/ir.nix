@@ -19,7 +19,6 @@
 let
   inherit (serialLib) serializeConstraint;
 
-in rec {
 
   # ══ Constraint 变体构造器 ══════════════════════════════════════════════
 
@@ -164,4 +163,56 @@ in rec {
         (lib.zipListsWith (k: v: { k = k; v = v; }) keys all);
     in
     uniq.result;
+in
+{
+  inherit
+  # ══ Constraint 变体构造器 ══════════════════════════════════════════════
+  mkEqConstraint
+  mkClassConstraint
+  mkPredConstraint
+  mkImpliesConstraint
+  mkRowEqConstraint
+  mkRefinedConstraint
+  # ════════════════════════════════════════════════════════════════════
+  # Phase 4.2 新增 Constraints
+  # ════════════════════════════════════════════════════════════════════
+  mkSchemeConstraint
+  mkKindConstraint
+  mkInstanceConstraint
+  # ════════════════════════════════════════════════════════════════════
+  # Phase 4.5.4 新增 Constraints
+  # ════════════════════════════════════════════════════════════════════
+  mkSubConstraint 
+  mkHasFieldConstraint
+  # ══ PredExpr 构造器（Refined Types 用）════════════════════════════════
+  mkPTrue
+  mkPFalse
+  mkPLit
+  mkPVar
+  mkPCmp
+  mkPAnd
+  mkPOr
+  mkPNot
+  mkPGt
+  mkPGe
+  mkPLt
+  mkPLe
+  # ══ Constraint 谓词 ════════════════════════════════════════════════════
+  isConstraint
+  isEqConstraint
+  isClassConstraint
+  isPredConstraint
+  isImpliesConstraint
+  isRowEqConstraint
+  isRefinedConstraint
+  isSchemeConstraint
+  isKindConstraint
+  isInstanceConstraint
+  isSubConstraint
+  isHasFieldConstraint
+  # ══ Constraint key（用于去重）══════════════════════════════════════════
+  constraintKey
+  # ══ 合并 Constraint 列表（去重）═══════════════════════════════════════
+  mergeConstraints
+  ;
 }

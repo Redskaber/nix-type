@@ -14,13 +14,10 @@
 #   Updated constraint tag patterns: "Equality"→"Eq", "RowEquality"→"RowEq"
 #   Added serialization for "Sub", "HasField", "Gt"/"Ge"/"Lt"/"Le" pred tags
 { lib, kindLib }:
-
 let
   inherit (kindLib) serializeKind isKind;
 
-in rec {
-
-  # ══ ARCH-SER-SAFE: safe string conversion for unknown values ═══════════════
+ # ══ ARCH-SER-SAFE: safe string conversion for unknown values ═══════════════
   # Contract: NEVER calls builtins.toJSON on a function value.
   _safeStr = v:
     if builtins.isFunction v then "<fn>"
@@ -348,4 +345,23 @@ in rec {
   # ══ canonical hash ══════════════════════════════════════════════════════════
   canonicalHash     = t: builtins.hashString "sha256" (serializeType t);
   canonicalHashRepr = r: builtins.hashString "sha256" (serializeRepr r);
+in
+{
+  inherit
+  # ══ ARCH-SER-SAFE: safe string conversion for unknown values ═══════════════
+  _safeStr
+  # ══ De Bruijn 序列化（alpha-等价规范化）══════════════════════════════
+  _serializeWithEnv
+  # ══ Constraint 序列化（INV-SER-1: no toJSON on unknown values）══════════
+  serializeConstraint
+  # ══ PredExpr 序列化（INV-SER-1）══════════════════════════════════════════
+  serializePredExpr
+  # ══ TypeRepr 序列化（public API）══════════════════════════════════════════
+  serializeRepr
+  # ══ Type 序列化 ════════════════════════════════════════════════════════════
+  serializeType
+  # ══ canonical hash ══════════════════════════════════════════════════════════
+  canonicalHash
+  canonicalHashRepr
+  ;
 }

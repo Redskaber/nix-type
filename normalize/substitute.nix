@@ -34,7 +34,6 @@ let
       else if v == "Constrained" then _boundVars t.repr.base
       else [];
 
-in rec {
 
   # ══ 核心 substitute（capture-safe）════════════════════════════════════
   # Type: String → Type → Type → Type
@@ -190,4 +189,16 @@ in rec {
     else
       let pairs = lib.zipListsWith (p: a: { name = p; ty = a; }) params args; in
       substituteMany pairs body;
+in
+{
+  inherit
+  # ══ 核心 substitute（capture-safe）════════════════════════════════════
+  substitute
+  # ══ 批量替换（列表）══════════════════════════════════════════════════
+  substituteMany
+  # ══ UnifiedSubst 应用（Phase 4.2 改进）════════════════════════════════
+  applyUnifiedSubst
+  # ══ 构造器参数批量替换（用于 rConstructor unfold）═════════════════════
+  substituteParams
+  ;
 }

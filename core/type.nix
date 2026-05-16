@@ -17,7 +17,6 @@ let
   _mkId = repr:
     builtins.hashString "sha256" (serializeRepr repr);
 
-in rec {
 
   # ══ TypeIR 核心构造器 ══════════════════════════════════════════════════
 
@@ -130,4 +129,37 @@ in rec {
         in
         lib.unique (varFvs ++ tailFvs)
       else [];
+in
+{
+  inherit
+  # ══ TypeIR 核心构造器 ══════════════════════════════════════════════════
+  mkTypeWith
+  mkTypeDefault
+  # ══ TypeIR 谓词 ════════════════════════════════════════════════════════
+  isType
+  # ══ TypeIR 解构 ════════════════════════════════════════════════════════
+  typeRepr
+  typeKind
+  typeMeta
+  typeId
+  # ══ TypeIR 更新（保持 id 语义）════════════════════════════════════════
+  withRepr
+  withKind
+  withMeta
+  # ══ 常用原始类型 ════════════════════════════════════════════════════════
+  tPrim
+  tInt
+  tBool
+  tString
+  tFloat
+  tUnit
+  # ══ TypeScheme（∀ quantification）════════════════════════════════════
+  mkScheme
+  monoScheme
+  isScheme
+  schemeForall
+  schemeBody
+  schemeCons
+  freeVars
+  ;
 }

@@ -1,5 +1,5 @@
 {
-  description = "nix-types — Phase 4.5.6: Pure Nix native type system";
+  description = "nix-types — Phase 4.5.8: Pure Nix native type system";
 
   inputs = {
     nixpkgs.url    = "github:NixOS/nixpkgs/nixos-unstable";
@@ -11,7 +11,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # ★ Phase 4.5.6: Test framework enhancement + BUG-T16/T25 fix
+        # ★ Phase 4.5.8: Test framework enhancement + BUG-T16/T25 fix
         #   BUG-T16: patternVars Ctor branch — builtins.map patternVars (rec fn)
         #            causes lazy-eval cycle in Nix rec{} → eval-error
         #            Fix: wrap in lambda (p: patternVars p)
@@ -20,7 +20,7 @@
         #   FRAMEWORK: mkTestBool/mkTest/mkTestWith carry diag fields
         #              diagnoseAll output provides hint/actual/expected per failure
         #              nix run .#diagnose — detailed failure report
-        version = "4.5.6";
+        version = "4.5.8";
 
         nix-types-lib = import ./lib/default.nix { lib = pkgs.lib; };
 
@@ -117,9 +117,9 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ nix nixpkgs-fmt ];
           shellHook = ''
-            echo "nix-types ${version} dev shell (Phase 4.5.6)"
+            echo "nix-types ${version} dev shell (Phase 4.5.8)"
             echo ""
-            echo "Fixes in 4.5.6:"
+            echo "Fixes in 4.5.8:"
             echo "  BUG-T16: patternVars Ctor — _patternVarsGo at top-level let (INV-NIX-2)"
             echo "  BUG-T24: checkAnnotatedLam API — 3-arg public wrapper in lib/default.nix"
             echo "  BUG-T25: invPat1 — same root cause as T16"
@@ -144,7 +144,7 @@
             type    = "app";
             program = toString (pkgs.writeShellScript "run-tests" ''
               set -euo pipefail
-              echo "Running nix-types ${version} tests (Phase 4.5.6)..."
+              echo "Running nix-types ${version} tests (Phase 4.5.8)..."
               ${pkgs.nix}/bin/nix-instantiate --eval --strict \
                 --expr '
                   let lib = (import ${nixpkgs-path}/lib);
@@ -159,7 +159,7 @@
                   }
                 ' --json
             '');
-            meta.description = "Run nix-types test suite (Phase 4.5.6, 203 tests)";
+            meta.description = "Run nix-types test suite (Phase 4.5.8, 203 tests)";
           };
 
           # ── diagnose: detailed failure diagnostics ───────────────────────
@@ -170,7 +170,7 @@
             type    = "app";
             program = toString (pkgs.writeShellScript "run-diagnose" ''
               set -euo pipefail
-              echo "nix-types ${version} — failure diagnostics (Phase 4.5.6)"
+              echo "nix-types ${version} — failure diagnostics (Phase 4.5.8)"
               echo ""
               ${pkgs.nix}/bin/nix-instantiate --eval --strict \
                 --expr '
@@ -184,7 +184,7 @@
                   }
                 ' --json
             '');
-            meta.description = "Show detailed diagnostics for failing tests (Phase 4.5.6)";
+            meta.description = "Show detailed diagnostics for failing tests (Phase 4.5.8)";
           };
 
           # ── check-invariants: invariant verification ──────────────────────
@@ -222,7 +222,7 @@
                   }
                 '
             '');
-            meta.description = "Check nix-types invariants (Phase 4.5.6)";
+            meta.description = "Check nix-types invariants (Phase 4.5.8)";
           };
 
           # ── demo: run demo scenarios ──────────────────────────────────────
@@ -230,7 +230,7 @@
             type    = "app";
             program = toString (pkgs.writeShellScript "run-demo" ''
               set -euo pipefail
-              echo "Running nix-types ${version} demo (Phase 4.5.6)..."
+              echo "Running nix-types ${version} demo (Phase 4.5.8)..."
               ${pkgs.nix}/bin/nix-instantiate --eval --strict \
                 --expr '
                   let lib = (import ${nixpkgs-path}/lib);
@@ -238,7 +238,7 @@
                   in d.summary
                 ' --json
             '');
-            meta.description = "Run nix-types demo (Phase 4.5.6)";
+            meta.description = "Run nix-types demo (Phase 4.5.8)";
           };
         };
       });
